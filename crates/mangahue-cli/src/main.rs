@@ -5,7 +5,10 @@ use mangahue_api::{run_doctor_report, serve, ApiServerConfig, DoctorRequest, Doc
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb, ImageSize, StyleProfile};
 use mangahue_hints::{generate_hints, load_user_hints};
-use mangahue_image::{load_image, save_gray, save_rgb};
+use mangahue_image::{
+    collect_image_paths, export_chapter_archive, import_chapter_to_dir, load_image, save_gray,
+    save_rgb, write_chapter_manifest, ChapterImportOptions,
+};
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestRequest};
 use mangahue_memory::{
@@ -25,7 +28,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, ProcessRefreshKind, System};
-use walkdir::WalkDir;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +53,10 @@ enum Commands {
     Link {
         #[command(subcommand)]
         command: LinkCommand,
+    },
+    Chapter {
+        #[command(subcommand)]
+        command: ChapterCommand,
     },
     Project {
         #[command(subcommand)]
@@ -237,6 +243,68 @@ struct LinkColorizeArgs {
 }
 
 #[derive(Debug, Subcommand)]
+enum ChapterCommand {
+    Import(ChapterImportArgs),
+    Export(ChapterExportArgs),
+    Colorize(Box<ChapterColorizeArgs>),
+}
+
+#[derive(Debug, Args)]
+struct ChapterImportArgs {
+    input: PathBuf,
+    #[arg(long, short)]
+    output: PathBuf,
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long, default_value_t = 500)]
+    max_pages: usize,
+    #[arg(long, default_value_t = 52_428_800)]
+    max_bytes_per_page: u64,
+    #[arg(long)]
+    no_overwrite: bool,
+}
+
+#[derive(Debug, Args)]
+struct ChapterExportArgs {
+    input_dir: PathBuf,
+    #[arg(long, short)]
+    output: PathBuf,
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ChapterColorizeArgs {
+    input: PathBuf,
+    #[arg(long, short)]
+    output: PathBuf,
+    #[arg(long, default_value = ".mangahue/chapters")]
+    work_dir: PathBuf,
+    #[arg(long)]
+    export: Option<PathBuf>,
+    #[arg(long)]
+    model: Option<PathBuf>,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    preset: Option<PathBuf>,
+    #[arg(long)]
+    style: Option<PathBuf>,
+    #[arg(long)]
+    project: Option<PathBuf>,
+    #[arg(long)]
+    mock: bool,
+    #[arg(long)]
+    report: Option<PathBuf>,
+    #[arg(long, short = 'j')]
+    jobs: Option<usize>,
+    #[arg(long, default_value_t = 500)]
+    max_pages: usize,
+    #[arg(long, default_value_t = 52_428_800)]
+    max_bytes_per_page: u64,
+}
+
+#[derive(Debug, Subcommand)]
 enum ProjectCommand {
     Create {
         name: String,
@@ -372,6 +440,7 @@ fn main() -> Result<()> {
         Commands::MakeHints(args) => run_make_hints(args),
         Commands::Doctor(args) => run_doctor(args),
         Commands::Link { command } => run_link(command),
+        Commands::Chapter { command } => run_chapter(command),
         Commands::Project { command } => run_project(command),
         Commands::Styles { command } => run_styles(command),
         Commands::Character { command } => run_character(command),
@@ -554,13 +623,7 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
     let peak_memory = Arc::new(AtomicU64::new(0));
     let stop_monitor = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let entries: Vec<PathBuf> = WalkDir::new(&args.input_dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|path| is_image_path(path))
-        .collect();
+    let entries = collect_image_paths(&args.input_dir)?;
 
     let monitor_peak = Arc::clone(&peak_memory);
     let monitor_stop = Arc::clone(&stop_monitor);
@@ -1075,6 +1138,98 @@ fn run_link_colorize(args: LinkColorizeArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_chapter(command: ChapterCommand) -> Result<()> {
+    match command {
+        ChapterCommand::Import(args) => {
+            let manifest = import_chapter_to_dir(
+                &args.input,
+                &args.output,
+                ChapterImportOptions {
+                    max_pages: args.max_pages,
+                    max_bytes_per_page: args.max_bytes_per_page,
+                    overwrite: !args.no_overwrite,
+                },
+            )?;
+            let manifest_path = args
+                .manifest
+                .unwrap_or_else(|| args.output.join("mangahue_chapter_manifest.json"));
+            write_chapter_manifest(&manifest, &manifest_path)?;
+            println!(
+                "imported {} page(s) to {}; manifest {}",
+                manifest.pages.len(),
+                manifest.root.display(),
+                manifest_path.display()
+            );
+            if !manifest.warnings.is_empty() {
+                println!("warnings: {}", manifest.warnings.len());
+            }
+        }
+        ChapterCommand::Export(args) => {
+            let manifest = export_chapter_archive(&args.input_dir, &args.output)?;
+            if let Some(manifest_path) = args.manifest {
+                write_chapter_manifest(&manifest, &manifest_path)?;
+                println!("manifest {}", manifest_path.display());
+            }
+            println!(
+                "exported {} page(s) from {} to {}",
+                manifest.pages.len(),
+                args.input_dir.display(),
+                args.output.display()
+            );
+        }
+        ChapterCommand::Colorize(args) => run_chapter_colorize(*args)?,
+    }
+    Ok(())
+}
+
+fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
+    let chapter_id = format!(
+        "{}_{}",
+        safe_url_slug(&args.input.to_string_lossy()),
+        unix_millis()
+    );
+    let import_dir = args.work_dir.join(chapter_id).join("imported");
+    let manifest = import_chapter_to_dir(
+        &args.input,
+        &import_dir,
+        ChapterImportOptions {
+            max_pages: args.max_pages,
+            max_bytes_per_page: args.max_bytes_per_page,
+            overwrite: true,
+        },
+    )?;
+    std::fs::create_dir_all(&args.output)
+        .with_context(|| format!("failed to create {}", args.output.display()))?;
+    let manifest_path = args.output.join("mangahue_import_manifest.json");
+    write_chapter_manifest(&manifest, &manifest_path)?;
+    run_batch(
+        BatchArgs {
+            input_dir: import_dir,
+            output: args.output.clone(),
+            model: args.model,
+            config: args.config,
+            preset: args.preset,
+            style: args.style,
+            project: args.project,
+            mock: args.mock,
+            report: args
+                .report
+                .or_else(|| Some(args.output.join("mangahue_chapter_colorize_report.json"))),
+            jobs: args.jobs,
+        },
+        true,
+    )?;
+    if let Some(export_path) = args.export {
+        let exported = export_chapter_archive(&args.output, &export_path)?;
+        println!(
+            "chapter export {} page(s) -> {}",
+            exported.pages.len(),
+            export_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn run_project(command: ProjectCommand) -> Result<()> {
     match command {
         ProjectCommand::Create { name, output } => {
@@ -1315,14 +1470,4 @@ fn init_tracing(verbose: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(format!("mangahue={level}"))
         .try_init();
-}
-
-fn is_image_path(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "webp" | "tif" | "tiff" | "bmp")
-    )
 }

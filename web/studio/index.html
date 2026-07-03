@@ -20,6 +20,7 @@
           <button class="tab active" data-view="inspect">Inspect</button>
           <button class="tab" data-view="colorize">Colorize</button>
           <button class="tab" data-view="link">Link</button>
+          <button class="tab" data-view="chapter">Chapter</button>
           <button class="tab" data-view="jobs">Jobs</button>
           <button class="tab" data-view="memory">Memory</button>
           <button class="tab" data-view="doctor">Doctor</button>
@@ -85,6 +86,30 @@
               <h3>Link Result</h3>
               <img id="link-preview-image" alt="Generated link colorization preview" />
               <pre id="link-output">No link job queued.</pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-chapter">
+          <header class="section-head">
+            <h2>Chapter Tools</h2>
+            <div class="actions">
+              <button id="chapter-export">Export Archive</button>
+              <button id="chapter-import">Import Chapter</button>
+            </div>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="chapter-form">
+              <label>Input folder, image, ZIP, or CBZ <input name="input_path" value="examples/input" /></label>
+              <label>Imported output dir <input name="output_dir" value="examples/output/studio_chapter_import" /></label>
+              <label>Manifest path <input name="manifest_path" value="examples/output/studio_chapter_import/manifest.json" /></label>
+              <label>Export input dir <input name="export_input_dir" value="examples/output/studio_chapter_import" /></label>
+              <label>Export archive <input name="export_file" value="examples/output/studio_chapter.cbz" /></label>
+              <label>Max pages <input name="max_pages" type="number" value="500" min="1" max="1000" /></label>
+            </form>
+            <article class="panel readout">
+              <h3>Chapter Output</h3>
+              <pre id="chapter-output">No chapter operation yet.</pre>
             </article>
           </div>
         </section>

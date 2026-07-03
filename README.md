@@ -37,6 +37,9 @@ mangahue model validate-onnx --model models/model.onnx --metadata models/model.m
 mangahue serve --addr 127.0.0.1:7878
 mangahue preprocess input.png --output clean.png
 mangahue make-hints input.png --hints hints.json --output-map hint_map.png --output-mask hint_mask.png
+mangahue chapter import chapter.cbz --output .mangahue/imported_chapter
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --mock
+mangahue chapter export examples/output/colored_chapter --output examples/output/colored_chapter.cbz
 mangahue project create "My Manga" --output projects/my_manga
 mangahue character create --project projects/my_manga --name Hero --hair "#111111" --eyes "#3366ff" --skin "#e8b89a"
 ```

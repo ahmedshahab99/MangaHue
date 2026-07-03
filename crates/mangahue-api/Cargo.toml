@@ -13,6 +13,7 @@ mangahue-orchestrator = { path = "../mangahue-orchestrator" }
 mangahue-config = { path = "../mangahue-config" }
 mangahue-inference = { path = "../mangahue-inference" }
 mangahue-ingest = { path = "../mangahue-ingest" }
+mangahue-image = { path = "../mangahue-image" }
 mangahue-memory = { path = "../mangahue-memory" }
 mangahue-core = { path = "../mangahue-core" }
 serde.workspace = true

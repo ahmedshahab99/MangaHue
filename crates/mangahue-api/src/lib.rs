@@ -7,6 +7,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb};
+use mangahue_image::{
+    export_chapter_archive, import_chapter_to_dir, write_chapter_manifest, ChapterImportOptions,
+    ChapterManifest,
+};
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestReport, IngestRequest};
 use mangahue_memory::{
@@ -69,6 +73,26 @@ pub struct ApiLinkColorizeRequest {
     #[serde(default = "default_continue_on_error")]
     pub continue_on_error: bool,
     pub user_agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiChapterImportRequest {
+    pub input_path: PathBuf,
+    pub output_dir: PathBuf,
+    pub manifest_path: Option<PathBuf>,
+    #[serde(default = "default_chapter_max_pages")]
+    pub max_pages: usize,
+    #[serde(default = "default_chapter_max_bytes_per_page")]
+    pub max_bytes_per_page: u64,
+    #[serde(default = "default_true")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiChapterExportRequest {
+    pub input_dir: PathBuf,
+    pub output_file: PathBuf,
+    pub manifest_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +363,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/batch", post(create_batch_job))
         .route("/api/link/ingest", post(ingest_link))
         .route("/api/link/colorize", post(create_link_colorize_job))
+        .route("/api/chapter/import", post(import_chapter))
+        .route("/api/chapter/export", post(export_chapter))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:id", get(get_job))
         .route("/api/jobs/:id/result", get(get_job_result))
@@ -641,6 +667,45 @@ async fn create_link_colorize_job(
     });
 
     Ok(Json(job))
+}
+
+async fn import_chapter(
+    Json(payload): Json<ApiChapterImportRequest>,
+) -> Result<Json<ChapterManifest>, ApiError> {
+    let manifest = tokio::task::spawn_blocking(move || {
+        let manifest = import_chapter_to_dir(
+            &payload.input_path,
+            &payload.output_dir,
+            ChapterImportOptions {
+                max_pages: payload.max_pages,
+                max_bytes_per_page: payload.max_bytes_per_page,
+                overwrite: payload.overwrite,
+            },
+        )?;
+        let manifest_path = payload
+            .manifest_path
+            .unwrap_or_else(|| payload.output_dir.join("mangahue_chapter_manifest.json"));
+        write_chapter_manifest(&manifest, manifest_path)?;
+        Ok::<_, anyhow::Error>(manifest)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(manifest))
+}
+
+async fn export_chapter(
+    Json(payload): Json<ApiChapterExportRequest>,
+) -> Result<Json<ChapterManifest>, ApiError> {
+    let manifest = tokio::task::spawn_blocking(move || {
+        let manifest = export_chapter_archive(&payload.input_dir, &payload.output_file)?;
+        if let Some(manifest_path) = payload.manifest_path {
+            write_chapter_manifest(&manifest, manifest_path)?;
+        }
+        Ok::<_, anyhow::Error>(manifest)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(manifest))
 }
 
 async fn inspect_page(
@@ -1033,12 +1098,24 @@ fn default_continue_on_error() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_link_max_pages() -> usize {
     32
 }
 
 fn default_link_max_bytes_per_page() -> u64 {
     32 * 1024 * 1024
+}
+
+fn default_chapter_max_pages() -> usize {
+    500
+}
+
+fn default_chapter_max_bytes_per_page() -> u64 {
+    50 * 1024 * 1024
 }
 
 fn default_config_path() -> PathBuf {
@@ -1388,6 +1465,8 @@ pub fn planned_routes() -> &'static [&'static str] {
         "POST /api/batch",
         "POST /api/link/ingest",
         "POST /api/link/colorize",
+        "POST /api/chapter/import",
+        "POST /api/chapter/export",
         "GET /api/jobs",
         "GET /api/jobs/{id}",
         "GET /api/jobs/{id}/result",
@@ -1435,5 +1514,6 @@ mod tests {
         assert!(routes.contains(&"POST /api/projects/export-corrections"));
         assert!(routes.contains(&"POST /api/projects/export-training-manifest"));
         assert!(routes.contains(&"POST /api/link/colorize"));
+        assert!(routes.contains(&"POST /api/chapter/import"));
     }
 }

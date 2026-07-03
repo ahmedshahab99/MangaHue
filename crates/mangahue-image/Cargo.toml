@@ -9,4 +9,9 @@ authors.workspace = true
 anyhow.workspace = true
 image.workspace = true
 mangahue-core = { path = "../mangahue-core" }
+serde.workspace = true
+serde_json.workspace = true
+zip.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true

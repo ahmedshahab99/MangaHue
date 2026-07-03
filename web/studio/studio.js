@@ -164,6 +164,34 @@ async function pollLinkJob(id) {
   throw new Error("link job timed out");
 }
 
+async function importChapter() {
+  const data = formData($("#chapter-form"));
+  const result = await api("/api/chapter/import", {
+    method: "POST",
+    body: JSON.stringify({
+      input_path: data.input_path,
+      output_dir: data.output_dir,
+      manifest_path: optionalPath(data.manifest_path),
+      max_pages: Number(data.max_pages || 500),
+      overwrite: true,
+    }),
+  });
+  $("#chapter-output").textContent = pretty(result);
+}
+
+async function exportChapter() {
+  const data = formData($("#chapter-form"));
+  const result = await api("/api/chapter/export", {
+    method: "POST",
+    body: JSON.stringify({
+      input_dir: data.export_input_dir,
+      output_file: data.export_file,
+      manifest_path: optionalPath(data.manifest_path),
+    }),
+  });
+  $("#chapter-output").textContent = pretty(result);
+}
+
 async function refreshJobs() {
   const jobs = await api("/api/jobs");
   $("#jobs-table").innerHTML = jobs
@@ -241,6 +269,8 @@ function wire() {
   $("#inspect-run").addEventListener("click", () => runInspect().catch((error) => $("#inspect-output").textContent = error.message));
   $("#colorize-run").addEventListener("click", () => queueColorize().catch((error) => $("#colorize-output").textContent = error.message));
   $("#link-run").addEventListener("click", () => queueLinkColorize().catch((error) => $("#link-output").textContent = error.message));
+  $("#chapter-import").addEventListener("click", () => importChapter().catch((error) => $("#chapter-output").textContent = error.message));
+  $("#chapter-export").addEventListener("click", () => exportChapter().catch((error) => $("#chapter-output").textContent = error.message));
   $("#jobs-refresh").addEventListener("click", () => refreshJobs());
   $("#correction-save").addEventListener("click", () => saveCorrection().catch((error) => $("#memory-output").textContent = error.message));
   $("#correction-export-hints").addEventListener("click", () => exportCorrectionHints().catch((error) => $("#memory-output").textContent = error.message));

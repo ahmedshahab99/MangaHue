@@ -29,6 +29,20 @@ cargo run -p mangahue-cli -- link fetch `
   --max-pages 32
 ```
 
+Chapter archive flow:
+
+```powershell
+cargo run -p mangahue-cli -- chapter import chapter.cbz `
+  --output .mangahue/imported/chapter_001
+
+cargo run -p mangahue-cli -- chapter colorize chapter.cbz `
+  --output examples/output/colored_chapter `
+  --export examples/output/colored_chapter.cbz `
+  --mock
+```
+
+The archive path supports folders, single images, ZIP, and CBZ. MangaHue validates page images, sorts them naturally, normalizes output names, and writes a manifest beside imported pages.
+
 ## Telegram Flow
 
 Run:

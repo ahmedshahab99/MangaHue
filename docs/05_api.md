@@ -30,6 +30,8 @@ Routes:
 - `POST /api/batch`
 - `POST /api/link/ingest`
 - `POST /api/link/colorize`
+- `POST /api/chapter/import`
+- `POST /api/chapter/export`
 - `GET /api/jobs/{id}`
 - `GET /api/jobs/{id}/result`
 - `POST /api/projects`
@@ -130,6 +132,31 @@ Link colorize payload:
 ```
 
 The link routes are for authorized manga, webtoon, and image URLs. They do not bypass logins, paywalls, DRM, or site protections.
+
+Chapter import payload:
+
+```json
+{
+  "input_path": "chapter.cbz",
+  "output_dir": ".mangahue/imported/chapter_001",
+  "manifest_path": ".mangahue/imported/chapter_001/manifest.json",
+  "max_pages": 500,
+  "max_bytes_per_page": 52428800,
+  "overwrite": true
+}
+```
+
+Chapter export payload:
+
+```json
+{
+  "input_dir": "examples/output/colored_chapter",
+  "output_file": "examples/output/colored_chapter.cbz",
+  "manifest_path": "examples/output/colored_chapter.export.json"
+}
+```
+
+Chapter import supports folders, single images, `.zip`, and `.cbz`. Pages are validated, naturally sorted, and normalized to `page_001.ext`, `page_002.ext`, and so on.
 
 The API stores in-memory job state for now. The contract is intentionally shaped so it can later be backed by Redis, SQLite, Postgres, or a cloud queue without changing engine internals.
 It also writes each job manifest to disk. The in-memory map is a fast cache, not the only record.
