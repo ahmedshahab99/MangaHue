@@ -1,0 +1,17 @@
+id: retro_90s_anime
+name: Retro 90s Anime
+saturation: 1.04
+contrast: 1.12
+brightness: -0.01
+shadow_strength: 0.62
+highlight_strength: 0.22
+line_strength: 1.08
+palette:
+  - "#e0a07e"
+  - "#2b5f9e"
+  - "#b8363f"
+  - "#d7bc65"
+protected_colors:
+  - "#ffffff"
+notes: "Classic cel-era colors, strong lines, restrained highlights."
+

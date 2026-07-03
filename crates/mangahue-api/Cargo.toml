@@ -1,0 +1,32 @@
+[package]
+name = "mangahue-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+mangahue-config = { path = "../mangahue-config" }
+mangahue-inference = { path = "../mangahue-inference" }
+mangahue-ingest = { path = "../mangahue-ingest" }
+mangahue-memory = { path = "../mangahue-memory" }
+mangahue-core = { path = "../mangahue-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "mangahue-api"
+path = "src/main.rs"

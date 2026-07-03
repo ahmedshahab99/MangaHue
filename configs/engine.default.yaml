@@ -1,0 +1,49 @@
+engine:
+  mode: balanced
+  preserve_lines: true
+  protect_speech_bubbles: true
+  save_debug_outputs: false
+  reading_direction: right_to_left
+  parallel_jobs: 0
+preprocess:
+  grayscale_mode: luma
+  denoise_enabled: true
+  denoise_strength: 1
+  threshold_mode: adaptive
+  line_sharpening: 0.35
+  background_cleanup: true
+  max_input_dimension: 2600
+layout:
+  panel_detection: true
+  tiling_enabled: true
+  tile_size: 768
+  tile_overlap: 64
+  webtoon_mode: auto
+  reading_direction: right_to_left
+hints:
+  user_hints_enabled: true
+  character_memory_enabled: true
+  style_hints_enabled: true
+  hint_blur_radius: 4.0
+  hint_strength: 1.0
+inference:
+  model_path: models/example_model.onnx.placeholder
+  model_metadata_path: models/model.mangahue.json
+  device: cpu
+  batch_size: 1
+  input_size: 768
+  fp16_enabled: false
+  resize_policy: fit
+postprocess:
+  restore_lines: true
+  line_strength: 1.0
+  bubble_cleanup: true
+  bleeding_correction: true
+  palette_correction: true
+  final_sharpening: 0.15
+output:
+  format: png
+  quality: 95
+  write_report: true
+  write_intermediates: false
+

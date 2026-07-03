@@ -1,0 +1,13 @@
+{
+  "model_name": "MangaHue Hint U-Net",
+  "version": "0.1.0",
+  "model_type": "hint_unet",
+  "input_size": 768,
+  "input_channels": 5,
+  "output_channels": 3,
+  "input_range": "0_1",
+  "output_range": "0_1",
+  "expects_lineart_inverted": false,
+  "supports_style_vector": false
+}
+

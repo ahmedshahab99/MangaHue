@@ -1,0 +1,14 @@
+engine:
+  mode: quality
+  parallel_jobs: 0
+preprocess:
+  denoise_strength: 2
+  line_sharpening: 0.5
+layout:
+  tile_size: 768
+  tile_overlap: 96
+hints:
+  hint_blur_radius: 6.0
+postprocess:
+  final_sharpening: 0.25
+

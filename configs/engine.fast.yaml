@@ -1,0 +1,12 @@
+engine:
+  mode: fast
+  parallel_jobs: 0
+layout:
+  tile_size: 896
+  tile_overlap: 32
+hints:
+  hint_blur_radius: 2.0
+postprocess:
+  bleeding_correction: false
+  final_sharpening: 0.05
+

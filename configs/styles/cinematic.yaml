@@ -1,0 +1,17 @@
+id: cinematic
+name: Cinematic
+saturation: 0.96
+contrast: 1.18
+brightness: -0.02
+shadow_strength: 0.72
+highlight_strength: 0.28
+line_strength: 1.05
+palette:
+  - "#d0a082"
+  - "#2b4858"
+  - "#c69b45"
+  - "#6a2f42"
+protected_colors:
+  - "#ffffff"
+notes: "Film-like contrast, controlled saturation, dramatic shadows."
+

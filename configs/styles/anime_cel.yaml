@@ -1,0 +1,17 @@
+id: anime_cel
+name: Anime Cel
+saturation: 1.12
+contrast: 1.08
+brightness: 0.02
+shadow_strength: 0.55
+highlight_strength: 0.35
+line_strength: 1.0
+palette:
+  - "#f2b38f"
+  - "#2f2f37"
+  - "#4267d6"
+  - "#f6d765"
+protected_colors:
+  - "#ffffff"
+notes: "Clean cel color with manga ink kept dominant."
+

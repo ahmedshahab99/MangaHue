@@ -1,0 +1,20 @@
+{
+  "hints": [
+    {
+      "x": 144,
+      "y": 292,
+      "radius": 18,
+      "color": "#111111",
+      "label": "hero.hair",
+      "strength": 1.0
+    },
+    {
+      "x": 180,
+      "y": 340,
+      "radius": 16,
+      "color": "#e8b89a",
+      "label": "hero.skin",
+      "strength": 0.9
+    }
+  ]
+}

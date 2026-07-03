@@ -1,0 +1,17 @@
+id: watercolor_soft
+name: Watercolor Soft
+saturation: 0.86
+contrast: 0.9
+brightness: 0.06
+shadow_strength: 0.18
+highlight_strength: 0.62
+line_strength: 0.9
+palette:
+  - "#eec5b2"
+  - "#9cc7d6"
+  - "#b6d7a8"
+  - "#d8b4d8"
+protected_colors:
+  - "#ffffff"
+notes: "Low contrast washes with preserved manga readability."
+

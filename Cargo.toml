@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mangahue-core",
+  "crates/mangahue-config",
+  "crates/mangahue-image",
+  "crates/mangahue-preprocess",
+  "crates/mangahue-layout",
+  "crates/mangahue-hints",
+  "crates/mangahue-memory",
+  "crates/mangahue-inference",
+  "crates/mangahue-postprocess",
+  "crates/mangahue-eval",
+  "crates/mangahue-orchestrator",
+  "crates/mangahue-ingest",
+  "crates/mangahue-cli",
+  "crates/mangahue-api",
+  "crates/mangahue-telegram",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["MangaHue AI"]
+repository = "https://example.com/mangahue-engine"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff", "bmp"] }
+imageproc = "0.25"
+rayon = "1.10"
+walkdir = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tempfile = "3.10"
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+axum = "0.7"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+scraper = "0.23"
+url = "2.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,13 @@
+[package]
+name = "mangahue-layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+mangahue-config = { path = "../mangahue-config" }
+mangahue-core = { path = "../mangahue-core" }
+

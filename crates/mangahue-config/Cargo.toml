@@ -1,0 +1,16 @@
+[package]
+name = "mangahue-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+mangahue-core = { path = "../mangahue-core" }
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+

@@ -1,0 +1,8 @@
+engine:
+  mode: debug
+  save_debug_outputs: true
+  parallel_jobs: 1
+output:
+  write_intermediates: true
+  write_report: true
+

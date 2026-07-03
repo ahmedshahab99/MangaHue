@@ -1,0 +1,12 @@
+{
+  "id": "example_project",
+  "name": "Example Project",
+  "default_style": "anime_cel",
+  "reading_direction": "right_to_left",
+  "characters": [
+    "hero"
+  ],
+  "processed_pages": [],
+  "corrections": []
+}
+

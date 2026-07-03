@@ -1,0 +1,20 @@
+{
+  "id": "hero",
+  "name": "Hero",
+  "aliases": [
+    "main character"
+  ],
+  "hair_color": "#111111",
+  "skin_color": "#e8b89a",
+  "eye_color": "#3366ff",
+  "outfit_colors": [
+    "#2f4f88"
+  ],
+  "accent_colors": [
+    "#f6d765"
+  ],
+  "confidence": 0.9,
+  "reference_images": [],
+  "notes": "Example character memory."
+}
+

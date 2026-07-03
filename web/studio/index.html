@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MangaHue Studio</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="mark">MH</span>
+          <div>
+            <h1>MangaHue Studio</h1>
+            <p>Local color director</p>
+          </div>
+        </div>
+        <nav class="tabs" aria-label="Studio views">
+          <button class="tab active" data-view="inspect">Inspect</button>
+          <button class="tab" data-view="colorize">Colorize</button>
+          <button class="tab" data-view="link">Link</button>
+          <button class="tab" data-view="jobs">Jobs</button>
+          <button class="tab" data-view="memory">Memory</button>
+          <button class="tab" data-view="doctor">Doctor</button>
+        </nav>
+        <section class="status" id="health">Connecting...</section>
+      </aside>
+
+      <section class="workspace">
+        <section class="view active" id="view-inspect">
+          <header class="section-head">
+            <h2>Page Inspector</h2>
+            <button id="inspect-run">Run Inspect</button>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="inspect-form">
+              <label>Input path <input name="input_path" value="examples/input/smoke_page.png" /></label>
+              <label>Debug dir <input name="debug_dir" value="examples/output/studio_inspect_debug" /></label>
+            </form>
+            <article class="panel readout">
+              <h3>Director Read</h3>
+              <pre id="inspect-output">No inspection yet.</pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-colorize">
+          <header class="section-head">
+            <h2>Colorize Job</h2>
+            <button id="colorize-run">Queue Job</button>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="colorize-form">
+              <label>Input path <input name="input_path" value="examples/input/smoke_page.png" /></label>
+              <label>Output path <input name="output_path" value="examples/output/studio_color.png" /></label>
+              <label>Debug dir <input name="debug_dir" value="examples/output/studio_color_debug" /></label>
+              <label>Style profile <input name="style_path" value="" placeholder="configs/styles/anime_cel.yaml" /></label>
+              <label>Hints JSON <input name="user_hints_path" value="" placeholder="examples/hints/user_hints.example.json" /></label>
+              <label class="check"><input type="checkbox" name="use_mock_backend" checked /> mock backend</label>
+            </form>
+            <article class="panel preview">
+              <h3>Preview</h3>
+              <img id="preview-image" alt="Generated output preview" />
+              <pre id="colorize-output">No job queued.</pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-link">
+          <header class="section-head">
+            <h2>Link Colorizer</h2>
+            <button id="link-run">Queue Link</button>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="link-form">
+              <label>Authorized manga or image URL <input name="source_url" value="http://127.0.0.1:7878/api/file?path=examples/input/smoke_page.png" /></label>
+              <label>Output dir <input name="output_dir" value="examples/output/studio_link" /></label>
+              <label>Downloads dir <input name="downloads_dir" value=".mangahue/link_downloads" /></label>
+              <label>Style profile <input name="style_path" value="" placeholder="configs/styles/webtoon_bright.yaml" /></label>
+              <label>Max pages <input name="max_pages" type="number" value="8" min="1" max="64" /></label>
+              <label class="check"><input type="checkbox" name="use_mock_backend" checked /> mock backend</label>
+            </form>
+            <article class="panel preview">
+              <h3>Link Result</h3>
+              <img id="link-preview-image" alt="Generated link colorization preview" />
+              <pre id="link-output">No link job queued.</pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-jobs">
+          <header class="section-head">
+            <h2>Jobs</h2>
+            <button id="jobs-refresh">Refresh</button>
+          </header>
+          <div class="panel">
+            <table>
+              <thead>
+                <tr><th>ID</th><th>Status</th><th>Output</th><th>Result</th></tr>
+              </thead>
+              <tbody id="jobs-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="view-memory">
+          <header class="section-head">
+            <h2>Project Memory</h2>
+            <div class="actions">
+              <button id="correction-export-hints">Export Hints</button>
+              <button id="correction-save">Save Correction</button>
+            </div>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="correction-form">
+              <label>Project JSON <input name="project" value="projects/example_project/project.json" /></label>
+              <label>Page <input name="page" value="page_001" /></label>
+              <div class="row">
+                <label>X <input name="x" type="number" value="100" /></label>
+                <label>Y <input name="y" type="number" value="200" /></label>
+              </div>
+              <div class="row">
+                <label>Width <input name="width" type="number" value="80" /></label>
+                <label>Height <input name="height" type="number" value="120" /></label>
+              </div>
+              <label>Label <input name="label" value="hair" /></label>
+              <label>Old color <input name="old" value="#5a4632" /></label>
+              <label>New color <input name="new" value="#111111" /></label>
+              <label>Character <input name="character" value="hero" /></label>
+              <label>Hints output <input name="hints_output" value="examples/output/studio_page_001.hints.json" /></label>
+            </form>
+            <article class="panel readout">
+              <h3>Styles</h3>
+              <div id="styles-list" class="style-list"></div>
+              <h3>Memory Output</h3>
+              <pre id="memory-output">No correction saved.</pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-doctor">
+          <header class="section-head">
+            <h2>System Doctor</h2>
+            <button id="doctor-run">Run Doctor</button>
+          </header>
+          <div class="grid two">
+            <form class="panel" id="doctor-form">
+              <label>Config <input name="config_path" value="configs/engine.default.yaml" /></label>
+              <label>Styles dir <input name="styles_dir" value="configs/styles" /></label>
+              <label>Model metadata <input name="metadata_path" value="models/model.mangahue.json" /></label>
+              <label>Jobs dir <input name="jobs_dir" value=".mangahue/jobs" /></label>
+              <label>Studio dir <input name="studio_dir" value="web/studio" /></label>
+              <label>Sample input <input name="sample_input" value="examples/input/smoke_page.png" /></label>
+              <label>Python <input name="python" value="python" /></label>
+            </form>
+            <article class="panel readout">
+              <h3>Report</h3>
+              <pre id="doctor-output">No doctor run yet.</pre>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="./studio.js"></script>
+  </body>
+</html>

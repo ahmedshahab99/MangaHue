@@ -1,0 +1,14 @@
+[package]
+name = "mangahue-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+image.workspace = true
+mangahue-core = { path = "../mangahue-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
