@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
 use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
@@ -10,9 +10,38 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
 
-const DEFAULT_USER_AGENT: &str = "MangaHue/0.1 (+local-authorized-colorization)";
+fn serialize_duration_ms<S>(d: &Duration, s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_u64(d.as_millis() as u64)
+}
+
+fn deserialize_duration_ms<'de, D>(d: D) -> std::result::Result<Duration, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let ms = u64::deserialize(d)?;
+    Ok(Duration::from_millis(ms))
+}
+
+const DEFAULT_USER_AGENT: &str = concat!(
+    "MangaHue/",
+    env!("CARGO_PKG_VERSION"),
+    " (+local-authorized-colorization)"
+);
+const DEFAULT_MIN_REQUEST_INTERVAL_MS: u64 = 500;
 const DEFAULT_MAX_PAGES: usize = 32;
 const DEFAULT_MAX_BYTES_PER_PAGE: u64 = 32 * 1024 * 1024;
+const DEFAULT_SELECTORS: &[(&str, &str)] = &[
+    ("meta[property='og:image']", "content"),
+    ("meta[name='twitter:image']", "content"),
+    ("img", "src"),
+    ("img", "data-src"),
+    ("img", "data-original"),
+    ("source", "srcset"),
+    ("img", "srcset"),
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
@@ -22,6 +51,14 @@ pub struct IngestRequest {
     pub max_pages: usize,
     #[serde(default = "default_max_bytes_per_page")]
     pub max_bytes_per_page: u64,
+    #[serde(
+        default = "default_min_request_interval",
+        serialize_with = "serialize_duration_ms",
+        deserialize_with = "deserialize_duration_ms"
+    )]
+    pub min_request_interval: Duration,
+    #[serde(default = "default_selectors")]
+    pub selectors: Vec<(String, String)>,
     pub user_agent: Option<String>,
 }
 
@@ -96,7 +133,8 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
         let html = response
             .text()
             .with_context(|| format!("failed to read HTML from {source_url}"))?;
-        let image_urls = extract_image_urls(source_url.as_str(), &html)?;
+        let image_urls =
+            extract_image_urls_with_selectors(source_url.as_str(), &html, &request.selectors)?;
         for image_url in image_urls.into_iter().take(max_pages) {
             let parsed = Url::parse(&image_url)?;
             match download_image_url(
@@ -115,6 +153,9 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
             }
             if pages.len() >= max_pages {
                 break;
+            }
+            if !request.min_request_interval.is_zero() {
+                std::thread::sleep(request.min_request_interval);
             }
         }
     }
@@ -136,24 +177,24 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
 }
 
 pub fn extract_image_urls(base_url: &str, html: &str) -> Result<Vec<String>> {
+    extract_image_urls_with_selectors(base_url, html, &default_selectors())
+}
+
+pub fn extract_image_urls_with_selectors(
+    base_url: &str,
+    html: &str,
+    selectors: &[(String, String)],
+) -> Result<Vec<String>> {
     let base = Url::parse(base_url).with_context(|| format!("invalid base URL: {base_url}"))?;
     let document = Html::parse_document(html);
     let mut urls = Vec::new();
     let mut seen = HashSet::new();
 
-    for (selector_text, attr) in [
-        ("meta[property='og:image']", "content"),
-        ("meta[name='twitter:image']", "content"),
-        ("img", "src"),
-        ("img", "data-src"),
-        ("img", "data-original"),
-        ("source", "srcset"),
-        ("img", "srcset"),
-    ] {
+    for (selector_text, attr) in selectors {
         let selector = Selector::parse(selector_text)
             .map_err(|error| anyhow::anyhow!("invalid selector {selector_text}: {error}"))?;
         for element in document.select(&selector) {
-            let Some(value) = element.value().attr(attr) else {
+            let Some(value) = element.value().attr(attr.as_str()) else {
                 continue;
             };
             for candidate in expand_srcset(value) {
@@ -299,6 +340,17 @@ fn default_max_pages() -> usize {
 
 fn default_max_bytes_per_page() -> u64 {
     DEFAULT_MAX_BYTES_PER_PAGE
+}
+
+fn default_min_request_interval() -> Duration {
+    Duration::from_millis(DEFAULT_MIN_REQUEST_INTERVAL_MS)
+}
+
+pub fn default_selectors() -> Vec<(String, String)> {
+    DEFAULT_SELECTORS
+        .iter()
+        .map(|&(sel, attr)| (sel.to_string(), attr.to_string()))
+        .collect()
 }
 
 #[cfg(test)]

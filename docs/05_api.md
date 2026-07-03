@@ -32,6 +32,7 @@ Routes:
 - `POST /api/link/colorize`
 - `POST /api/chapter/import`
 - `POST /api/chapter/export`
+- `POST /api/chapter/colorize`
 - `GET /api/jobs/{id}`
 - `GET /api/jobs/{id}/result`
 - `POST /api/projects`
@@ -153,6 +154,36 @@ Chapter export payload:
   "input_dir": "examples/output/colored_chapter",
   "output_file": "examples/output/colored_chapter.cbz",
   "manifest_path": "examples/output/colored_chapter.export.json"
+}
+```
+
+Chapter colorize payload:
+
+```json
+{
+  "input_path": "chapter.cbz",
+  "work_dir": ".mangahue/chapter_jobs",
+  "output_dir": "examples/output/colored_chapter",
+  "export_path": "examples/output/colored_chapter.cbz",
+  "gallery_path": "examples/output/colored_chapter/gallery.html",
+  "manifest_path": "examples/output/colored_chapter/job.json",
+  "brain_report_path": "examples/output/colored_chapter/mangahue_chapter_brain.json",
+  "locked_style_path": "examples/output/colored_chapter/mangahue_locked_style.json",
+  "safety_report_path": "examples/output/colored_chapter/mangahue_safety_gate.json",
+  "max_pages": 500,
+  "resume": false,
+  "safety_gate": true,
+  "enforce_safety_gate": false,
+  "consistency_retry": true,
+  "retry_drift_threshold": 0.18,
+  "retry_tone_threshold": 0.34,
+  "retry_max_pages": 24,
+  "template": {
+    "input_path": "",
+    "output_path": "",
+    "style_path": "configs/styles/webtoon_bright.yaml",
+    "use_mock_backend": true
+  }
 }
 ```
 

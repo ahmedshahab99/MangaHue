@@ -10,5 +10,6 @@ anyhow.workspace = true
 image.workspace = true
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
+serde.workspace = true
 serde_json.workspace = true
 

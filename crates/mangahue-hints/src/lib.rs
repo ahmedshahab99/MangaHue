@@ -4,12 +4,15 @@ use mangahue_config::HintsSection;
 use mangahue_core::{
     CharacterProfile, ColorHint, ColorRgb, HintSource, ImageSize, StyleProfile, UserHintFile,
 };
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HintResult {
+    #[serde(skip)]
     pub hint_map: RgbImage,
+    #[serde(skip)]
     pub hint_mask: GrayImage,
     pub applied_hints: usize,
     pub style_hints_applied: usize,

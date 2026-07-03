@@ -2,9 +2,14 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::stream::{Stream, StreamExt};
+use mangahue_chapter::{
+    run_chapter_job, ChapterConsistencyRetry, ChapterJobRequest, ChapterSafetyGateConfig,
+};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb};
 use mangahue_image::{
@@ -23,9 +28,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
@@ -96,6 +103,38 @@ pub struct ApiChapterExportRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiChapterColorizeRequest {
+    pub input_path: PathBuf,
+    pub work_dir: PathBuf,
+    pub output_dir: PathBuf,
+    pub export_path: Option<PathBuf>,
+    pub gallery_path: Option<PathBuf>,
+    pub manifest_path: Option<PathBuf>,
+    pub brain_report_path: Option<PathBuf>,
+    pub locked_style_path: Option<PathBuf>,
+    pub safety_report_path: Option<PathBuf>,
+    pub template: ColorizeRequest,
+    #[serde(default = "default_chapter_max_pages")]
+    pub max_pages: usize,
+    #[serde(default = "default_chapter_max_bytes_per_page")]
+    pub max_bytes_per_page: u64,
+    #[serde(default)]
+    pub resume: bool,
+    #[serde(default = "default_true")]
+    pub safety_gate: bool,
+    #[serde(default)]
+    pub enforce_safety_gate: bool,
+    #[serde(default)]
+    pub consistency_retry: bool,
+    #[serde(default = "default_retry_drift_threshold")]
+    pub retry_drift_threshold: f32,
+    #[serde(default = "default_retry_tone_threshold")]
+    pub retry_tone_threshold: f32,
+    #[serde(default = "default_retry_max_pages")]
+    pub retry_max_pages: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiInspectRequest {
     pub request: InspectRequest,
 }
@@ -126,6 +165,8 @@ pub struct ApiState {
     pub jobs_dir: PathBuf,
     pub styles_dir: PathBuf,
     pub studio_dir: PathBuf,
+    pub cancel_tokens: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -338,6 +379,8 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         jobs_dir: config.jobs_dir,
         styles_dir: config.styles_dir,
         studio_dir: config.studio_dir,
+        cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+        event_channels: Arc::new(RwLock::new(HashMap::new())),
     };
     let app = router(state);
     let listener = TcpListener::bind(config.addr).await?;
@@ -365,8 +408,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/link/colorize", post(create_link_colorize_job))
         .route("/api/chapter/import", post(import_chapter))
         .route("/api/chapter/export", post(export_chapter))
+        .route("/api/chapter/colorize", post(create_chapter_colorize_job))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:id", get(get_job))
+        .route("/api/jobs/:id/events", get(job_events_sse))
+        .route("/api/jobs/:id/cancel", post(cancel_job))
         .route("/api/jobs/:id/result", get(get_job_result))
         .route("/api/projects", post(create_project))
         .route("/api/projects/status", post(project_status))
@@ -441,9 +487,25 @@ pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
 
 async fn create_colorize_job(
     State(state): State<ApiState>,
-    Json(payload): Json<ApiColorizeRequest>,
+    Json(mut payload): Json<ApiColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
     let id = Uuid::new_v4().to_string();
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let (event_tx, _) = broadcast::channel::<String>(32);
+    state
+        .cancel_tokens
+        .write()
+        .await
+        .insert(id.clone(), cancel_token.clone());
+    state
+        .event_channels
+        .write()
+        .await
+        .insert(id.clone(), event_tx.clone());
+
+    payload.request.cancel_token = Some(cancel_token);
+    payload.request.cache_dir = Some(state.jobs_dir.clone());
+
     let job = ApiJob {
         id: id.clone(),
         status: ApiJobStatus::Queued,
@@ -455,11 +517,14 @@ async fn create_colorize_job(
     };
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
+    let _ = event_tx.send(r#"{"status":"queued"}"#.to_string());
+
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
     let runtime = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
+        let _ = event_tx.send(r#"{"status":"running"}"#.to_string());
         update_job_status_blocking(
             &runtime,
             &jobs,
@@ -476,6 +541,7 @@ async fn create_colorize_job(
         match result {
             Ok(result) => {
                 let output_path = result.output_path.clone();
+                let _ = event_tx.send(r#"{"status":"complete"}"#.to_string());
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
@@ -486,13 +552,17 @@ async fn create_colorize_job(
                         error: None,
                         output_path: Some(output_path),
                         result: Some(serde_json::to_value(result).unwrap_or_else(
-                            |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                            |e| serde_json::json!({ "serialization_error": e.to_string() }),
                         )),
                     },
                 );
             }
             Err(error) => {
                 error!("job {id} failed: {error:#}");
+                let _ = event_tx.send(format!(
+                    r#"{{"status":"failed","error":"{}"}}"#,
+                    error.to_string().replace('"', r#"\""#)
+                ));
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
@@ -592,6 +662,8 @@ async fn ingest_link(
             max_pages: payload.max_pages,
             max_bytes_per_page: payload.max_bytes_per_page,
             user_agent: payload.user_agent,
+            min_request_interval: std::time::Duration::from_millis(500),
+            selectors: mangahue_ingest::default_selectors(),
         })
     })
     .await
@@ -706,6 +778,105 @@ async fn export_chapter(
     .await
     .map_err(anyhow::Error::from)??;
     Ok(Json(manifest))
+}
+
+async fn create_chapter_colorize_job(
+    State(state): State<ApiState>,
+    Json(payload): Json<ApiChapterColorizeRequest>,
+) -> Result<Json<ApiJob>, ApiError> {
+    let id = Uuid::new_v4().to_string();
+    let job = ApiJob {
+        id: id.clone(),
+        status: ApiJobStatus::Queued,
+        result_url: Some(format!("/api/jobs/{id}/result")),
+        report_url: None,
+        output_path: Some(payload.output_dir.clone()),
+        error: None,
+        result: None,
+    };
+    state.jobs.write().await.insert(id.clone(), job.clone());
+    persist_job(&state.jobs_dir, &job)?;
+    let jobs = state.jobs.clone();
+    let jobs_dir = state.jobs_dir.clone();
+    let runtime = tokio::runtime::Handle::current();
+
+    tokio::task::spawn_blocking(move || {
+        update_job_status_blocking(
+            &runtime,
+            &jobs,
+            &id,
+            &jobs_dir,
+            JobUpdate {
+                status: ApiJobStatus::Running,
+                error: None,
+                output_path: None,
+                result: None,
+            },
+        );
+        let result = run_chapter_job(ChapterJobRequest {
+            input_path: payload.input_path,
+            work_dir: payload.work_dir,
+            output_dir: payload.output_dir,
+            export_path: payload.export_path,
+            gallery_path: payload.gallery_path,
+            manifest_path: payload.manifest_path,
+            brain_report_path: payload.brain_report_path,
+            locked_style_path: payload.locked_style_path,
+            safety_report_path: payload.safety_report_path,
+            colorize_template: payload.template,
+            import_options: ChapterImportOptions {
+                max_pages: payload.max_pages,
+                max_bytes_per_page: payload.max_bytes_per_page,
+                overwrite: !payload.resume,
+            },
+            safety_gate: ChapterSafetyGateConfig {
+                enabled: payload.safety_gate,
+                enforce: payload.enforce_safety_gate,
+                ..ChapterSafetyGateConfig::default()
+            },
+            consistency_retry: ChapterConsistencyRetry {
+                enabled: payload.consistency_retry,
+                palette_drift_threshold: payload.retry_drift_threshold,
+                tone_drift_threshold: payload.retry_tone_threshold,
+                max_pages: payload.retry_max_pages,
+            },
+            resume: payload.resume,
+        });
+        match result {
+            Ok(summary) => {
+                update_job_status_blocking(
+                    &runtime,
+                    &jobs,
+                    &id,
+                    &jobs_dir,
+                    JobUpdate {
+                        status: ApiJobStatus::Complete,
+                        error: None,
+                        output_path: Some(summary.output_dir.clone()),
+                        result: Some(serde_json::to_value(summary).unwrap_or_else(
+                            |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                        )),
+                    },
+                );
+            }
+            Err(error) => {
+                update_job_status_blocking(
+                    &runtime,
+                    &jobs,
+                    &id,
+                    &jobs_dir,
+                    JobUpdate {
+                        status: ApiJobStatus::Failed,
+                        error: Some(error.to_string()),
+                        output_path: None,
+                        result: None,
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(Json(job))
 }
 
 async fn inspect_page(
@@ -1038,6 +1209,8 @@ fn run_link_colorize_payload(payload: ApiLinkColorizeRequest) -> Result<ApiLinkC
         max_pages: payload.max_pages,
         max_bytes_per_page: payload.max_bytes_per_page,
         user_agent: payload.user_agent,
+        min_request_interval: std::time::Duration::from_millis(500),
+        selectors: mangahue_ingest::default_selectors(),
     })?;
     let engine = MangaHueEngine::new();
     let mut processed = 0usize;
@@ -1116,6 +1289,18 @@ fn default_chapter_max_pages() -> usize {
 
 fn default_chapter_max_bytes_per_page() -> u64 {
     50 * 1024 * 1024
+}
+
+fn default_retry_drift_threshold() -> f32 {
+    0.18
+}
+
+fn default_retry_tone_threshold() -> f32 {
+    0.34
+}
+
+fn default_retry_max_pages() -> usize {
+    24
 }
 
 fn default_config_path() -> PathBuf {
@@ -1467,6 +1652,7 @@ pub fn planned_routes() -> &'static [&'static str] {
         "POST /api/link/colorize",
         "POST /api/chapter/import",
         "POST /api/chapter/export",
+        "POST /api/chapter/colorize",
         "GET /api/jobs",
         "GET /api/jobs/{id}",
         "GET /api/jobs/{id}/result",
@@ -1480,6 +1666,43 @@ pub fn planned_routes() -> &'static [&'static str] {
         "POST /api/corrections",
         "GET /api/styles",
     ]
+}
+
+async fn job_events_sse(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Sse<impl Stream<Item = anyhow::Result<Event>>> {
+    let rx = {
+        let channels = state.event_channels.read().await;
+        match channels.get(&id).cloned() {
+            Some(tx) => tx.subscribe(),
+            None => {
+                let (fake_tx, fake_rx) = broadcast::channel::<String>(1);
+                let _ = fake_tx.send(r#"{"status":"not_found"}"#.to_string());
+                fake_rx
+            }
+        }
+    };
+    let stream = BroadcastStream::new(rx).map(|msg| match msg {
+        Ok(data) => Ok(Event::default().data(data)),
+        Err(_) => Ok(Event::default().data(r#"{"status":"dropped"}"#)),
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn cancel_job(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = state.cancel_tokens.write().await.remove(&id);
+    match token {
+        Some(toggle) => {
+            toggle.store(true, Ordering::Relaxed);
+            let _ = state.event_channels.write().await.remove(&id);
+            Ok(Json(serde_json::json!({ "status": "cancelled", "id": id })))
+        }
+        None => Ok(Json(serde_json::json!({ "status": "not_found", "id": id }))),
+    }
 }
 
 #[cfg(test)]
@@ -1515,5 +1738,6 @@ mod tests {
         assert!(routes.contains(&"POST /api/projects/export-training-manifest"));
         assert!(routes.contains(&"POST /api/link/colorize"));
         assert!(routes.contains(&"POST /api/chapter/import"));
+        assert!(routes.contains(&"POST /api/chapter/colorize"));
     }
 }

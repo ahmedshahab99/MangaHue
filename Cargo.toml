@@ -11,11 +11,15 @@ members = [
   "crates/mangahue-inference",
   "crates/mangahue-postprocess",
   "crates/mangahue-eval",
-  "crates/mangahue-orchestrator",
+  "crates/mangahue-cache",
+  "crates/mangahue-brain",
+  "crates/mangahue-chapter",
   "crates/mangahue-ingest",
+  "crates/mangahue-telegram",
+  "crates/mangahue-ensemble",
+  "crates/mangahue-orchestrator",
   "crates/mangahue-cli",
   "crates/mangahue-api",
-  "crates/mangahue-telegram",
 ]
 
 [workspace.package]
@@ -42,13 +46,19 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 tempfile = "3.10"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+sha2 = "0.10"
+base64 = "0.22"
 axum = "0.7"
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 scraper = "0.23"
 url = "2.5"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray", "std"] }
+ndarray = { version = "0.17", features = ["std"] }
 
 [profile.release]
 lto = "thin"

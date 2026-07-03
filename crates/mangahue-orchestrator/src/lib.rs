@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use image::{GrayImage, Luma, Rgb, RgbImage};
+use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
     CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
 };
+use mangahue_ensemble::{ConfidenceMap, Ensembler};
 use mangahue_hints::{generate_hints, load_user_hints};
 use mangahue_image::{crop_gray, crop_rgb, load_image, save_gray, save_rgb};
 use mangahue_inference::{
@@ -15,8 +17,10 @@ use mangahue_postprocess::{finalize, PostprocessInput};
 use mangahue_preprocess::preprocess_page;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
@@ -35,6 +39,16 @@ pub struct ColorizeRequest {
     pub user_hints_path: Option<PathBuf>,
     pub debug_dir: Option<PathBuf>,
     pub use_mock_backend: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ensemble_model_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub enable_ensemble: bool,
+    #[serde(default, skip)]
+    pub cancel_token: Option<Arc<AtomicBool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +56,12 @@ pub struct ColorizeResult {
     pub output_path: PathBuf,
     pub report: ProcessingReport,
     pub quality_report_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_map_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub from_cache: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -73,6 +93,35 @@ impl MangaHueEngine {
     }
 
     pub fn colorize(&self, request: ColorizeRequest) -> Result<ColorizeResult> {
+        let cancel = request.cancel_token.as_ref().map(Arc::clone);
+
+        if let Some(key) = request.idempotency_key.as_deref().map(|s| s.to_string()) {
+            let ck = CacheKey(key);
+            if let Some(dir) = request.cache_dir.as_deref() {
+                let cache = ArtifactCache::new(dir);
+                if let Ok(Some(artifact)) = cache.get(&ck) {
+                    let report_path = artifact.path.clone();
+                    let report: ProcessingReport = if report_path.exists() {
+                        serde_json::from_slice(&fs::read(&report_path).with_context(|| {
+                            format!("failed to read cached report {}", report_path.display())
+                        })?)
+                        .unwrap_or_default()
+                    } else {
+                        ProcessingReport::default()
+                    };
+                    info!(cache_key = %ck.0, "idempotency cache hit, returning cached result");
+                    return Ok(ColorizeResult {
+                        output_path: request.output_path,
+                        report,
+                        quality_report_path: None,
+                        confidence_map_path: None,
+                        idempotency_key: Some(ck.0),
+                        from_cache: true,
+                    });
+                }
+            }
+        }
+
         let total_start = Instant::now();
         let config = load_config(
             request.config_path.as_deref(),
@@ -103,7 +152,7 @@ impl MangaHueEngine {
         }
 
         let preprocess_start = Instant::now();
-        let preprocess = preprocess_page(&resized, &config.preprocess)?;
+        let preprocess = preprocess_page(&resized, &config.preprocess, &Default::default())?;
         report.preprocessing_ms = preprocess_start.elapsed().as_millis();
         report.page_classification = Some(classify_page(
             size_from_gray(&preprocess.clean_lineart),
@@ -162,80 +211,166 @@ impl MangaHueEngine {
                 .metric("user_hints", hints.user_hints_applied as f64)
                 .metric("hint_coverage", mask_coverage(&hints.hint_mask) as f64),
         );
-        for note in hints.notes {
-            report.warn(note);
+        for note in &hints.notes {
+            report.warn(note.clone());
         }
 
         let inference_start = Instant::now();
-        let backend: Arc<dyn ColorizationBackend> =
-            Arc::from(select_backend(&request, &config, &style)?);
         let parallel_jobs = resolve_parallel_jobs(config.engine.parallel_jobs);
-        info!(
-            backend = backend.name(),
-            jobs = parallel_jobs,
-            tiles = layout.tiles.len(),
-            "running inference"
-        );
-        let colored_tiles: Vec<(TileInfo, RgbImage)> =
+        let use_ensemble = request.enable_ensemble && !request.ensemble_model_paths.is_empty();
+
+        let colored_tiles: Vec<(TileInfo, RgbImage)>;
+        let mut ensemble_report: Option<mangahue_ensemble::EnsembleReport> = None;
+        let mut confidence_map: Option<ConfidenceMap> = None;
+
+        if use_ensemble {
+            let ens = build_ensembler(&request, &config)?;
+            info!(
+                ensemble_variants = 1usize + request.ensemble_model_paths.len(),
+                jobs = parallel_jobs,
+                tiles = layout.tiles.len(),
+                "running ensemble inference"
+            );
+            let cancel = cancel.clone();
             if layout.tiles.len() < 2 || parallel_jobs == 1 {
-                layout
-                    .tiles
-                    .iter()
-                    .map(|tile| {
-                        let lineart = crop_gray(&preprocess.clean_lineart, tile.bbox);
-                        let hint_map = crop_rgb(&hints.hint_map, tile.bbox);
-                        let hint_mask = crop_gray(&hints.hint_mask, tile.bbox);
-                        backend
-                            .colorize(&ModelInput {
-                                lineart,
-                                hint_map,
-                                hint_mask,
-                            })
-                            .map(|output| (tile.clone(), output))
-                            .map_err(|err| anyhow!(err))
-                    })
-                    .collect::<Result<Vec<_>>>()?
+                let mut acc = Vec::with_capacity(layout.tiles.len());
+                for tile in &layout.tiles {
+                    if check_cancel(&cancel) {
+                        return Err(anyhow!("colorization cancelled before tile {}", tile.id));
+                    }
+                    let (merged, conf, _report) = ens
+                        .colorize(&ModelInput {
+                            lineart: crop_gray(&preprocess.clean_lineart, tile.bbox),
+                            hint_map: crop_rgb(&hints.hint_map, tile.bbox),
+                            hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
+                        })
+                        .map_err(|err| anyhow!(err))?;
+                    ensemble_report = Some(_report);
+                    if confidence_map.is_none() {
+                        confidence_map = Some(conf.clone());
+                    }
+                    acc.push((tile.clone(), merged));
+                }
+                colored_tiles = acc;
             } else {
                 let pool = build_pool(parallel_jobs);
-                pool.install(|| {
+                let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
+                    let tiles = &layout.tiles;
+                    let clean = &preprocess.clean_lineart;
+                    let hint_map = &hints.hint_map;
+                    let hint_mask = &hints.hint_mask;
+                    let cancel = cancel.clone();
+                    tiles
+                        .par_iter()
+                        .map(|tile| {
+                            if check_cancel(&cancel) {
+                                return Err(anyhow!("cancelled during ensemble tile {}", tile.id));
+                            }
+                            ens.colorize(&ModelInput {
+                                lineart: crop_gray(clean, tile.bbox),
+                                hint_map: crop_rgb(hint_map, tile.bbox),
+                                hint_mask: crop_gray(hint_mask, tile.bbox),
+                            })
+                            .map(|(merged, _, _)| (tile.clone(), merged))
+                            .map_err(|err| anyhow!(err))
+                        })
+                        .collect()
+                });
+                colored_tiles = raw.into_iter().collect::<Result<Vec<_>>>()?;
+            }
+        } else {
+            let backend: Arc<dyn ColorizationBackend> =
+                Arc::from(select_backend(&request, &config, &style)?);
+            info!(
+                backend = backend.name(),
+                jobs = parallel_jobs,
+                tiles = layout.tiles.len(),
+                "running inference"
+            );
+            let cancel = cancel.clone();
+            colored_tiles = if layout.tiles.len() < 2 || parallel_jobs == 1 {
+                let mut acc = Vec::with_capacity(layout.tiles.len());
+                for tile in &layout.tiles {
+                    if check_cancel(&cancel) {
+                        return Err(anyhow!("colorization cancelled before tile {}", tile.id));
+                    }
+                    let output = backend
+                        .colorize(&ModelInput {
+                            lineart: crop_gray(&preprocess.clean_lineart, tile.bbox),
+                            hint_map: crop_rgb(&hints.hint_map, tile.bbox),
+                            hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
+                        })
+                        .map_err(|err| anyhow!(err))?;
+                    acc.push((tile.clone(), output));
+                }
+                acc
+            } else {
+                let pool = build_pool(parallel_jobs);
+                let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
                     let tiles = &layout.tiles;
                     let clean = &preprocess.clean_lineart;
                     let hint_map = &hints.hint_map;
                     let hint_mask = &hints.hint_mask;
                     let backend = Arc::clone(&backend);
+                    let cancel = cancel.clone();
                     tiles
                         .par_iter()
                         .map(|tile| {
-                            let lineart = crop_gray(clean, tile.bbox);
-                            let hint_map = crop_rgb(hint_map, tile.bbox);
-                            let hint_mask = crop_gray(hint_mask, tile.bbox);
+                            if check_cancel(&cancel) {
+                                return Err(anyhow!("cancelled during tile {}", tile.id));
+                            }
                             backend
                                 .colorize(&ModelInput {
-                                    lineart,
-                                    hint_map,
-                                    hint_mask,
+                                    lineart: crop_gray(clean, tile.bbox),
+                                    hint_map: crop_rgb(hint_map, tile.bbox),
+                                    hint_mask: crop_gray(hint_mask, tile.bbox),
                                 })
                                 .map(|output| (tile.clone(), output))
                                 .map_err(|err| anyhow!(err))
                         })
-                        .collect::<Result<Vec<_>>>()
-                })?
+                        .collect()
+                });
+                raw.into_iter().collect::<Result<Vec<_>>>()?
             };
+        }
+
         let merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
-        report.add_stage_report(
-            StageReport::new("inference")
-                .note(format!("backend={}", backend.name()))
-                .metric("parallel_jobs", parallel_jobs as f64)
-                .metric("tiles_completed", colored_tiles.len() as f64),
-        );
+        let backend_name = if use_ensemble {
+            "ensemble".to_string()
+        } else {
+            select_backend_label(&request, &config, &style)
+                .unwrap_or_else(|_| "unknown".to_string())
+        };
+        let mut inference_report = StageReport::new("inference")
+            .note(format!("backend={}", backend_name))
+            .metric("parallel_jobs", parallel_jobs as f64)
+            .metric("tiles_completed", colored_tiles.len() as f64);
+        if let Some(ref er) = ensemble_report {
+            inference_report = inference_report
+                .metric("ensemble_variants", er.variant_count as f64)
+                .metric("divergence_score", er.divergence_score as f64);
+        }
+        report.add_stage_report(inference_report);
+
+        let confidence_map_path: Option<PathBuf> = if let Some(ref cm) = confidence_map {
+            let conf_path =
+                mangahue_image::sibling_with_suffix(&request.output_path, ".confidence", "png");
+            save_gray(&conf_path, &cm.to_gray_image()).with_context(|| {
+                format!("failed to save confidence map {}", conf_path.display())
+            })?;
+            Some(conf_path)
+        } else {
+            None
+        };
 
         let postprocess_start = Instant::now();
-        let final_image = finalize(PostprocessInput {
+        let (final_image, _postprocess_report) = finalize(PostprocessInput {
             colorized: merged,
             original_grayscale: &preprocess.original_grayscale,
             line_mask: &preprocess.line_mask,
             bubble_mask: &preprocess.bubble_mask,
+            protected_mask: Some(&preprocess.protected_mask),
             style: &style,
             config: &config.postprocess,
         })?;
@@ -272,7 +407,7 @@ impl MangaHueEngine {
             Some(&hints.hint_map),
             Some(&hints.hint_mask),
         );
-        report.director_verdict = Some(director_verdict(&quality, &preprocess.report));
+        report.director_verdict = Some(director_verdict(&quality, &preprocess.report, &config));
 
         report.total_ms = total_start.elapsed().as_millis();
         let report_path = if config.output.write_report {
@@ -298,10 +433,27 @@ impl MangaHueEngine {
             quality_path
         });
 
+        let idempotency_key =
+            compute_idempotency_key(&request, &preprocess, &hints, &config, &style);
+        if let Some(report_path) = report_path.as_ref() {
+            if let Some(dir) = request.cache_dir.as_deref() {
+                let cache = ArtifactCache::new(dir);
+                let _ck = CacheKey(idempotency_key.clone());
+                let _ = cache.put_file(
+                    report_path,
+                    ArtifactKind::QualityReport,
+                    Some("application/json".to_string()),
+                );
+            }
+        }
+
         Ok(ColorizeResult {
             output_path: request.output_path,
             report,
             quality_report_path,
+            confidence_map_path,
+            idempotency_key: Some(idempotency_key),
+            from_cache: false,
         })
     }
 
@@ -315,7 +467,7 @@ impl MangaHueEngine {
             &manga_image.image,
             config.preprocess.max_input_dimension,
         );
-        let preprocess = preprocess_page(&resized, &config.preprocess)?;
+        let preprocess = preprocess_page(&resized, &config.preprocess, &Default::default())?;
         let layout = analyze_layout(&preprocess.clean_lineart, &config.layout)?;
         let page_classification = classify_page(
             size_from_gray(&preprocess.clean_lineart),
@@ -415,6 +567,12 @@ fn select_backend(
         return Err(anyhow!(
             "real colorization requires an ONNX model; pass --model path/to/model.onnx or use --mock for pipeline verification"
         ));
+    }
+    #[cfg(feature = "native-onnx")]
+    if let Ok(backend) =
+        mangahue_inference::RustOnnxBackend::new(model_path, &config.inference.model_metadata_path)
+    {
+        return Ok(Box::new(backend));
     }
     Ok(Box::new(OnnxColorizationBackend::new(
         model_path,
@@ -543,17 +701,18 @@ fn classify_page(size: ImageSize, report: &mangahue_preprocess::PreprocessReport
 fn director_verdict(
     quality: &mangahue_eval::QualityReport,
     preprocess: &mangahue_preprocess::PreprocessReport,
+    config: &EngineConfig,
 ) -> String {
-    if quality.line_preservation_score < 0.92 {
+    if quality.line_preservation_score < config.eval.line_preservation_threshold {
         return "needs_line_preservation_attention".to_string();
     }
-    if quality.protected_region_violation_score < 0.96 {
+    if quality.protected_region_violation_score < config.eval.protected_region_violation_threshold {
         return "needs_protected_region_cleanup".to_string();
     }
-    if quality.hint_adherence_score < 0.72 {
+    if quality.hint_adherence_score < config.eval.hint_adherence_threshold {
         return "needs_stronger_hint_or_memory_guidance".to_string();
     }
-    if preprocess.screen_tone_score > 0.18 {
+    if preprocess.screen_tone_score > config.eval.screen_tone_warning_threshold {
         return "production_ready_with_tone_training_warning".to_string();
     }
     "production_ready_preview".to_string()
@@ -635,6 +794,70 @@ fn build_pool(jobs: usize) -> rayon::ThreadPool {
                 .build()
                 .expect("rayon global pool must always build")
         })
+}
+
+fn build_ensembler(request: &ColorizeRequest, config: &EngineConfig) -> Result<Ensembler> {
+    let metadata_path = config.inference.model_metadata_path.as_path();
+    let mut model_paths: Vec<PathBuf> =
+        Vec::with_capacity(request.ensemble_model_paths.len().max(1));
+    model_paths.extend(request.ensemble_model_paths.iter().cloned());
+    if model_paths.is_empty() {
+        if let Some(ref primary) = request.model_path {
+            model_paths.push(primary.clone());
+        }
+    }
+    if model_paths.is_empty() {
+        return Err(anyhow!("ensemble requires at least one model path"));
+    }
+    Ensembler::from_onnx(&model_paths, metadata_path)
+}
+
+fn select_backend_label(
+    request: &ColorizeRequest,
+    config: &EngineConfig,
+    style: &StyleProfile,
+) -> Result<String> {
+    let backend = select_backend(request, config, style)?;
+    Ok(backend.name().to_string())
+}
+
+fn check_cancel(cancel: &Option<Arc<AtomicBool>>) -> bool {
+    cancel
+        .as_ref()
+        .is_some_and(|toggle| toggle.load(Ordering::Relaxed))
+}
+
+fn compute_idempotency_key(
+    request: &ColorizeRequest,
+    preprocess: &mangahue_preprocess::PreprocessResult,
+    hints: &mangahue_hints::HintResult,
+    config: &EngineConfig,
+    style: &StyleProfile,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(request.input_path.to_string_lossy().as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(preprocess.clean_lineart.width().to_le_bytes());
+    hasher.update(preprocess.clean_lineart.height().to_le_bytes());
+    hasher.update(hints.applied_hints.to_le_bytes());
+    hasher.update(b"\x00");
+    hasher.update(style.id.as_bytes());
+    let mode_val: u8 = match config.engine.mode {
+        mangahue_config::EngineMode::Fast => 0,
+        mangahue_config::EngineMode::Balanced => 1,
+        mangahue_config::EngineMode::Quality => 2,
+        mangahue_config::EngineMode::Debug => 3,
+    };
+    hasher.update([mode_val]);
+    hasher.update(config.layout.tile_size.to_le_bytes());
+    let digest = hasher.finalize();
+    base64_encode_hash(&digest)
+}
+
+fn base64_encode_hash(digest: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    URL_SAFE_NO_PAD.encode(digest)
 }
 
 #[cfg(test)]

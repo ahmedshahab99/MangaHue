@@ -192,6 +192,58 @@ async function exportChapter() {
   $("#chapter-output").textContent = pretty(result);
 }
 
+async function colorizeChapter() {
+  const data = formData($("#chapter-form"));
+  const job = await api("/api/chapter/colorize", {
+    method: "POST",
+    body: JSON.stringify({
+      input_path: data.input_path,
+      work_dir: data.work_dir,
+      output_dir: data.color_output_dir,
+      export_path: optionalPath(data.export_file),
+      gallery_path: optionalPath(data.gallery_path),
+      manifest_path: optionalPath(data.manifest_path),
+      brain_report_path: optionalPath(data.brain_report_path),
+      locked_style_path: optionalPath(data.locked_style_path),
+      safety_report_path: optionalPath(data.safety_report_path),
+      max_pages: Number(data.max_pages || 500),
+      resume: data.resume,
+      safety_gate: true,
+      enforce_safety_gate: data.enforce_safety_gate,
+      consistency_retry: data.consistency_retry,
+      retry_drift_threshold: Number(data.retry_drift_threshold || 0.18),
+      retry_tone_threshold: 0.34,
+      retry_max_pages: Number(data.retry_max_pages || 24),
+      template: {
+        input_path: "",
+        output_path: "",
+        style_path: optionalPath(data.style_path),
+        use_mock_backend: data.use_mock_backend,
+      },
+    }),
+  });
+  $("#chapter-output").textContent = pretty(job);
+  await pollChapterJob(job.id);
+}
+
+async function pollChapterJob(id) {
+  for (let i = 0; i < 180; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const job = await api(`/api/jobs/${id}`);
+    $("#chapter-output").textContent = pretty(job);
+    if (job.status === "complete") {
+      const result = await api(`/api/jobs/${id}/result`);
+      $("#chapter-output").textContent = pretty(result);
+      await refreshJobs();
+      return;
+    }
+    if (job.status === "failed") {
+      throw new Error(job.error || "chapter job failed");
+    }
+  }
+  throw new Error("chapter job timed out");
+}
+
 async function refreshJobs() {
   const jobs = await api("/api/jobs");
   $("#jobs-table").innerHTML = jobs
@@ -271,6 +323,7 @@ function wire() {
   $("#link-run").addEventListener("click", () => queueLinkColorize().catch((error) => $("#link-output").textContent = error.message));
   $("#chapter-import").addEventListener("click", () => importChapter().catch((error) => $("#chapter-output").textContent = error.message));
   $("#chapter-export").addEventListener("click", () => exportChapter().catch((error) => $("#chapter-output").textContent = error.message));
+  $("#chapter-colorize").addEventListener("click", () => colorizeChapter().catch((error) => $("#chapter-output").textContent = error.message));
   $("#jobs-refresh").addEventListener("click", () => refreshJobs());
   $("#correction-save").addEventListener("click", () => saveCorrection().catch((error) => $("#memory-output").textContent = error.message));
   $("#correction-export-hints").addEventListener("click", () => exportCorrectionHints().catch((error) => $("#memory-output").textContent = error.message));

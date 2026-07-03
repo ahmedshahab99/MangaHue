@@ -91,6 +91,25 @@ pub struct OutputSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalSection {
+    pub line_preservation_threshold: f32,
+    pub protected_region_violation_threshold: f32,
+    pub hint_adherence_threshold: f32,
+    pub screen_tone_warning_threshold: f32,
+}
+
+impl Default for EvalSection {
+    fn default() -> Self {
+        Self {
+            line_preservation_threshold: 0.92,
+            protected_region_violation_threshold: 0.96,
+            hint_adherence_threshold: 0.72,
+            screen_tone_warning_threshold: 0.18,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub engine: EngineSection,
     pub preprocess: PreprocessSection,
@@ -99,6 +118,8 @@ pub struct EngineConfig {
     pub inference: InferenceSection,
     pub postprocess: PostprocessSection,
     pub output: OutputSection,
+    pub eval: EvalSection,
+    // TODO: Add advanced_preprocess: AdvancedPreprocessConfig when it is defined in mangahue-preprocess
 }
 
 impl Default for EngineConfig {
@@ -159,6 +180,7 @@ impl Default for EngineConfig {
                 write_report: true,
                 write_intermediates: false,
             },
+            eval: EvalSection::default(),
         }
     }
 }

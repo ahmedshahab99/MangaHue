@@ -1,0 +1,18 @@
+[package]
+name = "mangahue-brain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+image.workspace = true
+mangahue-core = { path = "../mangahue-core" }
+mangahue-eval = { path = "../mangahue-eval" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

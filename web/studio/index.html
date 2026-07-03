@@ -94,6 +94,7 @@
           <header class="section-head">
             <h2>Chapter Tools</h2>
             <div class="actions">
+              <button id="chapter-colorize">Colorize Chapter</button>
               <button id="chapter-export">Export Archive</button>
               <button id="chapter-import">Import Chapter</button>
             </div>
@@ -105,7 +106,20 @@
               <label>Manifest path <input name="manifest_path" value="examples/output/studio_chapter_import/manifest.json" /></label>
               <label>Export input dir <input name="export_input_dir" value="examples/output/studio_chapter_import" /></label>
               <label>Export archive <input name="export_file" value="examples/output/studio_chapter.cbz" /></label>
+              <label>Color output dir <input name="color_output_dir" value="examples/output/studio_chapter_color" /></label>
+              <label>Work dir <input name="work_dir" value=".mangahue/chapter_jobs" /></label>
+              <label>Gallery path <input name="gallery_path" value="examples/output/studio_chapter_color/gallery.html" /></label>
+              <label>Brain report <input name="brain_report_path" value="examples/output/studio_chapter_color/mangahue_chapter_brain.json" /></label>
+              <label>Locked style <input name="locked_style_path" value="examples/output/studio_chapter_color/mangahue_locked_style.json" /></label>
+              <label>Safety report <input name="safety_report_path" value="examples/output/studio_chapter_color/mangahue_safety_gate.json" /></label>
+              <label>Style profile <input name="style_path" value="" placeholder="configs/styles/webtoon_bright.yaml" /></label>
               <label>Max pages <input name="max_pages" type="number" value="500" min="1" max="1000" /></label>
+              <label>Retry drift <input name="retry_drift_threshold" type="number" value="0.18" min="0" max="1" step="0.01" /></label>
+              <label>Retry pages <input name="retry_max_pages" type="number" value="24" min="1" max="500" /></label>
+              <label class="check"><input type="checkbox" name="use_mock_backend" checked /> mock backend</label>
+              <label class="check"><input type="checkbox" name="resume" /> resume completed pages</label>
+              <label class="check"><input type="checkbox" name="consistency_retry" checked /> consistency retry</label>
+              <label class="check"><input type="checkbox" name="enforce_safety_gate" /> enforce safety gate</label>
             </form>
             <article class="panel readout">
               <h3>Chapter Output</h3>

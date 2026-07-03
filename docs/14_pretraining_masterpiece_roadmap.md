@@ -10,20 +10,23 @@ MangaHue can become much more powerful before the final trained model exists. Th
 - Line-art preservation, speech/text protection, debug masks, and quality reports.
 - Project memory, correction records, correction-derived hints, and training manifests.
 - CLI, API, Studio, and Telegram delivery surfaces.
+- Resumable chapter jobs with persistent manifests, gallery output, and CBZ export.
+- Content-addressed artifact cache primitives for source pages, manifests, galleries, archives, and future intermediate tensors.
+- Chapter brain reports that extract stable palettes, measure page-to-page drift, write locked style profiles, and selectively retry drifted pages.
+- Chapter safety gate reports that audit line preservation, speech bubble cleanliness, protected regions, and hint adherence before archive export.
+- Protected-region repair in postprocess: bright bubble/protected areas are restored while dark text/ink is preserved.
 
 ## Best Advanced Features Before Training
 
-1. Chapter job resume: persist every page stage so a 200-page chapter can continue after failure.
-2. Visual gallery export: static HTML gallery with before/after sliders and quality warnings.
-3. Region lock editor: let users lock hair, eyes, skin, clothing, bubbles, and backgrounds before model inference.
-4. Palette memory studio: chapter-level character palettes with locked colors and confidence scores.
-5. Bubble/text safety audit: hard fail or auto-repair when speech bubbles are colored.
-6. Chapter consistency report: detect color drift page-to-page even with mock/model outputs.
-7. Archive security hardening: archive bomb limits, total uncompressed byte limits, nested archive rejection.
-8. Watermark/export profiles: free preview, premium high-res, CBZ, ZIP, and web gallery bundles.
-9. Dataset builder: convert finished/corrected chapters into training-ready paired samples.
-10. Human correction loop: export corrections, create hint files, and feed improvements into later training.
+1. Palette memory studio: editable chapter-level character palettes with locked colors and confidence scores.
+2. Region lock editor: let users lock hair, eyes, skin, clothing, bubbles, and backgrounds before model inference.
+3. Dataset builder: convert finished/corrected chapters into training-ready paired samples.
+4. Consistency dashboard: rank risky pages, retry history, and palette lock confidence.
+5. Archive security hardening: archive bomb limits, total uncompressed byte limits, nested archive rejection.
+6. Watermark/export profiles: free preview, premium high-res, CBZ, ZIP, and web gallery bundles.
+7. Training data curator: rank pages by safety, palette stability, hint adherence, and correction density.
+8. Human correction loop: export corrections, create hint files, and feed improvements into later training.
 
 ## Next Recommended Build Step
 
-Build chapter job resume and a web preview gallery. That makes MangaHue feel like a full product even before the model is trained: users can upload a full chapter, watch progress, recover failures, inspect quality, and download a polished package.
+Build the palette memory studio. MangaHue now protects chapter output before training; the next brain step is giving users direct control over locked identity colors.

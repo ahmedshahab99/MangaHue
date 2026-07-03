@@ -62,7 +62,9 @@ pub trait ColorizationBackend: Send + Sync {
 
 #[derive(Debug, Clone)]
 pub struct MockColorizationBackend {
+    #[allow(dead_code)]
     palette: Vec<ColorRgb>,
+    ambient: ColorRgb,
 }
 
 impl Default for MockColorizationBackend {
@@ -74,13 +76,17 @@ impl Default for MockColorizationBackend {
                 ColorRgb::new(241, 205, 91),
                 ColorRgb::new(87, 174, 132),
             ],
+            ambient: ColorRgb::new(185, 163, 147),
         }
     }
 }
 
 impl MockColorizationBackend {
     pub fn new(palette: Vec<ColorRgb>) -> Self {
-        Self { palette }
+        Self {
+            palette,
+            ambient: ColorRgb::new(185, 163, 147),
+        }
     }
 }
 
@@ -101,34 +107,33 @@ impl ColorizationBackend for MockColorizationBackend {
         }
 
         let mut output = RgbImage::new(width, height);
-        let denom = (width + height).max(1) as f32;
         for y in 0..height {
             for x in 0..width {
-                let line = input.lineart.get_pixel(x, y)[0] as f32 / 255.0;
-                let palette_index = ((x / 96 + y / 96) as usize) % self.palette.len().max(1);
-                let base = self
-                    .palette
-                    .get(palette_index)
-                    .copied()
-                    .unwrap_or(ColorRgb::new(190, 160, 140));
-                let gradient = (x + y) as f32 / denom;
-                let ambient = ColorRgb::new(
-                    shift(base.r, 28.0 * (gradient - 0.5)),
-                    shift(base.g, 18.0 * (0.5 - gradient)),
-                    shift(base.b, 22.0 * (gradient - 0.25)),
-                );
+                let line_value = input.lineart.get_pixel(x, y)[0] as f32;
+                let line = line_value / 255.0;
                 let hint_strength = input.hint_mask.get_pixel(x, y)[0] as f32 / 255.0;
                 let hint = input.hint_map.get_pixel(x, y);
                 let hinted = ColorRgb::new(hint[0], hint[1], hint[2]);
-                let mixed = ambient.mix(hinted, hint_strength);
+                let color = if hint_strength > 0.0 {
+                    hinted
+                } else {
+                    self.ambient
+                };
+                let line_darken = if line_value < 50.0 { 0.75 } else { 1.0 };
                 let paper_shadow = 0.72 + 0.28 * line;
                 output.put_pixel(
                     x,
                     y,
                     Rgb([
-                        (mixed.r as f32 * paper_shadow).round().clamp(0.0, 255.0) as u8,
-                        (mixed.g as f32 * paper_shadow).round().clamp(0.0, 255.0) as u8,
-                        (mixed.b as f32 * paper_shadow).round().clamp(0.0, 255.0) as u8,
+                        (color.r as f32 * paper_shadow * line_darken)
+                            .round()
+                            .clamp(0.0, 255.0) as u8,
+                        (color.g as f32 * paper_shadow * line_darken)
+                            .round()
+                            .clamp(0.0, 255.0) as u8,
+                        (color.b as f32 * paper_shadow * line_darken)
+                            .round()
+                            .clamp(0.0, 255.0) as u8,
                     ]),
                 );
             }
@@ -156,11 +161,28 @@ impl OnnxColorizationBackend {
         }
         let metadata_path = metadata_path.as_ref();
         let metadata = ModelMetadata::load(metadata_path)?;
+        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let status = std::process::Command::new(&python)
+            .arg("--version")
+            .output()
+            .map_err(|e| {
+                anyhow!(
+                    "Python executable '{}' not found or not runnable: {}. Set MANGAHUE_PYTHON.",
+                    python,
+                    e
+                )
+            })?;
+        if !status.status.success() {
+            return Err(anyhow!(
+                "Python executable '{}' failed version check",
+                python
+            ));
+        }
         Ok(Self {
             model_path: model_path.to_path_buf(),
             metadata_path: metadata_path.to_path_buf(),
             metadata,
-            python: std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string()),
+            python,
         })
     }
 }
@@ -237,8 +259,96 @@ impl ColorizationBackend for OnnxColorizationBackend {
     }
 }
 
-fn shift(value: u8, delta: f32) -> u8 {
-    (value as f32 + delta).round().clamp(0.0, 255.0) as u8
+#[cfg(feature = "native-onnx")]
+use ort::{session::Session, value::Tensor};
+
+#[cfg(feature = "native-onnx")]
+use std::sync::Mutex;
+
+#[cfg(feature = "native-onnx")]
+#[derive(Debug)]
+pub struct RustOnnxBackend {
+    session: Mutex<Session>,
+    metadata: ModelMetadata,
+}
+
+#[cfg(feature = "native-onnx")]
+impl RustOnnxBackend {
+    pub fn new(model_path: impl AsRef<Path>, metadata_path: impl AsRef<Path>) -> Result<Self> {
+        let metadata = ModelMetadata::load(metadata_path)?;
+        let model_path = model_path.as_ref();
+        let session = Session::builder()
+            .map_err(|e| anyhow!("failed to create ONNX session: {e}"))?
+            .commit_from_file(model_path)
+            .map_err(|e| anyhow!("failed to load ONNX model {}: {e}", model_path.display()))?;
+        Ok(Self {
+            session: Mutex::new(session),
+            metadata,
+        })
+    }
+}
+
+#[cfg(feature = "native-onnx")]
+impl ColorizationBackend for RustOnnxBackend {
+    fn name(&self) -> &str {
+        "rust-onnx"
+    }
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let h = input.lineart.height() as usize;
+        let w = input.lineart.width() as usize;
+        let channels = self.metadata.input_channels as usize;
+
+        let mut tensor_data = Vec::with_capacity(1 * channels * h * w);
+        for y in 0..h {
+            for x in 0..w {
+                tensor_data.push(input.lineart.get_pixel(x as u32, y as u32)[0] as f32 / 255.0);
+            }
+        }
+        if channels == 5 {
+            for c in 0..3 {
+                for y in 0..h {
+                    for x in 0..w {
+                        tensor_data
+                            .push(input.hint_map.get_pixel(x as u32, y as u32)[c] as f32 / 255.0);
+                    }
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    tensor_data
+                        .push(input.hint_mask.get_pixel(x as u32, y as u32)[0] as f32 / 255.0);
+                }
+            }
+        }
+
+        let array = ndarray::Array4::from_shape_vec((1, channels, h, w), tensor_data)
+            .map_err(|e| EngineError::Inference(format!("tensor shape error: {e}")))?;
+        let tensor = Tensor::from_array(array)
+            .map_err(|e| EngineError::Inference(format!("failed to create tensor: {e}")))?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
+        let outputs = session
+            .run(ort::inputs!["image_input" => tensor])
+            .map_err(|e| EngineError::Inference(format!("ONNX inference failed: {e}")))?;
+        let (_, output_data) = outputs["color_output"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
+
+        let mut image = RgbImage::new(w as u32, h as u32);
+        let plane_size = h * w;
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                let r = (output_data[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let g = (output_data[plane_size + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                let b = (output_data[2 * plane_size + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
+                image.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+            }
+        }
+        Ok(image)
+    }
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ chrono.workspace = true
 mangahue-core = { path = "../mangahue-core" }
 serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

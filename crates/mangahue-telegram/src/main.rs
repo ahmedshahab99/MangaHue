@@ -88,41 +88,54 @@ fn main() -> Result<()> {
         .context("failed to build Telegram HTTP client")?;
 
     let mut offset = None;
+    let mut backoff = std::time::Duration::from_secs(1);
     loop {
-        let updates = get_updates(&client, &token, offset, args.poll_timeout_seconds)?;
-        for update in updates {
-            offset = Some(update.update_id + 1);
-            let Some(message) = update.message else {
-                continue;
-            };
-            let Some(text) = message.text else {
-                send_message(
-                    &client,
-                    &token,
-                    message.chat.id,
-                    "Send an authorized manga, webtoon, or image URL and I will colorize it.",
-                )?;
-                continue;
-            };
-            let Some(url) = first_url(&text) else {
-                send_message(
-                    &client,
-                    &token,
-                    message.chat.id,
-                    "Send one authorized manga, webtoon, or image URL.",
-                )?;
-                continue;
-            };
-            if let Err(error) = handle_link(&client, &token, &args, message.chat.id, &url) {
-                let _ = send_message(
-                    &client,
-                    &token,
-                    message.chat.id,
-                    &format!("MangaHue could not finish this link: {error}"),
-                );
+        match poll_once(&client, &token, &args, &mut offset) {
+            Ok(()) => backoff = std::time::Duration::from_secs(1),
+            Err(e) => {
+                tracing::error!("poll error (will retry in {}s): {e}", backoff.as_secs());
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
             }
         }
     }
+}
+
+fn poll_once(client: &Client, token: &str, args: &Args, offset: &mut Option<i64>) -> Result<()> {
+    let updates = get_updates(client, token, *offset, args.poll_timeout_seconds)?;
+    for update in updates {
+        *offset = Some(update.update_id + 1);
+        let Some(message) = update.message else {
+            continue;
+        };
+        let Some(text) = message.text else {
+            send_message(
+                client,
+                token,
+                message.chat.id,
+                "Send an authorized manga, webtoon, or image URL and I will colorize it.",
+            )?;
+            continue;
+        };
+        let Some(url) = first_url(&text) else {
+            send_message(
+                client,
+                token,
+                message.chat.id,
+                "Send one authorized manga, webtoon, or image URL.",
+            )?;
+            continue;
+        };
+        if let Err(error) = handle_link(client, token, args, message.chat.id, &url) {
+            let _ = send_message(
+                client,
+                token,
+                message.chat.id,
+                &format!("MangaHue could not finish this link: {error}"),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn handle_link(client: &Client, token: &str, args: &Args, chat_id: i64, url: &str) -> Result<()> {
@@ -144,6 +157,8 @@ fn handle_link(client: &Client, token: &str, args: &Args, chat_id: i64, url: &st
         output_dir: downloads_dir,
         max_pages: args.max_pages,
         max_bytes_per_page: args.max_bytes_per_page,
+        min_request_interval: std::time::Duration::from_millis(500),
+        selectors: mangahue_ingest::default_selectors(),
         user_agent: None,
     })?;
     if ingest.pages.is_empty() {

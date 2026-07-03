@@ -12,7 +12,10 @@ MangaHue Engine separates the colorization product into stable responsibilities:
 - `mangahue-inference`: model contracts and colorization backends.
 - `mangahue-postprocess`: line restore, bubble cleanup, palette correction.
 - `mangahue-eval`: quality metrics.
+- `mangahue-cache`: content-addressed artifact storage.
+- `mangahue-brain`: chapter palette locks and consistency reports.
 - `mangahue-orchestrator`: the full pipeline.
+- `mangahue-chapter`: resumable chapter jobs, archive export, galleries, and brain output.
 - `mangahue-cli`: user commands.
 - `mangahue-api`: web API contract skeleton.
 

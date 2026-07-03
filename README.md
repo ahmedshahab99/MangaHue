@@ -5,7 +5,7 @@ MangaHue Engine is a Rust-first manga colorization intelligence layer. It does n
 This repository currently contains the first production-shaped slice:
 
 - A Rust workspace with the blueprint crates.
-- Strong domain types, config loading, image I/O, preprocessing, layout, hints, memory, inference interfaces, postprocessing, evaluation, orchestrator, CLI, and API skeletons.
+- Strong domain types, config loading, image I/O, preprocessing, layout, hints, memory, inference interfaces, brain reports, postprocessing, evaluation, orchestrator, CLI, and API skeletons.
 - Director-grade inspection reports: page classification, ink density, tone score, component analysis, protected-region coverage, hint adherence, and a final verdict.
 - Debug overlays that show ink, bubbles, text, tones, and hints in one visual.
 - A Python/PyTorch model package scaffold for future training and ONNX export.
@@ -38,7 +38,8 @@ mangahue serve --addr 127.0.0.1:7878
 mangahue preprocess input.png --output clean.png
 mangahue make-hints input.png --hints hints.json --output-map hint_map.png --output-mask hint_mask.png
 mangahue chapter import chapter.cbz --output .mangahue/imported_chapter
-mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --mock
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --gallery examples/output/colored_chapter/gallery.html --manifest examples/output/colored_chapter/job.json --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --locked-style examples/output/colored_chapter/mangahue_locked_style.json --safety-report examples/output/colored_chapter/mangahue_safety_gate.json --consistency-retry --mock
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --manifest examples/output/colored_chapter/job.json --resume --mock
 mangahue chapter export examples/output/colored_chapter --output examples/output/colored_chapter.cbz
 mangahue project create "My Manga" --output projects/my_manga
 mangahue character create --project projects/my_manga --name Hero --hair "#111111" --eyes "#3366ff" --skin "#e8b89a"

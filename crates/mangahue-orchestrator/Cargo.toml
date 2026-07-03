@@ -5,8 +5,13 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+native-onnx = ["mangahue-inference/native-onnx"]
+
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 image.workspace = true
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
@@ -18,9 +23,12 @@ mangahue-layout = { path = "../mangahue-layout" }
 mangahue-memory = { path = "../mangahue-memory" }
 mangahue-postprocess = { path = "../mangahue-postprocess" }
 mangahue-preprocess = { path = "../mangahue-preprocess" }
+mangahue-cache = { path = "../mangahue-cache" }
+mangahue-ensemble = { path = "../mangahue-ensemble" }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

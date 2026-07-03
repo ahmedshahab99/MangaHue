@@ -343,10 +343,14 @@ fn safe_page_id(page: &str) -> String {
 }
 
 fn manifest_relative_path(base_dir: &Path, path: &Path) -> PathBuf {
-    let base = base_dir
-        .canonicalize()
-        .unwrap_or_else(|_| base_dir.to_path_buf());
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let base = std::fs::canonicalize(base_dir).unwrap_or_else(|e| {
+        tracing::warn!("cannot canonicalize {}: {e}", base_dir.display());
+        base_dir.to_path_buf()
+    });
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|e| {
+        tracing::warn!("cannot canonicalize {}: {e}", path.display());
+        path.to_path_buf()
+    });
     resolved
         .strip_prefix(&base)
         .map(Path::to_path_buf)

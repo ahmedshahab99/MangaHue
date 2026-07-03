@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 image.workspace = true
+imageproc.workspace = true
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
 serde.workspace = true

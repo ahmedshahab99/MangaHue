@@ -22,9 +22,17 @@ Implemented deliverables:
 - Benchmark JSON reports now include per-page stage timings (`preprocess / layout / hint / inference / postprocess`), mean/median/stddev/throughput metrics, backend counts, peak/final RSS, CPU count, total memory, and ISO-8601 start/finish timestamps.
 - Engine configs (`engine.default.yaml`, `engine.fast.yaml`, `engine.quality.yaml`, `engine.debug.yaml`) all expose `engine.parallel_jobs`.
 
+## Production Intelligence Layer (Beyond Phase 10)
+
+- **`mangahue-ensemble`** crate: multi-backend voting via `Ensembler`. N models vote per tile; divergence scored per pixel; three consensus strategies (`MajorityWeighted`, `DivergenceReject`, `AverageBlend`); produces a `ConfidenceMap` (grayscale confidence + cause-heatmap). Plugs behind the existing `ColorizationBackend` trait.
+- **`mangahue-cache`** crate: content-addressable artifact store (SHA-256 keys, `ArtifactCache`). Pipeline computes an idempotency key from input path, preprocess hashes, hint counts, style, and engine config; cache hit returns `from_cache: true` instantly.
+- **Cancellable jobs**: `ColorizeRequest.cancel_token: Option<Arc<AtomicBool>>` checked before each tile and between pages. `POST /api/jobs/:id/cancel` sets the flag; orchestrator returns a clean error.
+- **SSE streaming**: `GET /api/jobs/:id/events` pushes `queued → running → complete/failed` via Server-Sent Events (`tokio::sync::broadcast`). Studio can watch live progress.
+- **Idempotency key**: computed per-request from a SHA-256 hash of the entire pipeline state; written into reports and cache manifests.
+
 ## Remaining major work
 
 - Train the actual colorization model (the `python/` package now has a preparer, trainer with val split + best checkpoint, and ONNX export with `--validate`; the full workflow lives in `docs/12_training_workflow.md` and `scripts/train.ps1`).
 - After training, run `python -m mangahue_train.export_onnx ... --validate` and `cargo run -p mangahue-cli -- model validate-onnx` against the produced files.
-- Add a native Rust ONNX provider behind the existing `ColorizationBackend` trait (current backend shells out to the Python ONNX sidecar). Requires the `ort` crate and is optional.
-- Optional: model quantization (fp16/int8) tools for release-size shrinking once a real model exists.
+- Add a native Rust ONNX provider behind the existing `ColorizationBackend` trait. Requires the `ort` crate.
+- Optional: model quantization (fp16/int8) tools for release-size shrinking.

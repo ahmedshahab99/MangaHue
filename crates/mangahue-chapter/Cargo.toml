@@ -1,0 +1,22 @@
+[package]
+name = "mangahue-chapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+mangahue-brain = { path = "../mangahue-brain" }
+mangahue-config = { path = "../mangahue-config" }
+mangahue-core = { path = "../mangahue-core" }
+mangahue-image = { path = "../mangahue-image" }
+mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+image.workspace = true
+tempfile.workspace = true

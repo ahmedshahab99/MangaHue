@@ -66,8 +66,8 @@ pub fn load_image(path: impl AsRef<Path>) -> Result<MangaImage> {
     let format = format_from_path(path);
     let id = path
         .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("page")
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow!("image path has no valid stem: {}", path.display()))?
         .to_string();
     let info = MangaPageInfo {
         id,

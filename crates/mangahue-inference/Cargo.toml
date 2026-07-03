@@ -5,10 +5,16 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+native-onnx = ["ort", "ndarray"]
+
 [dependencies]
 anyhow.workspace = true
 image.workspace = true
 mangahue-core = { path = "../mangahue-core" }
+ndarray = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

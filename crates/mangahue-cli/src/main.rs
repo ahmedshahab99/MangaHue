@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use mangahue_api::{run_doctor_report, serve, ApiServerConfig, DoctorRequest, DoctorStatus};
+use mangahue_chapter::{
+    run_chapter_job, ChapterConsistencyRetry, ChapterJobRequest, ChapterSafetyGateConfig,
+};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb, ImageSize, StyleProfile};
 use mangahue_hints::{generate_hints, load_user_hints};
@@ -283,6 +286,30 @@ struct ChapterColorizeArgs {
     #[arg(long)]
     export: Option<PathBuf>,
     #[arg(long)]
+    gallery: Option<PathBuf>,
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long = "brain-report")]
+    brain_report: Option<PathBuf>,
+    #[arg(long = "locked-style")]
+    locked_style: Option<PathBuf>,
+    #[arg(long = "safety-report")]
+    safety_report: Option<PathBuf>,
+    #[arg(long = "no-safety-gate")]
+    no_safety_gate: bool,
+    #[arg(long = "enforce-safety-gate")]
+    enforce_safety_gate: bool,
+    #[arg(long)]
+    resume: bool,
+    #[arg(long = "consistency-retry")]
+    consistency_retry: bool,
+    #[arg(long = "retry-drift-threshold", default_value_t = 0.18)]
+    retry_drift_threshold: f32,
+    #[arg(long = "retry-tone-threshold", default_value_t = 0.34)]
+    retry_tone_threshold: f32,
+    #[arg(long = "retry-max-pages", default_value_t = 24)]
+    retry_max_pages: usize,
+    #[arg(long)]
     model: Option<PathBuf>,
     #[arg(long)]
     config: Option<PathBuf>,
@@ -510,6 +537,7 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         user_hints_path: args.hints,
         debug_dir,
         use_mock_backend: args.mock,
+        ..ColorizeRequest::default()
     })?;
 
     println!("saved {}", result.output_path.display());
@@ -952,7 +980,7 @@ fn run_preprocess(args: PreprocessArgs) -> Result<()> {
         None => EngineConfig::default(),
     };
     let input = load_image(&args.input)?;
-    let result = preprocess_page(&input.image, &config.preprocess)?;
+    let result = preprocess_page(&input.image, &config.preprocess, &Default::default())?;
     save_gray(&args.output, &result.clean_lineart)?;
     println!("saved {}", args.output.display());
     Ok(())
@@ -1026,6 +1054,8 @@ fn run_link(command: LinkCommand) -> Result<()> {
                 max_pages: args.max_pages,
                 max_bytes_per_page: args.max_bytes_per_page,
                 user_agent: args.user_agent,
+                min_request_interval: std::time::Duration::from_millis(500),
+                selectors: mangahue_ingest::default_selectors(),
             })?;
             println!(
                 "downloaded {} page image(s) to {}",
@@ -1054,6 +1084,8 @@ fn run_link_colorize(args: LinkColorizeArgs) -> Result<()> {
         max_pages: args.max_pages,
         max_bytes_per_page: args.max_bytes_per_page,
         user_agent: args.user_agent,
+        min_request_interval: std::time::Duration::from_millis(500),
+        selectors: mangahue_ingest::default_selectors(),
     })?;
     let engine = MangaHueEngine::new();
     let mut pages = Vec::new();
@@ -1183,50 +1215,70 @@ fn run_chapter(command: ChapterCommand) -> Result<()> {
 }
 
 fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
-    let chapter_id = format!(
-        "{}_{}",
-        safe_url_slug(&args.input.to_string_lossy()),
-        unix_millis()
-    );
-    let import_dir = args.work_dir.join(chapter_id).join("imported");
-    let manifest = import_chapter_to_dir(
-        &args.input,
-        &import_dir,
-        ChapterImportOptions {
+    if let Some(jobs) = args.jobs {
+        if jobs > 1 {
+            println!("chapter resume mode processes pages serially; use batch for parallel folder-only runs");
+        }
+    }
+    let manifest_path = args
+        .manifest
+        .clone()
+        .or_else(|| args.report.clone())
+        .unwrap_or_else(|| args.output.join("mangahue_chapter_job.json"));
+    let result = run_chapter_job(ChapterJobRequest {
+        input_path: args.input,
+        work_dir: args.work_dir,
+        output_dir: args.output.clone(),
+        export_path: args.export,
+        gallery_path: args
+            .gallery
+            .or_else(|| Some(args.output.join("gallery.html"))),
+        manifest_path: Some(manifest_path.clone()),
+        brain_report_path: args
+            .brain_report
+            .or_else(|| Some(args.output.join("mangahue_chapter_brain.json"))),
+        locked_style_path: args
+            .locked_style
+            .or_else(|| Some(args.output.join("mangahue_locked_style.json"))),
+        safety_report_path: args
+            .safety_report
+            .or_else(|| Some(args.output.join("mangahue_safety_gate.json"))),
+        colorize_template: ColorizeRequest {
+            model_path: args.model,
+            config_path: args.config,
+            preset_path: args.preset,
+            style_path: args.style,
+            project_path: args.project,
+            use_mock_backend: args.mock,
+            ..ColorizeRequest::default()
+        },
+        import_options: ChapterImportOptions {
             max_pages: args.max_pages,
             max_bytes_per_page: args.max_bytes_per_page,
-            overwrite: true,
+            overwrite: !args.resume,
         },
-    )?;
-    std::fs::create_dir_all(&args.output)
-        .with_context(|| format!("failed to create {}", args.output.display()))?;
-    let manifest_path = args.output.join("mangahue_import_manifest.json");
-    write_chapter_manifest(&manifest, &manifest_path)?;
-    run_batch(
-        BatchArgs {
-            input_dir: import_dir,
-            output: args.output.clone(),
-            model: args.model,
-            config: args.config,
-            preset: args.preset,
-            style: args.style,
-            project: args.project,
-            mock: args.mock,
-            report: args
-                .report
-                .or_else(|| Some(args.output.join("mangahue_chapter_colorize_report.json"))),
-            jobs: args.jobs,
+        safety_gate: ChapterSafetyGateConfig {
+            enabled: !args.no_safety_gate,
+            enforce: args.enforce_safety_gate,
+            ..ChapterSafetyGateConfig::default()
         },
-        true,
-    )?;
-    if let Some(export_path) = args.export {
-        let exported = export_chapter_archive(&args.output, &export_path)?;
-        println!(
-            "chapter export {} page(s) -> {}",
-            exported.pages.len(),
-            export_path.display()
-        );
-    }
+        consistency_retry: ChapterConsistencyRetry {
+            enabled: args.consistency_retry,
+            palette_drift_threshold: args.retry_drift_threshold,
+            tone_drift_threshold: args.retry_tone_threshold,
+            max_pages: args.retry_max_pages,
+        },
+        resume: args.resume,
+    })?;
+    println!(
+        "chapter job {} {:?}: {} complete, {} failed, {} skipped; manifest {}",
+        result.id,
+        result.status,
+        result.processed,
+        result.failed,
+        result.skipped,
+        manifest_path.display()
+    );
     Ok(())
 }
 

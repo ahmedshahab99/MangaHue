@@ -2,8 +2,9 @@ use anyhow::{anyhow, Result};
 use image::{GrayImage, Rgb, RgbImage};
 use mangahue_config::{LayoutSection, ReadingDirection};
 use mangahue_core::{BoundingBox, ImageSize, MangaPanel, TileInfo};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutResult {
     pub panels: Vec<MangaPanel>,
     pub tiles: Vec<TileInfo>,
@@ -155,13 +156,15 @@ pub fn detect_panels_basic(lineart: &GrayImage, direction: ReadingDirection) -> 
 
     let y_ranges = ranges_from_cuts(height, &row_cuts);
     let x_ranges = ranges_from_cuts(width, &col_cuts);
+    let x_len = x_ranges.len();
+    let x_ranges_rev: Vec<(u32, u32)> = x_ranges.iter().rev().cloned().collect();
+    let x_iter: &[(u32, u32)] = match direction {
+        ReadingDirection::LeftToRight => &x_ranges,
+        ReadingDirection::RightToLeft => &x_ranges_rev,
+    };
     let mut panels = Vec::new();
     for (row, (y0, y1)) in y_ranges.iter().enumerate() {
-        let columns: Box<dyn Iterator<Item = &(u32, u32)>> = match direction {
-            ReadingDirection::LeftToRight => Box::new(x_ranges.iter()),
-            ReadingDirection::RightToLeft => Box::new(x_ranges.iter().rev()),
-        };
-        for (col, (x0, x1)) in columns.enumerate() {
+        for (col, (x0, x1)) in x_iter.iter().enumerate() {
             let bbox = BoundingBox::new(*x0, *y0, x1 - x0, y1 - y0);
             if bbox.area() < (width as u64 * height as u64) / 200 {
                 continue;
@@ -169,7 +172,7 @@ pub fn detect_panels_basic(lineart: &GrayImage, direction: ReadingDirection) -> 
             panels.push(MangaPanel {
                 id: format!("panel_{:04}", panels.len() + 1),
                 bbox,
-                reading_order: row * x_ranges.len() + col,
+                reading_order: row * x_len + col,
                 confidence: 0.45,
             });
         }
@@ -219,8 +222,12 @@ fn tile_weight(x: u32, y: u32, width: u32, height: u32, overlap: u32) -> f32 {
     }
     let edge_x = x.min(width.saturating_sub(1).saturating_sub(x));
     let edge_y = y.min(height.saturating_sub(1).saturating_sub(y));
-    let edge = edge_x.min(edge_y) as f32;
-    (edge / overlap as f32).clamp(0.15, 1.0)
+    let dist = edge_x.min(edge_y) as f32;
+    if dist >= overlap as f32 {
+        return 1.0;
+    }
+    let t = dist / overlap as f32;
+    (0.5 - 0.5 * (std::f32::consts::PI * t).cos()).clamp(0.0, 1.0)
 }
 
 fn white_runs_rows(lineart: &GrayImage) -> Vec<(u32, u32)> {
