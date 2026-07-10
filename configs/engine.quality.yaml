@@ -1,6 +1,8 @@
 engine:
   mode: quality
   parallel_jobs: 0
+  pyramid_enabled: true
+  hint_propagation_enabled: true
 preprocess:
   denoise_strength: 2
   line_sharpening: 0.5
@@ -11,4 +13,8 @@ hints:
   hint_blur_radius: 6.0
 postprocess:
   final_sharpening: 0.25
-
+eval:
+  line_preservation_threshold: 0.96
+  protected_region_violation_threshold: 0.98
+  hint_adherence_threshold: 0.82
+  screen_tone_warning_threshold: 0.12

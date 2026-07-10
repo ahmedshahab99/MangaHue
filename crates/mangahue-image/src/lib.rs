@@ -5,11 +5,18 @@ use image::{
 use mangahue_core::{BoundingBox, ImageFormat, ImageSize, MangaPageInfo};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_COMPRESSION_RATIO: f64 = 250.0;
+const MAX_IMAGE_DIMENSION: u32 = 50_000;
+const MAX_IMAGE_PIXELS: u64 = 120_000_000;
 
 #[derive(Debug, Clone)]
 pub struct MangaImage {
@@ -363,15 +370,73 @@ fn import_chapter_archive(
         fs::File::open(input).with_context(|| format!("failed to open {}", input.display()))?;
     let mut archive =
         ZipArchive::new(file).with_context(|| format!("failed to read {}", input.display()))?;
+    let entry_limit = options
+        .max_pages
+        .saturating_mul(8)
+        .saturating_add(64)
+        .min(MAX_ARCHIVE_ENTRIES);
+    if archive.len() > entry_limit {
+        anyhow::bail!(
+            "archive has {} entries, above security limit {}",
+            archive.len(),
+            entry_limit
+        );
+    }
+    let total_limit = options
+        .max_bytes_per_page
+        .saturating_mul(options.max_pages as u64)
+        .min(MAX_ARCHIVE_UNCOMPRESSED_BYTES);
     let mut entries = Vec::new();
+    let mut total_uncompressed = 0u64;
+    let mut names = HashSet::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index)?;
         if entry.is_dir() {
             continue;
         }
-        let Some(name) = safe_archive_name(entry.name()) else {
-            continue;
-        };
+        if entry.encrypted() {
+            anyhow::bail!("encrypted archive entry is not supported: {}", entry.name());
+        }
+        if entry.is_symlink() {
+            anyhow::bail!(
+                "symbolic links are forbidden in chapter archives: {}",
+                entry.name()
+            );
+        }
+        let name = safe_archive_name(entry.name())
+            .ok_or_else(|| anyhow!("unsafe archive entry path is forbidden: {}", entry.name()))?;
+        let normalized_name = name.to_ascii_lowercase();
+        if !names.insert(normalized_name) {
+            anyhow::bail!("duplicate archive entry name is forbidden: {name}");
+        }
+        if is_nested_archive_path(Path::new(&name)) {
+            anyhow::bail!("nested archives are forbidden: {name}");
+        }
+        total_uncompressed = total_uncompressed
+            .checked_add(entry.size())
+            .ok_or_else(|| anyhow!("archive size overflow"))?;
+        if total_uncompressed > total_limit {
+            anyhow::bail!(
+                "archive expands to {} bytes, above security limit {}",
+                total_uncompressed,
+                total_limit
+            );
+        }
+        let compressed = entry.compressed_size();
+        if entry.size() > 1024 * 1024 {
+            if compressed == 0 {
+                anyhow::bail!("archive entry has invalid compressed size: {name}");
+            }
+            let ratio = entry.size() as f64 / compressed as f64;
+            if ratio > MAX_ARCHIVE_COMPRESSION_RATIO {
+                anyhow::bail!(
+                    "archive entry compression ratio {:.1} exceeds security limit {:.1}: {}",
+                    ratio,
+                    MAX_ARCHIVE_COMPRESSION_RATIO,
+                    name
+                );
+            }
+        }
         if is_supported_image_path(Path::new(&name)) {
             entries.push((index, name));
         }
@@ -406,8 +471,7 @@ fn import_chapter_archive(
             warnings.push(format!("{} skipped: image exceeded byte limit", name));
             continue;
         }
-        image::load_from_memory(&data)
-            .with_context(|| format!("invalid image in archive: {name}"))?;
+        validate_image_payload(&data, &name)?;
         let extension = normalized_image_extension(Path::new(&name)).unwrap_or("png");
         let output = output_dir.join(format!("page_{page_number:03}.{extension}"));
         fs::write(&output, data)
@@ -429,7 +493,9 @@ fn import_chapter_archive(
 }
 
 fn chapter_page_from_path(index: usize, path: &Path) -> Result<ChapterPage> {
-    let image = load_image(path)?;
+    let (width, height) = image::image_dimensions(path)
+        .with_context(|| format!("failed to inspect image dimensions for {}", path.display()))?;
+    validate_image_dimensions(width, height, &path.display().to_string())?;
     let bytes = fs::metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?
         .len();
@@ -437,8 +503,8 @@ fn chapter_page_from_path(index: usize, path: &Path) -> Result<ChapterPage> {
         index,
         id: format!("page_{index:03}"),
         path: path.to_path_buf(),
-        size: image.info.size,
-        format: image.info.format,
+        size: ImageSize::new(width, height),
+        format: format_from_path(path),
         bytes,
     })
 }
@@ -479,6 +545,50 @@ fn is_archive_path(path: &Path) -> bool {
             .as_deref(),
         Some("zip" | "cbz")
     )
+}
+
+fn is_nested_archive_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("zip" | "cbz" | "rar" | "7z" | "tar" | "gz")
+    )
+}
+
+fn validate_image_payload(data: &[u8], name: &str) -> Result<()> {
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .with_context(|| format!("failed to detect image format in archive: {name}"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .with_context(|| format!("invalid image in archive: {name}"))?;
+    validate_image_dimensions(width, height, name)
+}
+
+fn validate_image_dimensions(width: u32, height: u32, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        width > 0 && height > 0,
+        "image has empty dimensions: {name}"
+    );
+    anyhow::ensure!(
+        width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION,
+        "image dimensions {}x{} exceed security limit {}: {}",
+        width,
+        height,
+        MAX_IMAGE_DIMENSION,
+        name
+    );
+    let pixels = (width as u64).saturating_mul(height as u64);
+    anyhow::ensure!(
+        pixels <= MAX_IMAGE_PIXELS,
+        "image has {} pixels, above security limit {}: {}",
+        pixels,
+        MAX_IMAGE_PIXELS,
+        name
+    );
+    Ok(())
 }
 
 pub fn is_supported_image_path(path: &Path) -> bool {
@@ -652,6 +762,27 @@ mod tests {
             imported_manifest.pages[0].path.file_name().unwrap(),
             "page_001.png"
         );
+    }
+
+    #[test]
+    fn rejects_nested_and_unsafe_archive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, entry_name) in [("nested.cbz", "chapter.zip"), ("unsafe.cbz", "../page.png")] {
+            let archive_path = dir.path().join(name);
+            let file = fs::File::create(&archive_path).unwrap();
+            let mut writer = ZipWriter::new(file);
+            writer
+                .start_file(entry_name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"not-an-image").unwrap();
+            writer.finish().unwrap();
+            let result = import_chapter_to_dir(
+                &archive_path,
+                dir.path().join(format!("{name}.out")),
+                ChapterImportOptions::default(),
+            );
+            assert!(result.is_err());
+        }
     }
 
     fn write_test_png(path: &Path, color: [u8; 3]) {

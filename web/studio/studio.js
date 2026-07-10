@@ -87,6 +87,7 @@ async function queueColorize() {
     debug_dir: optionalPath(data.debug_dir),
     style_path: optionalPath(data.style_path),
     user_hints_path: optionalPath(data.user_hints_path),
+    region_locks_path: optionalPath(data.region_locks_path),
     use_mock_backend: data.use_mock_backend,
   };
   const job = await api("/api/colorize", {
@@ -122,6 +123,7 @@ async function queueLinkColorize() {
     input_path: "",
     output_path: "",
     style_path: optionalPath(data.style_path),
+    region_locks_path: optionalPath(data.region_locks_path),
     use_mock_backend: data.use_mock_backend,
   };
   const job = await api("/api/link/colorize", {
@@ -205,6 +207,8 @@ async function colorizeChapter() {
       manifest_path: optionalPath(data.manifest_path),
       brain_report_path: optionalPath(data.brain_report_path),
       locked_style_path: optionalPath(data.locked_style_path),
+      palette_memory_path: optionalPath(data.palette_memory_path),
+      palette_memory_style_path: optionalPath(data.palette_memory_style_path),
       safety_report_path: optionalPath(data.safety_report_path),
       max_pages: Number(data.max_pages || 500),
       resume: data.resume,
@@ -218,6 +222,7 @@ async function colorizeChapter() {
         input_path: "",
         output_path: "",
         style_path: optionalPath(data.style_path),
+        region_locks_path: optionalPath(data.region_locks_path),
         use_mock_backend: data.use_mock_backend,
       },
     }),
@@ -299,6 +304,76 @@ async function exportCorrectionHints() {
   $("#memory-output").textContent = pretty(result);
 }
 
+function renderPaletteMemory(memory) {
+  const entries = memory.entries || [];
+  $("#palette-memory-list").innerHTML = entries
+    .map(
+      (entry) => `<button class="swatch" data-entry="${entry.id}" title="${entry.id}">
+        <span style="background:${entry.color}"></span>
+        <strong>${entry.role}</strong>
+        <small>${entry.color} ${Math.round((entry.confidence || 0) * 100)}%</small>
+      </button>`,
+    )
+    .join("");
+  $$(".swatch").forEach((button) => {
+    button.addEventListener("click", () => {
+      const entry = entries.find((item) => item.id === button.dataset.entry);
+      if (!entry) return;
+      const form = $("#correction-form");
+      form.elements.palette_edit_id.value = entry.id;
+      form.elements.palette_edit_role.value = entry.role;
+      form.elements.palette_edit_color.value = entry.color;
+      form.elements.palette_edit_tolerance.value = entry.tolerance || 12;
+      form.elements.palette_edit_locked.checked = Boolean(entry.locked);
+      form.elements.palette_edit_notes.value = entry.notes || "";
+    });
+  });
+}
+
+async function buildPaletteMemory() {
+  const data = formData($("#correction-form"));
+  const memory = await api("/api/brain/palette-memory", {
+    method: "POST",
+    body: JSON.stringify({
+      brain_report_path: data.palette_brain_report,
+      output_path: data.palette_memory_output,
+      style_output_path: optionalPath(data.palette_style_output),
+      base_style_path: optionalPath(data.palette_base_style),
+      id: optionalPath(data.palette_memory_id),
+      name: optionalPath(data.palette_memory_name),
+      max_entries: 12,
+      min_confidence: 0.18,
+    }),
+  });
+  renderPaletteMemory(memory);
+  $("#memory-output").textContent = pretty(memory);
+}
+
+async function editPaletteMemory() {
+  const data = formData($("#correction-form"));
+  const memory = await api("/api/brain/palette-memory/edit", {
+    method: "POST",
+    body: JSON.stringify({
+      memory_path: data.palette_memory_output,
+      style_output_path: optionalPath(data.palette_style_output),
+      base_style_path: optionalPath(data.palette_base_style),
+      edits: [
+        {
+          id: data.palette_edit_id,
+          role: optionalPath(data.palette_edit_role),
+          color: optionalPath(data.palette_edit_color),
+          locked: data.palette_edit_locked,
+          confidence: 0.99,
+          tolerance: Number(data.palette_edit_tolerance || 12),
+          notes: optionalPath(data.palette_edit_notes),
+        },
+      ],
+    }),
+  });
+  renderPaletteMemory(memory);
+  $("#memory-output").textContent = pretty(memory);
+}
+
 async function runDoctor() {
   const data = formData($("#doctor-form"));
   const result = await api("/api/doctor", {
@@ -327,6 +402,8 @@ function wire() {
   $("#jobs-refresh").addEventListener("click", () => refreshJobs());
   $("#correction-save").addEventListener("click", () => saveCorrection().catch((error) => $("#memory-output").textContent = error.message));
   $("#correction-export-hints").addEventListener("click", () => exportCorrectionHints().catch((error) => $("#memory-output").textContent = error.message));
+  $("#palette-memory-build").addEventListener("click", () => buildPaletteMemory().catch((error) => $("#memory-output").textContent = error.message));
+  $("#palette-memory-edit").addEventListener("click", () => editPaletteMemory().catch((error) => $("#memory-output").textContent = error.message));
   $("#doctor-run").addEventListener("click", () => runDoctor().catch((error) => $("#doctor-output").textContent = error.message));
 }
 

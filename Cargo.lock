@@ -1371,9 +1371,11 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "mangahue-brain",
  "mangahue-chapter",
  "mangahue-config",
  "mangahue-core",
+ "mangahue-hints",
  "mangahue-image",
  "mangahue-inference",
  "mangahue-ingest",
@@ -1400,6 +1402,7 @@ dependencies = [
  "image",
  "mangahue-core",
  "mangahue-eval",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -1447,6 +1450,7 @@ dependencies = [
  "clap",
  "image",
  "mangahue-api",
+ "mangahue-brain",
  "mangahue-chapter",
  "mangahue-config",
  "mangahue-core",
@@ -1456,10 +1460,12 @@ dependencies = [
  "mangahue-ingest",
  "mangahue-memory",
  "mangahue-orchestrator",
+ "mangahue-platform",
  "mangahue-preprocess",
  "rayon",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sysinfo",
  "tokio",
  "tracing-subscriber",
@@ -1604,11 +1610,23 @@ dependencies = [
  "mangahue-memory",
  "mangahue-postprocess",
  "mangahue-preprocess",
+ "mangahue-pyramid",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mangahue-platform"
+version = "0.1.0"
+dependencies = [
+ "mangahue-config",
+ "serde",
+ "sysinfo",
  "tracing",
 ]
 
@@ -1636,6 +1654,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangahue-pyramid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "mangahue-core",
+ "mangahue-inference",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "mangahue-telegram"
 version = "0.1.0"
 dependencies = [
@@ -1646,6 +1676,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

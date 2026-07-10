@@ -33,6 +33,8 @@ Routes:
 - `POST /api/chapter/import`
 - `POST /api/chapter/export`
 - `POST /api/chapter/colorize`
+- `POST /api/brain/palette-memory`
+- `POST /api/brain/palette-memory/edit`
 - `GET /api/jobs/{id}`
 - `GET /api/jobs/{id}/result`
 - `POST /api/projects`
@@ -169,6 +171,8 @@ Chapter colorize payload:
   "manifest_path": "examples/output/colored_chapter/job.json",
   "brain_report_path": "examples/output/colored_chapter/mangahue_chapter_brain.json",
   "locked_style_path": "examples/output/colored_chapter/mangahue_locked_style.json",
+  "palette_memory_path": "examples/output/colored_chapter/mangahue_palette_memory.json",
+  "palette_memory_style_path": "examples/output/colored_chapter/mangahue_palette_memory_style.json",
   "safety_report_path": "examples/output/colored_chapter/mangahue_safety_gate.json",
   "max_pages": 500,
   "resume": false,
@@ -184,6 +188,41 @@ Chapter colorize payload:
     "style_path": "configs/styles/webtoon_bright.yaml",
     "use_mock_backend": true
   }
+}
+```
+
+Palette memory payload:
+
+```json
+{
+  "brain_report_path": "examples/output/colored_chapter/mangahue_chapter_brain.json",
+  "output_path": "examples/output/colored_chapter/mangahue_palette_memory.json",
+  "style_output_path": "examples/output/colored_chapter/mangahue_palette_memory_style.json",
+  "base_style_path": "configs/styles/anime_cel.yaml",
+  "id": "chapter_one",
+  "name": "Chapter One Palette Memory",
+  "max_entries": 12,
+  "min_confidence": 0.18
+}
+```
+
+Palette memory edit payload:
+
+```json
+{
+  "memory_path": "examples/output/colored_chapter/mangahue_palette_memory.json",
+  "style_output_path": "examples/output/colored_chapter/mangahue_palette_memory_style.json",
+  "edits": [
+    {
+      "id": "hair_0a141e",
+      "role": "hair",
+      "color": "#0a141e",
+      "locked": true,
+      "confidence": 0.99,
+      "tolerance": 12.0,
+      "notes": "Hero hair lock"
+    }
+  ]
 }
 ```
 

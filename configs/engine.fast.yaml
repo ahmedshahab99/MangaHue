@@ -1,6 +1,7 @@
 engine:
   mode: fast
   parallel_jobs: 0
+  pyramid_enabled: false
 layout:
   tile_size: 896
   tile_overlap: 32
@@ -9,4 +10,8 @@ hints:
 postprocess:
   bleeding_correction: false
   final_sharpening: 0.05
-
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.24

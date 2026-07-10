@@ -58,6 +58,7 @@
               <label>Debug dir <input name="debug_dir" value="examples/output/studio_color_debug" /></label>
               <label>Style profile <input name="style_path" value="" placeholder="configs/styles/anime_cel.yaml" /></label>
               <label>Hints JSON <input name="user_hints_path" value="" placeholder="examples/hints/user_hints.example.json" /></label>
+              <label>Region locks <input name="region_locks_path" value="" placeholder="examples/region_locks/smoke_page.region-locks.json" /></label>
               <label class="check"><input type="checkbox" name="use_mock_backend" checked /> mock backend</label>
             </form>
             <article class="panel preview">
@@ -79,6 +80,7 @@
               <label>Output dir <input name="output_dir" value="examples/output/studio_link" /></label>
               <label>Downloads dir <input name="downloads_dir" value=".mangahue/link_downloads" /></label>
               <label>Style profile <input name="style_path" value="" placeholder="configs/styles/webtoon_bright.yaml" /></label>
+              <label>Region locks <input name="region_locks_path" value="" placeholder="examples/region_locks" /></label>
               <label>Max pages <input name="max_pages" type="number" value="8" min="1" max="64" /></label>
               <label class="check"><input type="checkbox" name="use_mock_backend" checked /> mock backend</label>
             </form>
@@ -111,8 +113,11 @@
               <label>Gallery path <input name="gallery_path" value="examples/output/studio_chapter_color/gallery.html" /></label>
               <label>Brain report <input name="brain_report_path" value="examples/output/studio_chapter_color/mangahue_chapter_brain.json" /></label>
               <label>Locked style <input name="locked_style_path" value="examples/output/studio_chapter_color/mangahue_locked_style.json" /></label>
+              <label>Palette memory <input name="palette_memory_path" value="examples/output/studio_chapter_color/mangahue_palette_memory.json" /></label>
+              <label>Palette style <input name="palette_memory_style_path" value="examples/output/studio_chapter_color/mangahue_palette_memory_style.json" /></label>
               <label>Safety report <input name="safety_report_path" value="examples/output/studio_chapter_color/mangahue_safety_gate.json" /></label>
               <label>Style profile <input name="style_path" value="" placeholder="configs/styles/webtoon_bright.yaml" /></label>
+              <label>Region locks file or directory <input name="region_locks_path" value="" placeholder="examples/region_locks" /></label>
               <label>Max pages <input name="max_pages" type="number" value="500" min="1" max="1000" /></label>
               <label>Retry drift <input name="retry_drift_threshold" type="number" value="0.18" min="0" max="1" step="0.01" /></label>
               <label>Retry pages <input name="retry_max_pages" type="number" value="24" min="1" max="500" /></label>
@@ -147,6 +152,8 @@
           <header class="section-head">
             <h2>Project Memory</h2>
             <div class="actions">
+              <button id="palette-memory-edit">Edit Palette</button>
+              <button id="palette-memory-build">Build Palette</button>
               <button id="correction-export-hints">Export Hints</button>
               <button id="correction-save">Save Correction</button>
             </div>
@@ -168,10 +175,30 @@
               <label>New color <input name="new" value="#111111" /></label>
               <label>Character <input name="character" value="hero" /></label>
               <label>Hints output <input name="hints_output" value="examples/output/studio_page_001.hints.json" /></label>
+              <label>Brain report <input name="palette_brain_report" value="examples/output/studio_chapter_color/mangahue_chapter_brain.json" /></label>
+              <label>Palette memory <input name="palette_memory_output" value="examples/output/studio_chapter_color/mangahue_palette_memory.json" /></label>
+              <label>Palette style <input name="palette_style_output" value="examples/output/studio_chapter_color/mangahue_palette_memory_style.json" /></label>
+              <label>Base style <input name="palette_base_style" value="configs/styles/anime_cel.yaml" /></label>
+              <div class="row">
+                <label>Palette ID <input name="palette_memory_id" value="chapter_one" /></label>
+                <label>Palette name <input name="palette_memory_name" value="Chapter One Palette" /></label>
+              </div>
+              <div class="row">
+                <label>Edit entry <input name="palette_edit_id" value="" /></label>
+                <label>Role <input name="palette_edit_role" value="hair" /></label>
+              </div>
+              <div class="row">
+                <label>Color <input name="palette_edit_color" value="#111111" /></label>
+                <label>Tolerance <input name="palette_edit_tolerance" type="number" value="12" min="0" max="128" step="1" /></label>
+              </div>
+              <label>Notes <input name="palette_edit_notes" value="" /></label>
+              <label class="check"><input type="checkbox" name="palette_edit_locked" checked /> locked color</label>
             </form>
             <article class="panel readout">
               <h3>Styles</h3>
               <div id="styles-list" class="style-list"></div>
+              <h3>Palette Memory</h3>
+              <div id="palette-memory-list" class="swatches"></div>
               <h3>Memory Output</h3>
               <pre id="memory-output">No correction saved.</pre>
             </article>

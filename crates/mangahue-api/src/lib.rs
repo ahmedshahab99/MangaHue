@@ -7,14 +7,19 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{Stream, StreamExt};
+use mangahue_brain::{
+    build_palette_memory, load_palette_memory, write_palette_memory, write_palette_memory_style,
+    ChapterBrainReport, PaletteMemoryBook, PaletteMemoryEdit, PaletteMemoryRequest,
+};
 use mangahue_chapter::{
     run_chapter_job, ChapterConsistencyRetry, ChapterJobRequest, ChapterSafetyGateConfig,
 };
 use mangahue_config::{load_style_profile, EngineConfig};
-use mangahue_core::{BoundingBox, ColorRgb};
+use mangahue_core::{BoundingBox, ColorRgb, ImageSize};
+use mangahue_hints::{load_region_locks, rasterize_region_locks};
 use mangahue_image::{
-    export_chapter_archive, import_chapter_to_dir, write_chapter_manifest, ChapterImportOptions,
-    ChapterManifest,
+    export_chapter_archive, import_chapter_to_dir, load_image, save_gray, save_rgb,
+    write_chapter_manifest, ChapterImportOptions, ChapterManifest,
 };
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestReport, IngestRequest};
@@ -112,6 +117,8 @@ pub struct ApiChapterColorizeRequest {
     pub manifest_path: Option<PathBuf>,
     pub brain_report_path: Option<PathBuf>,
     pub locked_style_path: Option<PathBuf>,
+    pub palette_memory_path: Option<PathBuf>,
+    pub palette_memory_style_path: Option<PathBuf>,
     pub safety_report_path: Option<PathBuf>,
     pub template: ColorizeRequest,
     #[serde(default = "default_chapter_max_pages")]
@@ -231,6 +238,37 @@ pub struct ApiCorrectionTrainingManifestRequest {
     pub color_dir: PathBuf,
     pub hints_dir: PathBuf,
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiPaletteMemoryCreateRequest {
+    pub brain_report_path: PathBuf,
+    pub output_path: PathBuf,
+    pub style_output_path: Option<PathBuf>,
+    pub base_style_path: Option<PathBuf>,
+    pub id: Option<String>,
+    pub name: Option<String>,
+    #[serde(default = "default_palette_memory_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_palette_memory_min_confidence")]
+    pub min_confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiPaletteMemoryEditRequest {
+    pub memory_path: PathBuf,
+    pub output_path: Option<PathBuf>,
+    pub style_output_path: Option<PathBuf>,
+    pub base_style_path: Option<PathBuf>,
+    #[serde(default)]
+    pub edits: Vec<PaletteMemoryEdit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiRegionLockPreviewRequest {
+    pub input_path: PathBuf,
+    pub region_locks_path: PathBuf,
+    pub output_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -409,6 +447,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/chapter/import", post(import_chapter))
         .route("/api/chapter/export", post(export_chapter))
         .route("/api/chapter/colorize", post(create_chapter_colorize_job))
+        .route(
+            "/api/brain/palette-memory",
+            post(create_palette_memory_from_report),
+        )
+        .route("/api/brain/palette-memory/edit", post(edit_palette_memory))
+        .route(
+            "/api/brain/region-locks/preview",
+            post(preview_region_locks),
+        )
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:id", get(get_job))
         .route("/api/jobs/:id/events", get(job_events_sse))
@@ -506,6 +553,31 @@ async fn create_colorize_job(
     payload.request.cancel_token = Some(cancel_token);
     payload.request.cache_dir = Some(state.jobs_dir.clone());
 
+    // Progressive rendering: create an unbounded mpsc channel so the
+    // orchestrator's blocking task can push per-tile progress updates
+    // without backpressure. A async forwarder task drains the receiver
+    // and republishes each update as a JSON-encoded SSE payload into the
+    // existing broadcast channel that `GET /api/jobs/:id/events` drinks.
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<mangahue_orchestrator::ProgressUpdate>();
+    payload.request.progress_sender = Some(progress_tx);
+
+    let forward_tx = event_tx.clone();
+    tokio::task::spawn(async move {
+        while let Some(update) = progress_rx.recv().await {
+            let payload = serde_json::json!({
+                "status": "progress",
+                "stage": update.stage,
+                "tiles_completed": update.tiles_completed,
+                "tiles_total": update.tiles_total,
+                "percent": update.percent,
+                "tile_id": update.tile_id,
+            })
+            .to_string();
+            let _ = forward_tx.send(payload);
+        }
+    });
+
     let job = ApiJob {
         id: id.clone(),
         status: ApiJobStatus::Queued,
@@ -517,14 +589,14 @@ async fn create_colorize_job(
     };
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
-    let _ = event_tx.send(r#"{"status":"queued"}"#.to_string());
+    let _ = event_tx.send(r#"{"status":"queued","progress":0}"#.to_string());
 
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
     let runtime = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
-        let _ = event_tx.send(r#"{"status":"running"}"#.to_string());
+        let _ = event_tx.send(r#"{"status":"running","progress":0}"#.to_string());
         update_job_status_blocking(
             &runtime,
             &jobs,
@@ -541,7 +613,7 @@ async fn create_colorize_job(
         match result {
             Ok(result) => {
                 let output_path = result.output_path.clone();
-                let _ = event_tx.send(r#"{"status":"complete"}"#.to_string());
+                let _ = event_tx.send(r#"{"status":"complete","progress":100}"#.to_string());
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
@@ -560,7 +632,7 @@ async fn create_colorize_job(
             Err(error) => {
                 error!("job {id} failed: {error:#}");
                 let _ = event_tx.send(format!(
-                    r#"{{"status":"failed","error":"{}"}}"#,
+                    r#"{{"status":"failed","progress":100,"error":"{}"}}"#,
                     error.to_string().replace('"', r#"\""#)
                 ));
                 update_job_status_blocking(
@@ -822,6 +894,8 @@ async fn create_chapter_colorize_job(
             manifest_path: payload.manifest_path,
             brain_report_path: payload.brain_report_path,
             locked_style_path: payload.locked_style_path,
+            palette_memory_path: payload.palette_memory_path,
+            palette_memory_style_path: payload.palette_memory_style_path,
             safety_report_path: payload.safety_report_path,
             colorize_template: payload.template,
             import_options: ChapterImportOptions {
@@ -970,6 +1044,85 @@ async fn list_styles(State(state): State<ApiState>) -> Result<Json<Vec<StyleSumm
     Ok(Json(styles))
 }
 
+async fn create_palette_memory_from_report(
+    Json(payload): Json<ApiPaletteMemoryCreateRequest>,
+) -> Result<Json<PaletteMemoryBook>, ApiError> {
+    let report: ChapterBrainReport = serde_json::from_slice(
+        &std::fs::read(&payload.brain_report_path)
+            .with_context(|| format!("failed to read {}", payload.brain_report_path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", payload.brain_report_path.display()))?;
+    let memory = build_palette_memory(
+        &report,
+        PaletteMemoryRequest {
+            id: payload.id,
+            name: payload.name,
+            source_report_path: Some(payload.brain_report_path),
+            max_entries: payload.max_entries,
+            min_confidence: payload.min_confidence,
+            lock_entries: true,
+        },
+    );
+    write_palette_memory(&memory, &payload.output_path)?;
+    if let Some(style_output_path) = payload.style_output_path {
+        let base_style = load_optional_style(payload.base_style_path.as_deref())?;
+        write_palette_memory_style(&memory, &base_style, style_output_path)?;
+    }
+    Ok(Json(memory))
+}
+
+async fn edit_palette_memory(
+    Json(payload): Json<ApiPaletteMemoryEditRequest>,
+) -> Result<Json<PaletteMemoryBook>, ApiError> {
+    let mut memory = load_palette_memory(&payload.memory_path)?;
+    for edit in payload.edits {
+        if !mangahue_brain::apply_palette_memory_edit(&mut memory, edit) {
+            return Err(ApiError(anyhow::anyhow!(
+                "palette memory entry was not found"
+            )));
+        }
+    }
+    let output_path = payload
+        .output_path
+        .clone()
+        .unwrap_or_else(|| payload.memory_path.clone());
+    write_palette_memory(&memory, &output_path)?;
+    if let Some(style_output_path) = payload.style_output_path {
+        let base_style = load_optional_style(payload.base_style_path.as_deref())?;
+        write_palette_memory_style(&memory, &base_style, style_output_path)?;
+    }
+    Ok(Json(memory))
+}
+
+async fn preview_region_locks(
+    Json(payload): Json<ApiRegionLockPreviewRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let page = load_image(&payload.input_path)?;
+    let size = ImageSize::new(page.image.width(), page.image.height());
+    let locks = load_region_locks(&payload.region_locks_path)?;
+    let raster = rasterize_region_locks(&locks, size)?;
+    std::fs::create_dir_all(&payload.output_dir)
+        .with_context(|| format!("failed to create {}", payload.output_dir.display()))?;
+    let color_map_path = payload.output_dir.join("region_color_map.png");
+    let color_mask_path = payload.output_dir.join("region_color_mask.png");
+    let preserve_mask_path = payload.output_dir.join("region_preserve_mask.png");
+    let exclude_mask_path = payload.output_dir.join("region_exclude_mask.png");
+    save_rgb(&color_map_path, &raster.color_map)?;
+    save_gray(&color_mask_path, &raster.color_mask)?;
+    save_gray(&preserve_mask_path, &raster.preserve_mask)?;
+    save_gray(&exclude_mask_path, &raster.exclude_mask)?;
+    Ok(Json(serde_json::json!({
+        "page_id": locks.page_id,
+        "size": size,
+        "applied_locks": raster.applied_locks,
+        "active_pixels": raster.active_pixels,
+        "color_map_path": color_map_path,
+        "color_mask_path": color_mask_path,
+        "preserve_mask_path": preserve_mask_path,
+        "exclude_mask_path": exclude_mask_path
+    })))
+}
+
 async fn create_project(
     Json(payload): Json<ApiProjectCreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1075,6 +1228,13 @@ fn parse_color(value: Option<String>) -> Result<Option<mangahue_core::ColorRgb>>
         .map(str::parse)
         .transpose()
         .map_err(anyhow::Error::from)
+}
+
+fn load_optional_style(path: Option<&Path>) -> Result<mangahue_core::StyleProfile> {
+    match path {
+        Some(path) => load_style_profile(path),
+        None => Ok(mangahue_core::StyleProfile::default()),
+    }
 }
 
 fn update_job_status_blocking(
@@ -1301,6 +1461,14 @@ fn default_retry_tone_threshold() -> f32 {
 
 fn default_retry_max_pages() -> usize {
     24
+}
+
+fn default_palette_memory_max_entries() -> usize {
+    12
+}
+
+fn default_palette_memory_min_confidence() -> f32 {
+    0.18
 }
 
 fn default_config_path() -> PathBuf {
@@ -1653,6 +1821,9 @@ pub fn planned_routes() -> &'static [&'static str] {
         "POST /api/chapter/import",
         "POST /api/chapter/export",
         "POST /api/chapter/colorize",
+        "POST /api/brain/palette-memory",
+        "POST /api/brain/palette-memory/edit",
+        "POST /api/brain/region-locks/preview",
         "GET /api/jobs",
         "GET /api/jobs/{id}",
         "GET /api/jobs/{id}/result",
@@ -1739,5 +1910,8 @@ mod tests {
         assert!(routes.contains(&"POST /api/link/colorize"));
         assert!(routes.contains(&"POST /api/chapter/import"));
         assert!(routes.contains(&"POST /api/chapter/colorize"));
+        assert!(routes.contains(&"POST /api/brain/palette-memory"));
+        assert!(routes.contains(&"POST /api/brain/palette-memory/edit"));
+        assert!(routes.contains(&"POST /api/brain/region-locks/preview"));
     }
 }

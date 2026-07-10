@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "page_id": "smoke_page",
+  "coordinate_space": "normalized",
+  "locks": [
+    {
+      "id": "primary_subject",
+      "label": "Primary subject color lock",
+      "semantic": "clothing",
+      "mode": "colorize",
+      "region": {
+        "shape": "ellipse",
+        "center_x": 0.5,
+        "center_y": 0.56,
+        "radius_x": 0.24,
+        "radius_y": 0.34
+      },
+      "color": {
+        "r": 38,
+        "g": 104,
+        "b": 188
+      },
+      "strength": 0.86,
+      "feather_radius": 4.0,
+      "enabled": true
+    },
+    {
+      "id": "protected_header",
+      "label": "Protected bright header",
+      "semantic": "speech",
+      "mode": "preserve",
+      "region": {
+        "shape": "rectangle",
+        "x": 0.08,
+        "y": 0.04,
+        "width": 0.84,
+        "height": 0.16
+      },
+      "strength": 1.0,
+      "feather_radius": 2.0,
+      "enabled": true
+    }
+  ]
+}

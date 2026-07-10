@@ -12,6 +12,7 @@ image.workspace = true
 mangahue-core = { path = "../mangahue-core" }
 mangahue-eval = { path = "../mangahue-eval" }
 serde.workspace = true
+rand.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

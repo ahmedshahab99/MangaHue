@@ -15,13 +15,14 @@ MangaHue can become much more powerful before the final trained model exists. Th
 - Chapter brain reports that extract stable palettes, measure page-to-page drift, write locked style profiles, and selectively retry drifted pages.
 - Chapter safety gate reports that audit line preservation, speech bubble cleanliness, protected regions, and hint adherence before archive export.
 - Protected-region repair in postprocess: bright bubble/protected areas are restored while dark text/ink is preserved.
+- Palette memory books with editable locked colors, roles, confidence, tolerances, and style export.
 
 ## Best Advanced Features Before Training
 
-1. Palette memory studio: editable chapter-level character palettes with locked colors and confidence scores.
-2. Region lock editor: let users lock hair, eyes, skin, clothing, bubbles, and backgrounds before model inference.
-3. Dataset builder: convert finished/corrected chapters into training-ready paired samples.
-4. Consistency dashboard: rank risky pages, retry history, and palette lock confidence.
+1. Region lock editor: let users lock hair, eyes, skin, clothing, bubbles, and backgrounds before model inference.
+2. Dataset builder: convert finished/corrected chapters into training-ready paired samples.
+3. Consistency dashboard: rank risky pages, retry history, and palette lock confidence.
+4. Palette memory visual editor: swatches, roles, tolerance sliders, and one-click style export.
 5. Archive security hardening: archive bomb limits, total uncompressed byte limits, nested archive rejection.
 6. Watermark/export profiles: free preview, premium high-res, CBZ, ZIP, and web gallery bundles.
 7. Training data curator: rank pages by safety, palette stability, hint adherence, and correction density.
@@ -29,4 +30,4 @@ MangaHue can become much more powerful before the final trained model exists. Th
 
 ## Next Recommended Build Step
 
-Build the palette memory studio. MangaHue now protects chapter output before training; the next brain step is giving users direct control over locked identity colors.
+Build the region lock editor. MangaHue now creates editable palette memories; the next brain step is spatial locks for hair, eyes, clothing, bubbles, and backgrounds before inference.

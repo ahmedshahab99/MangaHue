@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use mangahue_core::{ColorRgb, ImageSize, StyleProfile};
 use mangahue_eval::QualityReport;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -93,6 +94,95 @@ pub struct PaletteLock {
     pub coverage: f32,
     pub support_pages: usize,
     pub suggested_role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteMemoryRequest {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub source_report_path: Option<PathBuf>,
+    #[serde(default = "default_palette_memory_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_palette_memory_min_confidence")]
+    pub min_confidence: f32,
+    #[serde(default = "default_true")]
+    pub lock_entries: bool,
+}
+
+impl Default for PaletteMemoryRequest {
+    fn default() -> Self {
+        Self {
+            id: None,
+            name: None,
+            source_report_path: None,
+            max_entries: default_palette_memory_max_entries(),
+            min_confidence: default_palette_memory_min_confidence(),
+            lock_entries: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteMemoryBook {
+    pub id: String,
+    pub name: String,
+    pub generated_at: String,
+    pub source_report_path: Option<PathBuf>,
+    pub consistency_score: f32,
+    pub director_verdict: String,
+    #[serde(default)]
+    pub entries: Vec<PaletteMemoryEntry>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteMemoryEntry {
+    pub id: String,
+    pub role: PaletteMemoryRole,
+    pub color: ColorRgb,
+    pub locked: bool,
+    pub confidence: f32,
+    pub tolerance: f32,
+    pub coverage: f32,
+    pub support_pages: usize,
+    pub source_lock_id: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaletteMemoryRole {
+    Skin,
+    Hair,
+    Eyes,
+    Outfit,
+    Accent,
+    Shadow,
+    Highlight,
+    Background,
+    BaseTone,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteMemoryEdit {
+    pub id: String,
+    pub role: Option<PaletteMemoryRole>,
+    pub color: Option<ColorRgb>,
+    pub locked: Option<bool>,
+    pub confidence: Option<f32>,
+    pub tolerance: Option<f32>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterPalette {
+    pub dominant_colors: Vec<ColorRgb>,
+    pub color_weights: Vec<f32>,
+    pub background_color: ColorRgb,
+    pub total_pixels_sampled: u64,
+    pub pages_sampled: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +401,166 @@ pub fn write_locked_style_profile(
     fs::write(
         output_path,
         serde_json::to_string_pretty(&locked_style_profile(report, base))?,
+    )
+    .with_context(|| format!("failed to write {}", output_path.display()))
+}
+
+pub fn build_palette_memory(
+    report: &ChapterBrainReport,
+    request: PaletteMemoryRequest,
+) -> PaletteMemoryBook {
+    let mut warnings = report.warnings.clone();
+    let mut locks = report.palette_locks.clone();
+    locks.sort_by(|left, right| {
+        right
+            .confidence
+            .total_cmp(&left.confidence)
+            .then_with(|| right.coverage.total_cmp(&left.coverage))
+    });
+
+    let mut entries = Vec::new();
+    for lock in locks
+        .into_iter()
+        .filter(|lock| lock.confidence >= request.min_confidence)
+        .take(request.max_entries.max(1))
+    {
+        let role = role_from_suggestion(&lock.suggested_role, lock.color);
+        let id = format!(
+            "{}_{}",
+            role_slug(role),
+            lock.color.to_hex().trim_start_matches('#')
+        );
+        entries.push(PaletteMemoryEntry {
+            id,
+            role,
+            color: lock.color,
+            locked: request.lock_entries,
+            confidence: lock.confidence,
+            tolerance: lock.tolerance,
+            coverage: lock.coverage,
+            support_pages: lock.support_pages,
+            source_lock_id: Some(lock.id),
+            notes: Some(format!(
+                "coverage={:.4}; support_pages={}; role_hint={}",
+                lock.coverage, lock.support_pages, lock.suggested_role
+            )),
+        });
+    }
+
+    if entries.is_empty() {
+        warnings.push("palette memory has no entries above confidence threshold".to_string());
+    }
+    entries.sort_by(|left, right| {
+        left.role
+            .cmp(&right.role)
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| right.coverage.total_cmp(&left.coverage))
+    });
+
+    PaletteMemoryBook {
+        id: request
+            .id
+            .unwrap_or_else(|| format!("palette_memory_{}", compact_timestamp())),
+        name: request
+            .name
+            .unwrap_or_else(|| "MangaHue Palette Memory".to_string()),
+        generated_at: Utc::now().to_rfc3339(),
+        source_report_path: request.source_report_path,
+        consistency_score: report.consistency_score,
+        director_verdict: report.director_verdict.clone(),
+        entries,
+        warnings,
+    }
+}
+
+pub fn load_palette_memory(path: impl AsRef<Path>) -> Result<PaletteMemoryBook> {
+    let path = path.as_ref();
+    serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+pub fn write_palette_memory(
+    memory: &PaletteMemoryBook,
+    output_path: impl AsRef<Path>,
+) -> Result<()> {
+    let output_path = output_path.as_ref();
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(output_path, serde_json::to_string_pretty(memory)?)
+        .with_context(|| format!("failed to write {}", output_path.display()))
+}
+
+pub fn apply_palette_memory_edit(memory: &mut PaletteMemoryBook, edit: PaletteMemoryEdit) -> bool {
+    let Some(entry) = memory.entries.iter_mut().find(|entry| entry.id == edit.id) else {
+        return false;
+    };
+    if let Some(role) = edit.role {
+        entry.role = role;
+    }
+    if let Some(color) = edit.color {
+        entry.color = color;
+    }
+    if let Some(locked) = edit.locked {
+        entry.locked = locked;
+    }
+    if let Some(confidence) = edit.confidence {
+        entry.confidence = confidence.clamp(0.0, 1.0);
+    }
+    if let Some(tolerance) = edit.tolerance {
+        entry.tolerance = tolerance.clamp(0.0, 128.0);
+    }
+    if let Some(notes) = edit.notes {
+        entry.notes = Some(notes);
+    }
+    memory.generated_at = Utc::now().to_rfc3339();
+    true
+}
+
+pub fn palette_memory_style(memory: &PaletteMemoryBook, base: &StyleProfile) -> StyleProfile {
+    let mut style = base.clone();
+    let mut entries = memory.entries.clone();
+    entries.sort_by(|left, right| {
+        right
+            .locked
+            .cmp(&left.locked)
+            .then_with(|| right.confidence.total_cmp(&left.confidence))
+            .then_with(|| right.coverage.total_cmp(&left.coverage))
+    });
+    let palette = entries
+        .iter()
+        .filter(|entry| entry.locked || entry.confidence >= 0.48)
+        .map(|entry| entry.color)
+        .take(16)
+        .collect::<Vec<_>>();
+    if !palette.is_empty() {
+        style.palette = palette;
+    }
+    style.id = format!("{}_style", memory.id);
+    style.name = format!("{} Style", memory.name);
+    style.notes = Some(format!(
+        "Generated from palette memory {}; consistency_score={:.3}; verdict={}",
+        memory.id, memory.consistency_score, memory.director_verdict
+    ));
+    style
+}
+
+pub fn write_palette_memory_style(
+    memory: &PaletteMemoryBook,
+    base: &StyleProfile,
+    output_path: impl AsRef<Path>,
+) -> Result<()> {
+    let output_path = output_path.as_ref();
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        output_path,
+        serde_json::to_string_pretty(&palette_memory_style(memory, base))?,
     )
     .with_context(|| format!("failed to write {}", output_path.display()))
 }
@@ -790,6 +1040,46 @@ fn suggested_role(color: ColorRgb) -> String {
     }
 }
 
+fn role_from_suggestion(suggestion: &str, color: ColorRgb) -> PaletteMemoryRole {
+    match suggestion {
+        "skin_candidate" => PaletteMemoryRole::Skin,
+        "accent_candidate" => PaletteMemoryRole::Accent,
+        "highlight_candidate" => PaletteMemoryRole::Highlight,
+        "shadow_or_ink_tint" => PaletteMemoryRole::Shadow,
+        "base_tone" => {
+            let saturation = color_saturation(color);
+            let luma = color_luma(color);
+            if saturation > 0.42 {
+                PaletteMemoryRole::Outfit
+            } else if luma > 198.0 {
+                PaletteMemoryRole::Background
+            } else {
+                PaletteMemoryRole::BaseTone
+            }
+        }
+        _ => PaletteMemoryRole::Unknown,
+    }
+}
+
+fn role_slug(role: PaletteMemoryRole) -> &'static str {
+    match role {
+        PaletteMemoryRole::Skin => "skin",
+        PaletteMemoryRole::Hair => "hair",
+        PaletteMemoryRole::Eyes => "eyes",
+        PaletteMemoryRole::Outfit => "outfit",
+        PaletteMemoryRole::Accent => "accent",
+        PaletteMemoryRole::Shadow => "shadow",
+        PaletteMemoryRole::Highlight => "highlight",
+        PaletteMemoryRole::Background => "background",
+        PaletteMemoryRole::BaseTone => "base_tone",
+        PaletteMemoryRole::Unknown => "unknown",
+    }
+}
+
+fn compact_timestamp() -> String {
+    Utc::now().format("%Y%m%d%H%M%S").to_string()
+}
+
 fn mean_by(pages: &[PageBrainReport], metric: impl Fn(&PageBrainReport) -> f32) -> f32 {
     if pages.is_empty() {
         return 0.0;
@@ -809,6 +1099,18 @@ fn default_max_sampled_pixels() -> u64 {
     260_000
 }
 
+fn default_palette_memory_max_entries() -> usize {
+    12
+}
+
+fn default_palette_memory_min_confidence() -> f32 {
+    0.18
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_min_line_preservation() -> f32 {
     0.92
 }
@@ -823,6 +1125,174 @@ fn default_min_protected_region() -> f32 {
 
 fn default_min_hint_adherence() -> f32 {
     0.62
+}
+
+pub fn extract_chapter_palette(
+    page_paths: &[PathBuf],
+    num_colors: usize,
+    samples_per_page: usize,
+) -> Result<ChapterPalette> {
+    let mut all_pixels: Vec<[f32; 3]> = Vec::new();
+    let max_pages = page_paths.len().min(50);
+    let samples = samples_per_page.min(1000);
+
+    for path in page_paths.iter().take(max_pages) {
+        let img = match image::open(path) {
+            Ok(img) => img,
+            Err(_) => continue,
+        };
+        let img = img.resize(256, 256, image::imageops::FilterType::Nearest);
+        let rgb = img.to_rgb8();
+        let step = ((rgb.width() * rgb.height()) as usize / samples).max(1);
+        for (count, (_, _, pixel)) in rgb.enumerate_pixels().enumerate() {
+            if count.is_multiple_of(step) {
+                let r = pixel[0] as f32 / 255.0;
+                let g = pixel[1] as f32 / 255.0;
+                let b = pixel[2] as f32 / 255.0;
+                let luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+                if luminance > 0.08 && luminance < 0.92 {
+                    all_pixels.push([r, g, b]);
+                }
+            }
+        }
+    }
+
+    if all_pixels.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no valid color pixels found in chapter pages"
+        ));
+    }
+
+    let k = num_colors.min(all_pixels.len());
+    let mut rng = rand::thread_rng();
+    let (centroids, assignments) = kmeans_plus_plus(&all_pixels, k, &mut rng);
+
+    let mut color_weights = vec![0.0f32; k];
+    for cluster in &assignments {
+        color_weights[*cluster] += 1.0;
+    }
+    let total: f32 = color_weights.iter().sum();
+    for w in &mut color_weights {
+        *w /= total.max(1.0);
+    }
+
+    let dominant_colors: Vec<ColorRgb> = centroids
+        .iter()
+        .map(|c| {
+            ColorRgb::new(
+                (c[0] * 255.0).round() as u8,
+                (c[1] * 255.0).round() as u8,
+                (c[2] * 255.0).round() as u8,
+            )
+        })
+        .collect();
+
+    let bg_idx = centroids
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            let la = 0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2];
+            let lb = 0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2];
+            la.partial_cmp(&lb).unwrap()
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let background_color = dominant_colors[bg_idx];
+
+    Ok(ChapterPalette {
+        dominant_colors,
+        color_weights,
+        background_color,
+        total_pixels_sampled: all_pixels.len() as u64,
+        pages_sampled: max_pages,
+    })
+}
+
+fn kmeans_plus_plus(
+    data: &[[f32; 3]],
+    k: usize,
+    rng: &mut impl Rng,
+) -> (Vec<[f32; 3]>, Vec<usize>) {
+    let n = data.len();
+    if n == 0 || k == 0 {
+        return (vec![], vec![]);
+    }
+    let k = k.min(n);
+
+    let mut centroids = vec![data[rng.gen_range(0..n)]];
+
+    while centroids.len() < k {
+        let dists: Vec<f32> = data
+            .iter()
+            .map(|point| {
+                centroids
+                    .iter()
+                    .map(|c| {
+                        let dr = point[0] - c[0];
+                        let dg = point[1] - c[1];
+                        let db = point[2] - c[2];
+                        dr * dr + dg * dg + db * db
+                    })
+                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    .unwrap_or(f32::MAX)
+            })
+            .collect();
+
+        let total: f32 = dists.iter().sum();
+        let target = rng.gen::<f32>() * total;
+        let mut cumulative = 0.0f32;
+        let mut chosen = n - 1;
+        for (i, &d) in dists.iter().enumerate() {
+            cumulative += d;
+            if cumulative >= target {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(data[chosen]);
+    }
+
+    let mut assignments = vec![0usize; n];
+    let mut sums = vec![[0.0f32; 3]; k];
+    let mut counts = vec![0usize; k];
+
+    for (i, point) in data.iter().enumerate() {
+        let mut best_idx = 0usize;
+        let mut best_dist = f32::MAX;
+        for (j, centroid) in centroids.iter().enumerate() {
+            let dr = point[0] - centroid[0];
+            let dg = point[1] - centroid[1];
+            let db = point[2] - centroid[2];
+            let dist = dr * dr + dg * dg + db * db;
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = j;
+            }
+        }
+        assignments[i] = best_idx;
+        counts[best_idx] += 1;
+        sums[best_idx][0] += point[0];
+        sums[best_idx][1] += point[1];
+        sums[best_idx][2] += point[2];
+    }
+
+    let final_centroids: Vec<[f32; 3]> = centroids
+        .iter()
+        .enumerate()
+        .map(|(i, fallback)| {
+            if counts[i] > 0 {
+                [
+                    sums[i][0] / counts[i] as f32,
+                    sums[i][1] / counts[i] as f32,
+                    sums[i][2] / counts[i] as f32,
+                ]
+            } else {
+                *fallback
+            }
+        })
+        .collect();
+
+    (final_centroids, assignments)
 }
 
 #[cfg(test)]
@@ -914,6 +1384,49 @@ mod tests {
         assert!(!report.pass);
         assert_eq!(report.failed_pages, 1);
         assert_eq!(report.verdict, "safety_gate_text_or_bubble_risk");
+    }
+
+    #[test]
+    fn palette_memory_can_be_edited_and_exported_as_style() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page_001.png");
+        write_blocks(&path, [238, 176, 142], [56, 104, 214]);
+        let report = analyze_chapter_brain(ChapterBrainRequest {
+            pages: vec![BrainPageInput {
+                index: 1,
+                input_path: path.clone(),
+                output_path: path,
+            }],
+            ..ChapterBrainRequest::default()
+        })
+        .unwrap();
+
+        let mut memory = build_palette_memory(
+            &report,
+            PaletteMemoryRequest {
+                id: Some("chapter_one".to_string()),
+                name: Some("Chapter One".to_string()),
+                ..PaletteMemoryRequest::default()
+            },
+        );
+        assert!(!memory.entries.is_empty());
+        let first_id = memory.entries[0].id.clone();
+        assert!(apply_palette_memory_edit(
+            &mut memory,
+            PaletteMemoryEdit {
+                id: first_id,
+                role: Some(PaletteMemoryRole::Hair),
+                color: Some(ColorRgb::new(10, 20, 30)),
+                locked: Some(true),
+                confidence: Some(0.99),
+                tolerance: Some(12.0),
+                notes: Some("hero hair".to_string()),
+            },
+        ));
+
+        let style = palette_memory_style(&memory, &StyleProfile::default());
+        assert_eq!(style.id, "chapter_one_style");
+        assert!(style.palette.contains(&ColorRgb::new(10, 20, 30)));
     }
 
     fn write_blocks(path: &Path, skin: [u8; 3], accent: [u8; 3]) {

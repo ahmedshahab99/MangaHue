@@ -38,7 +38,8 @@ mangahue serve --addr 127.0.0.1:7878
 mangahue preprocess input.png --output clean.png
 mangahue make-hints input.png --hints hints.json --output-map hint_map.png --output-mask hint_mask.png
 mangahue chapter import chapter.cbz --output .mangahue/imported_chapter
-mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --gallery examples/output/colored_chapter/gallery.html --manifest examples/output/colored_chapter/job.json --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --locked-style examples/output/colored_chapter/mangahue_locked_style.json --safety-report examples/output/colored_chapter/mangahue_safety_gate.json --consistency-retry --mock
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --gallery examples/output/colored_chapter/gallery.html --manifest examples/output/colored_chapter/job.json --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --locked-style examples/output/colored_chapter/mangahue_locked_style.json --palette-memory examples/output/colored_chapter/mangahue_palette_memory.json --palette-memory-style examples/output/colored_chapter/mangahue_palette_memory_style.json --safety-report examples/output/colored_chapter/mangahue_safety_gate.json --consistency-retry --mock
+mangahue brain palette-memory --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --output examples/output/colored_chapter/mangahue_palette_memory.json --style-output examples/output/colored_chapter/mangahue_palette_memory_style.json
 mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --manifest examples/output/colored_chapter/job.json --resume --mock
 mangahue chapter export examples/output/colored_chapter --output examples/output/colored_chapter.cbz
 mangahue project create "My Manga" --output projects/my_manga

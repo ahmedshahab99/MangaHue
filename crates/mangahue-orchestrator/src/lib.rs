@@ -6,7 +6,10 @@ use mangahue_core::{
     CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
 };
 use mangahue_ensemble::{ConfidenceMap, Ensembler};
-use mangahue_hints::{generate_hints, load_user_hints};
+use mangahue_hints::{
+    apply_region_locks_to_hints, enforce_region_locks, generate_hints, load_region_locks,
+    load_user_hints, propagate_hints, rasterize_region_locks,
+};
 use mangahue_image::{crop_gray, crop_rgb, load_image, save_gray, save_rgb};
 use mangahue_inference::{
     ColorizationBackend, MockColorizationBackend, ModelInput, OnnxColorizationBackend,
@@ -15,6 +18,7 @@ use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
 use mangahue_postprocess::{finalize, PostprocessInput};
 use mangahue_preprocess::preprocess_page;
+use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -34,6 +38,7 @@ pub struct ColorizeRequest {
     pub preset_path: Option<PathBuf>,
     pub style_path: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
+    pub region_locks_path: Option<PathBuf>,
     #[serde(default)]
     pub character_ids: Vec<String>,
     pub user_hints_path: Option<PathBuf>,
@@ -49,6 +54,47 @@ pub struct ColorizeRequest {
     pub cancel_token: Option<Arc<AtomicBool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub pyramid_enabled: bool,
+    #[serde(default)]
+    pub hint_propagation_enabled: bool,
+    #[serde(skip)]
+    pub progress_sender: Option<tokio::sync::mpsc::UnboundedSender<ProgressUpdate>>,
+}
+
+/// Progressive rendering update emitted at each pipeline stage and after
+/// every tile completes. Streamed to API clients via SSE so Studio can show
+/// partial results as they arrive.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressUpdate {
+    pub stage: String,
+    pub tiles_completed: usize,
+    pub tiles_total: usize,
+    pub tile_id: Option<String>,
+    pub percent: f32,
+}
+
+fn emit_progress(
+    sender: &Option<tokio::sync::mpsc::UnboundedSender<ProgressUpdate>>,
+    stage: &str,
+    completed: usize,
+    total: usize,
+    tile_id: Option<String>,
+) {
+    if let Some(tx) = sender {
+        let percent = if total == 0 {
+            100.0
+        } else {
+            (completed as f32 / total as f32) * 100.0
+        };
+        let _ = tx.send(ProgressUpdate {
+            stage: stage.to_string(),
+            tiles_completed: completed,
+            tiles_total: total,
+            tile_id,
+            percent,
+        });
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +175,14 @@ impl MangaHueEngine {
         )?;
         let style = load_style(request.style_path.as_deref())?;
 
+        // Resolve pyramid / hint propagation flags. Request explicit opt-in
+        // takes precedence; otherwise fall back to the config-derived value.
+        let pyramid_enabled = request.pyramid_enabled || config.engine.pyramid_enabled;
+        let hint_propagation_enabled =
+            request.hint_propagation_enabled || config.engine.hint_propagation_enabled;
+        let progress = request.progress_sender.clone();
+        emit_progress(&progress, "queued", 0, 1, None);
+
         let mut report = ProcessingReport {
             input_path: request.input_path.clone(),
             output_path: request.output_path.clone(),
@@ -152,8 +206,10 @@ impl MangaHueEngine {
         }
 
         let preprocess_start = Instant::now();
+        emit_progress(&progress, "preprocess", 0, 6, None);
         let preprocess = preprocess_page(&resized, &config.preprocess, &Default::default())?;
         report.preprocessing_ms = preprocess_start.elapsed().as_millis();
+        emit_progress(&progress, "preprocess", 1, 6, None);
         report.page_classification = Some(classify_page(
             size_from_gray(&preprocess.clean_lineart),
             &preprocess.report,
@@ -164,8 +220,10 @@ impl MangaHueEngine {
         }
 
         let layout_start = Instant::now();
+        emit_progress(&progress, "layout", 1, 6, None);
         let layout = analyze_layout(&preprocess.clean_lineart, &config.layout)?;
         report.layout_ms = layout_start.elapsed().as_millis();
+        emit_progress(&progress, "layout", 2, 6, None);
         report.tiles_count = layout.tiles.len();
         report.add_stage_report(
             StageReport::new("layout")
@@ -183,6 +241,7 @@ impl MangaHueEngine {
         );
 
         let hint_start = Instant::now();
+        emit_progress(&progress, "hints", 2, 6, None);
         let user_hints = match request.user_hints_path.as_deref() {
             Some(path) => Some(load_user_hints(path)?),
             None => None,
@@ -195,7 +254,7 @@ impl MangaHueEngine {
             preprocess.clean_lineart.width(),
             preprocess.clean_lineart.height(),
         );
-        let hints = generate_hints(
+        let mut hints = generate_hints(
             size,
             user_hints.as_ref(),
             &style,
@@ -215,9 +274,53 @@ impl MangaHueEngine {
             report.warn(note.clone());
         }
 
+        if hint_propagation_enabled {
+            let (propagated_map, propagated_mask) = propagate_hints(
+                &hints.hint_map,
+                &hints.hint_mask,
+                &preprocess.clean_lineart,
+                48,
+                0.3,
+            );
+            hints.hint_map = propagated_map;
+            hints.hint_mask = propagated_mask;
+            report.warn("hints propagated with radius 48".to_string());
+        }
+
+        let region_lock_raster = request
+            .region_locks_path
+            .as_deref()
+            .map(load_region_locks)
+            .transpose()?
+            .map(|locks| rasterize_region_locks(&locks, size))
+            .transpose()?;
+        if let Some(raster) = &region_lock_raster {
+            let lock_report =
+                apply_region_locks_to_hints(&mut hints.hint_map, &mut hints.hint_mask, raster);
+            report.warn(format!(
+                "region locks applied: {} lock(s), {} constrained pixel(s), {} excluded hint pixel(s)",
+                lock_report.applied_locks,
+                lock_report.colorized_pixels + lock_report.preserved_pixels,
+                lock_report.excluded_hint_pixels
+            ));
+            if let Some(debug_dir) = request.debug_dir.as_deref() {
+                save_gray(debug_dir.join("region_color_mask.png"), &raster.color_mask)?;
+                save_gray(
+                    debug_dir.join("region_preserve_mask.png"),
+                    &raster.preserve_mask,
+                )?;
+                save_gray(
+                    debug_dir.join("region_exclude_mask.png"),
+                    &raster.exclude_mask,
+                )?;
+            }
+        }
+
         let inference_start = Instant::now();
         let parallel_jobs = resolve_parallel_jobs(config.engine.parallel_jobs);
         let use_ensemble = request.enable_ensemble && !request.ensemble_model_paths.is_empty();
+        let tiles_total = layout.tiles.len();
+        emit_progress(&progress, "inference_started", 0, tiles_total, None);
 
         let colored_tiles: Vec<(TileInfo, RgbImage)>;
         let mut ensemble_report: Option<mangahue_ensemble::EnsembleReport> = None;
@@ -250,6 +353,13 @@ impl MangaHueEngine {
                         confidence_map = Some(conf.clone());
                     }
                     acc.push((tile.clone(), merged));
+                    emit_progress(
+                        &progress,
+                        "inference_tile",
+                        acc.len(),
+                        tiles_total,
+                        Some(tile.id.clone()),
+                    );
                 }
                 colored_tiles = acc;
             } else {
@@ -278,9 +388,15 @@ impl MangaHueEngine {
                 });
                 colored_tiles = raw.into_iter().collect::<Result<Vec<_>>>()?;
             }
+            emit_progress(&progress, "inference_done", tiles_total, tiles_total, None);
         } else {
-            let backend: Arc<dyn ColorizationBackend> =
+            let raw_backend: Arc<dyn ColorizationBackend> =
                 Arc::from(select_backend(&request, &config, &style)?);
+            let backend: Arc<dyn ColorizationBackend> = if pyramid_enabled {
+                Arc::new(PyramidColorizer::new(raw_backend, PyramidConfig::default()))
+            } else {
+                raw_backend
+            };
             info!(
                 backend = backend.name(),
                 jobs = parallel_jobs,
@@ -302,6 +418,13 @@ impl MangaHueEngine {
                         })
                         .map_err(|err| anyhow!(err))?;
                     acc.push((tile.clone(), output));
+                    emit_progress(
+                        &progress,
+                        "inference_tile",
+                        acc.len(),
+                        tiles_total,
+                        Some(tile.id.clone()),
+                    );
                 }
                 acc
             } else {
@@ -332,6 +455,7 @@ impl MangaHueEngine {
                 });
                 raw.into_iter().collect::<Result<Vec<_>>>()?
             };
+            emit_progress(&progress, "inference_done", tiles_total, tiles_total, None);
         }
 
         let merged = merge_rgb_tiles(size, &colored_tiles)?;
@@ -365,7 +489,8 @@ impl MangaHueEngine {
         };
 
         let postprocess_start = Instant::now();
-        let (final_image, _postprocess_report) = finalize(PostprocessInput {
+        emit_progress(&progress, "postprocess", 5, 6, None);
+        let (mut final_image, _postprocess_report) = finalize(PostprocessInput {
             colorized: merged,
             original_grayscale: &preprocess.original_grayscale,
             line_mask: &preprocess.line_mask,
@@ -374,9 +499,22 @@ impl MangaHueEngine {
             style: &style,
             config: &config.postprocess,
         })?;
+        if let Some(raster) = &region_lock_raster {
+            let lock_report = enforce_region_locks(
+                &mut final_image,
+                &preprocess.original_grayscale,
+                &preprocess.line_mask,
+                raster,
+            );
+            report.warn(format!(
+                "region lock enforcement completed: {} color pixel(s), {} preserved pixel(s)",
+                lock_report.colorized_pixels, lock_report.preserved_pixels
+            ));
+        }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 
         save_rgb(&request.output_path, &final_image)?;
+        emit_progress(&progress, "done", 6, 6, None);
 
         if let Some(project_path) = request.project_path.as_deref() {
             update_project_history(project_path, &manga_image.info.id).ok();
@@ -839,9 +977,39 @@ fn compute_idempotency_key(
     hasher.update(b"\x00");
     hasher.update(preprocess.clean_lineart.width().to_le_bytes());
     hasher.update(preprocess.clean_lineart.height().to_le_bytes());
+    hasher.update(preprocess.clean_lineart.as_raw());
     hasher.update(hints.applied_hints.to_le_bytes());
+    hasher.update(hints.hint_map.as_raw());
+    hasher.update(hints.hint_mask.as_raw());
     hasher.update(b"\x00");
     hasher.update(style.id.as_bytes());
+    if let Ok(style_json) = serde_json::to_vec(style) {
+        hasher.update(style_json);
+    }
+    if let Ok(config_json) = serde_json::to_vec(config) {
+        hasher.update(config_json);
+    }
+    if let Some(model_path) = request.model_path.as_deref() {
+        hasher.update(model_path.to_string_lossy().as_bytes());
+        if let Ok(metadata) = fs::metadata(model_path) {
+            hasher.update(metadata.len().to_le_bytes());
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(elapsed.as_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
+    hasher.update([
+        request.use_mock_backend as u8,
+        request.pyramid_enabled as u8,
+        request.hint_propagation_enabled as u8,
+        request.enable_ensemble as u8,
+    ]);
+    for model in &request.ensemble_model_paths {
+        hasher.update(model.to_string_lossy().as_bytes());
+        hasher.update(b"\x00");
+    }
     let mode_val: u8 = match config.engine.mode {
         mangahue_config::EngineMode::Fast => 0,
         mangahue_config::EngineMode::Balanced => 1,

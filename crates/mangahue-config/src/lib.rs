@@ -29,6 +29,10 @@ pub struct EngineSection {
     pub save_debug_outputs: bool,
     pub reading_direction: ReadingDirection,
     pub parallel_jobs: usize,
+    #[serde(default)]
+    pub pyramid_enabled: bool,
+    #[serde(default)]
+    pub hint_propagation_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +136,8 @@ impl Default for EngineConfig {
                 save_debug_outputs: false,
                 reading_direction: ReadingDirection::RightToLeft,
                 parallel_jobs: 0,
+                pyramid_enabled: false,
+                hint_propagation_enabled: false,
             },
             preprocess: PreprocessSection {
                 grayscale_mode: "luma".to_string(),

@@ -9,11 +9,13 @@ authors.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
+mangahue-brain = { path = "../mangahue-brain" }
 mangahue-orchestrator = { path = "../mangahue-orchestrator" }
 mangahue-chapter = { path = "../mangahue-chapter" }
 mangahue-config = { path = "../mangahue-config" }
 mangahue-inference = { path = "../mangahue-inference" }
 mangahue-ingest = { path = "../mangahue-ingest" }
+mangahue-hints = { path = "../mangahue-hints" }
 mangahue-image = { path = "../mangahue-image" }
 mangahue-memory = { path = "../mangahue-memory" }
 mangahue-core = { path = "../mangahue-core" }

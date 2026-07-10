@@ -1,0 +1,12 @@
+[package]
+name = "mangahue-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+mangahue-config = { path = "../mangahue-config" }
+serde.workspace = true
+sysinfo.workspace = true
+tracing.workspace = true

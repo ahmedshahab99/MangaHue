@@ -5,6 +5,8 @@ engine:
   save_debug_outputs: false
   reading_direction: right_to_left
   parallel_jobs: 0
+  pyramid_enabled: false
+  hint_propagation_enabled: false
 preprocess:
   grayscale_mode: luma
   denoise_enabled: true
@@ -46,4 +48,9 @@ output:
   quality: 95
   write_report: true
   write_intermediates: false
+eval:
+  line_preservation_threshold: 0.92
+  protected_region_violation_threshold: 0.96
+  hint_adherence_threshold: 0.72
+  screen_tone_warning_threshold: 0.18
 

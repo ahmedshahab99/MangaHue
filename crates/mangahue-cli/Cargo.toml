@@ -17,6 +17,7 @@ image.workspace = true
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
 mangahue-api = { path = "../mangahue-api" }
+mangahue-brain = { path = "../mangahue-brain" }
 mangahue-chapter = { path = "../mangahue-chapter" }
 mangahue-hints = { path = "../mangahue-hints" }
 mangahue-image = { path = "../mangahue-image" }
@@ -24,10 +25,12 @@ mangahue-ingest = { path = "../mangahue-ingest" }
 mangahue-inference = { path = "../mangahue-inference" }
 mangahue-memory = { path = "../mangahue-memory" }
 mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+mangahue-platform = { path = "../mangahue-platform" }
 mangahue-preprocess = { path = "../mangahue-preprocess" }
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+serde_yaml.workspace = true
 sysinfo.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

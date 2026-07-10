@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use mangahue_brain::{
-    analyze_chapter_brain, analyze_safety_gate, write_chapter_brain_report,
-    write_locked_style_profile, write_safety_gate_report, BrainPageInput, ChapterBrainReport,
-    ChapterBrainRequest, ChapterSafetyReport, SafetyGatePageInput, SafetyGateRequest,
+    analyze_chapter_brain, analyze_safety_gate, build_palette_memory, write_chapter_brain_report,
+    write_locked_style_profile, write_palette_memory, write_palette_memory_style,
+    write_safety_gate_report, BrainPageInput, ChapterBrainReport, ChapterBrainRequest,
+    ChapterSafetyReport, PaletteMemoryRequest, SafetyGatePageInput, SafetyGateRequest,
     SafetyGateThresholds,
 };
 use mangahue_config::load_style_profile;
@@ -29,6 +30,8 @@ pub struct ChapterJobRequest {
     pub manifest_path: Option<PathBuf>,
     pub brain_report_path: Option<PathBuf>,
     pub locked_style_path: Option<PathBuf>,
+    pub palette_memory_path: Option<PathBuf>,
+    pub palette_memory_style_path: Option<PathBuf>,
     pub safety_report_path: Option<PathBuf>,
     pub colorize_template: ColorizeRequest,
     pub import_options: ChapterImportOptions,
@@ -97,6 +100,10 @@ pub struct ChapterJobManifest {
     pub brain_report_path: Option<PathBuf>,
     #[serde(default)]
     pub locked_style_path: Option<PathBuf>,
+    #[serde(default)]
+    pub palette_memory_path: Option<PathBuf>,
+    #[serde(default)]
+    pub palette_memory_style_path: Option<PathBuf>,
     #[serde(default)]
     pub safety_report_path: Option<PathBuf>,
     pub processed: usize,
@@ -271,6 +278,17 @@ fn start_chapter_job(
             .locked_style_path
             .clone()
             .or_else(|| Some(request.output_dir.join("mangahue_locked_style.json"))),
+        palette_memory_path: request
+            .palette_memory_path
+            .clone()
+            .or_else(|| Some(request.output_dir.join("mangahue_palette_memory.json"))),
+        palette_memory_style_path: request.palette_memory_style_path.clone().or_else(|| {
+            Some(
+                request
+                    .output_dir
+                    .join("mangahue_palette_memory_style.json"),
+            )
+        }),
         safety_report_path: request
             .safety_report_path
             .clone()
@@ -313,6 +331,22 @@ fn resume_chapter_job(
         .clone()
         .or(manifest.locked_style_path)
         .or_else(|| Some(manifest.output_dir.join("mangahue_locked_style.json")));
+    manifest.palette_memory_path = request
+        .palette_memory_path
+        .clone()
+        .or(manifest.palette_memory_path)
+        .or_else(|| Some(manifest.output_dir.join("mangahue_palette_memory.json")));
+    manifest.palette_memory_style_path = request
+        .palette_memory_style_path
+        .clone()
+        .or(manifest.palette_memory_style_path)
+        .or_else(|| {
+            Some(
+                manifest
+                    .output_dir
+                    .join("mangahue_palette_memory_style.json"),
+            )
+        });
     manifest.safety_report_path = request
         .safety_report_path
         .clone()
@@ -349,6 +383,10 @@ fn process_manifest_pages(
         let mut colorize = request.colorize_template.clone();
         colorize.input_path = manifest.pages[index].input_path.clone();
         colorize.output_path = manifest.pages[index].output_path.clone();
+        colorize.region_locks_path = resolve_region_locks_path(
+            request.colorize_template.region_locks_path.as_deref(),
+            &manifest.pages[index].input_path,
+        );
         let result = engine.colorize(colorize);
         match result {
             Ok(result) => {
@@ -428,7 +466,11 @@ fn write_chapter_brain_outputs(
     request: &ChapterJobRequest,
     manifest: &ChapterJobManifest,
 ) -> Result<Option<ChapterBrainReport>> {
-    if manifest.brain_report_path.is_none() && manifest.locked_style_path.is_none() {
+    if manifest.brain_report_path.is_none()
+        && manifest.locked_style_path.is_none()
+        && manifest.palette_memory_path.is_none()
+        && manifest.palette_memory_style_path.is_none()
+    {
         return Ok(None);
     }
 
@@ -462,6 +504,24 @@ fn write_chapter_brain_outputs(
     if let Some(style_path) = &manifest.locked_style_path {
         let base_style = load_base_style(request.colorize_template.style_path.as_deref())?;
         write_locked_style_profile(&report, &base_style, style_path)?;
+    }
+    if manifest.palette_memory_path.is_some() || manifest.palette_memory_style_path.is_some() {
+        let memory = build_palette_memory(
+            &report,
+            PaletteMemoryRequest {
+                id: Some(format!("chapter_{}", manifest.id.replace('-', "_"))),
+                name: Some("MangaHue Chapter Palette Memory".to_string()),
+                source_report_path: manifest.brain_report_path.clone(),
+                ..PaletteMemoryRequest::default()
+            },
+        );
+        if let Some(memory_path) = &manifest.palette_memory_path {
+            write_palette_memory(&memory, memory_path)?;
+        }
+        if let Some(style_path) = &manifest.palette_memory_style_path {
+            let base_style = load_base_style(request.colorize_template.style_path.as_deref())?;
+            write_palette_memory_style(&memory, &base_style, style_path)?;
+        }
     }
     Ok(Some(report))
 }
@@ -519,6 +579,10 @@ fn run_consistency_retry(
         colorize.input_path = manifest.pages[index].input_path.clone();
         colorize.output_path = manifest.pages[index].output_path.clone();
         colorize.style_path = Some(locked_style_path.clone());
+        colorize.region_locks_path = resolve_region_locks_path(
+            request.colorize_template.region_locks_path.as_deref(),
+            &manifest.pages[index].input_path,
+        );
 
         match engine.colorize(colorize) {
             Ok(result) => {
@@ -546,6 +610,25 @@ fn run_consistency_retry(
         save_job_manifest(manifest, manifest_path)?;
     }
     Ok(retried)
+}
+
+fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
+    let root = root?;
+    if root.is_file() {
+        return Some(root.to_path_buf());
+    }
+    if !root.is_dir() {
+        return Some(root.to_path_buf());
+    }
+    let stem = page_path.file_stem()?.to_str()?;
+    [
+        format!("{stem}.region-locks.json"),
+        format!("{stem}.regions.json"),
+        format!("{stem}.json"),
+    ]
+    .into_iter()
+    .map(|name| root.join(name))
+    .find(|candidate| candidate.is_file())
 }
 
 fn apply_brain_report_to_manifest(manifest: &mut ChapterJobManifest, report: &ChapterBrainReport) {
@@ -737,6 +820,20 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     #[test]
+    fn resolves_page_specific_region_locks_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("page_001.region-locks.json");
+        fs::write(&lock_path, "{}").unwrap();
+        let resolved =
+            resolve_region_locks_path(Some(dir.path()), Path::new("chapter/page_001.png"));
+        assert_eq!(resolved.as_deref(), Some(lock_path.as_path()));
+        assert!(
+            resolve_region_locks_path(Some(dir.path()), Path::new("chapter/page_999.png"))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn chapter_job_runs_and_resumes_completed_pages() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input");
@@ -756,6 +853,8 @@ mod tests {
             manifest_path: Some(manifest_path.clone()),
             brain_report_path: Some(output.join("brain.json")),
             locked_style_path: Some(output.join("locked_style.json")),
+            palette_memory_path: Some(output.join("palette_memory.json")),
+            palette_memory_style_path: Some(output.join("palette_memory_style.json")),
             safety_report_path: Some(output.join("safety.json")),
             colorize_template: ColorizeRequest {
                 use_mock_backend: true,
@@ -773,6 +872,8 @@ mod tests {
         assert!(output.join("gallery.html").exists());
         assert!(output.join("brain.json").exists());
         assert!(output.join("locked_style.json").exists());
+        assert!(output.join("palette_memory.json").exists());
+        assert!(output.join("palette_memory_style.json").exists());
         assert!(output.join("safety.json").exists());
 
         let resumed = run_chapter_job(ChapterJobRequest {

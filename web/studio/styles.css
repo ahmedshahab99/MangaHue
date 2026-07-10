@@ -217,6 +217,42 @@ table {
   font-size: 13px;
 }
 
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.swatch {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  grid-template-rows: auto auto;
+  align-items: center;
+  gap: 2px 8px;
+  min-height: 48px;
+  text-align: left;
+}
+
+.swatch span {
+  grid-row: 1 / span 2;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.swatch strong,
+.swatch small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swatch small {
+  color: var(--muted);
+}
+
 th,
 td {
   border-bottom: 1px solid var(--line);

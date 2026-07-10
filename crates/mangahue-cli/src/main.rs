@@ -2,15 +2,19 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use mangahue_api::{run_doctor_report, serve, ApiServerConfig, DoctorRequest, DoctorStatus};
+use mangahue_brain::{
+    build_palette_memory, extract_chapter_palette, write_palette_memory,
+    write_palette_memory_style, ChapterBrainReport, PaletteMemoryRequest,
+};
 use mangahue_chapter::{
     run_chapter_job, ChapterConsistencyRetry, ChapterJobRequest, ChapterSafetyGateConfig,
 };
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb, ImageSize, StyleProfile};
-use mangahue_hints::{generate_hints, load_user_hints};
+use mangahue_hints::{generate_hints, load_region_locks, load_user_hints, rasterize_region_locks};
 use mangahue_image::{
-    collect_image_paths, export_chapter_archive, import_chapter_to_dir, load_image, save_gray,
-    save_rgb, write_chapter_manifest, ChapterImportOptions,
+    collect_image_paths, export_chapter_archive, import_chapter_to_dir, is_supported_image_path,
+    load_image, save_gray, save_rgb, write_chapter_manifest, ChapterImportOptions,
 };
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestRequest};
@@ -19,6 +23,7 @@ use mangahue_memory::{
     export_correction_training_manifest, export_corrections_jsonl, NewCorrection, ProjectMemory,
 };
 use mangahue_orchestrator::{ColorizeRequest, InspectRequest, MangaHueEngine};
+use mangahue_platform::PlatformProfile;
 use mangahue_preprocess::preprocess_page;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -31,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{get_current_pid, ProcessRefreshKind, System};
+use walkdir::WalkDir;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +83,14 @@ enum Commands {
         #[command(subcommand)]
         command: CorrectionCommand,
     },
+    Brain {
+        #[command(subcommand)]
+        command: BrainCommand,
+    },
+    Palette {
+        #[command(subcommand)]
+        command: PaletteCommand,
+    },
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -84,6 +98,17 @@ enum Commands {
     Benchmark(BatchArgs),
     Serve(ServeArgs),
     Debug(ColorizeArgs),
+    Platform(PlatformArgs),
+}
+
+#[derive(Debug, Args)]
+struct PlatformArgs {
+    #[arg(long, help = "Write platform-tuned config to this YAML path")]
+    apply_to: Option<PathBuf>,
+    #[arg(long, help = "Base config to load before applying platform profile")]
+    config: Option<PathBuf>,
+    #[arg(long, help = "Preset overlay applied on top of --config")]
+    preset: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -101,6 +126,8 @@ struct ColorizeArgs {
     style: Option<PathBuf>,
     #[arg(long)]
     hints: Option<PathBuf>,
+    #[arg(long = "region-locks")]
+    region_locks: Option<PathBuf>,
     #[arg(long)]
     project: Option<PathBuf>,
     #[arg(long = "character")]
@@ -109,6 +136,10 @@ struct ColorizeArgs {
     debug: Option<PathBuf>,
     #[arg(long, help = "Use deterministic preview backend for tests and demos")]
     mock: bool,
+    #[arg(long, help = "Enable multi-resolution pyramid inference")]
+    pyramid: bool,
+    #[arg(long, help = "Propagate user hints to similar line-art regions")]
+    hint_propagate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -136,6 +167,8 @@ struct BatchArgs {
         help = "Parallel worker count (0 = rayon's default, 1 = serial)"
     )]
     jobs: Option<usize>,
+    #[arg(long)]
+    hint_propagate: bool,
 }
 
 #[derive(Debug, Args)]
@@ -233,6 +266,8 @@ struct LinkColorizeArgs {
     style: Option<PathBuf>,
     #[arg(long)]
     project: Option<PathBuf>,
+    #[arg(long = "region-locks")]
+    region_locks: Option<PathBuf>,
     #[arg(long)]
     hints: Option<PathBuf>,
     #[arg(long)]
@@ -293,6 +328,10 @@ struct ChapterColorizeArgs {
     brain_report: Option<PathBuf>,
     #[arg(long = "locked-style")]
     locked_style: Option<PathBuf>,
+    #[arg(long = "palette-memory")]
+    palette_memory: Option<PathBuf>,
+    #[arg(long = "palette-memory-style")]
+    palette_memory_style: Option<PathBuf>,
     #[arg(long = "safety-report")]
     safety_report: Option<PathBuf>,
     #[arg(long = "no-safety-gate")]
@@ -319,6 +358,8 @@ struct ChapterColorizeArgs {
     style: Option<PathBuf>,
     #[arg(long)]
     project: Option<PathBuf>,
+    #[arg(long = "region-locks")]
+    region_locks: Option<PathBuf>,
     #[arg(long)]
     mock: bool,
     #[arg(long)]
@@ -401,6 +442,54 @@ enum CorrectionCommand {
     Add(CorrectionAddArgs),
 }
 
+#[derive(Debug, Subcommand)]
+enum BrainCommand {
+    PaletteMemory(BrainPaletteMemoryArgs),
+    RegionLocks(BrainRegionLocksArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum PaletteCommand {
+    Extract {
+        #[arg(long)]
+        chapter: PathBuf,
+        #[arg(long, short)]
+        output: PathBuf,
+        #[arg(long, default_value = "8")]
+        colors: usize,
+    },
+}
+
+#[derive(Debug, Args)]
+struct BrainPaletteMemoryArgs {
+    #[arg(long = "brain-report")]
+    brain_report: PathBuf,
+    #[arg(long, short)]
+    output: PathBuf,
+    #[arg(long = "style-output")]
+    style_output: Option<PathBuf>,
+    #[arg(long = "base-style")]
+    base_style: Option<PathBuf>,
+    #[arg(long)]
+    id: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long = "max-entries", default_value_t = 12)]
+    max_entries: usize,
+    #[arg(long = "min-confidence", default_value_t = 0.18)]
+    min_confidence: f32,
+}
+
+#[derive(Debug, Args)]
+struct BrainRegionLocksArgs {
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    locks: PathBuf,
+    #[arg(long, short)]
+    output: PathBuf,
+}
+
 #[derive(Debug, Args)]
 struct CorrectionAddArgs {
     #[arg(long)]
@@ -472,9 +561,61 @@ fn main() -> Result<()> {
         Commands::Styles { command } => run_styles(command),
         Commands::Character { command } => run_character(command),
         Commands::Correction { command } => run_correction(command),
+        Commands::Brain { command } => run_brain(command),
+        Commands::Palette { command } => match command {
+            PaletteCommand::Extract {
+                chapter,
+                output,
+                colors,
+            } => {
+                let paths: Vec<PathBuf> = WalkDir::new(&chapter)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| is_supported_image_path(e.path()))
+                    .map(|e| e.into_path())
+                    .collect();
+                let palette = extract_chapter_palette(&paths, colors, 500)?;
+                std::fs::write(&output, serde_json::to_string_pretty(&palette)?)?;
+                println!(
+                    "extracted {} colors from {} pages -> {}",
+                    palette.dominant_colors.len(),
+                    palette.pages_sampled,
+                    output.display()
+                );
+                Ok(())
+            }
+        },
         Commands::Model { command } => run_model(command),
         Commands::Serve(args) => run_serve(args),
+        Commands::Platform(args) => run_platform(args),
     }
+}
+
+fn run_platform(args: PlatformArgs) -> Result<()> {
+    let profile = PlatformProfile::detect();
+    println!("{}", serde_json::to_string_pretty(&profile)?);
+    if let Some(config_path) = args.apply_to {
+        let mut cfg = match (args.config, args.preset) {
+            (Some(c), Some(p)) => {
+                let paths: Vec<&Path> = vec![c.as_path(), p.as_path()];
+                EngineConfig::from_paths(paths)?
+            }
+            (Some(c), None) => EngineConfig::from_path(c)?,
+            (None, Some(p)) => EngineConfig::from_path(p)?,
+            (None, None) => EngineConfig::default(),
+        };
+        profile.apply_to_config(&mut cfg);
+        cfg.validate()?;
+        let yaml = serde_yaml::to_string(&cfg)?;
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        std::fs::write(&config_path, yaml)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+        println!("applied platform profile to {}", config_path.display());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -535,8 +676,11 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         project_path: args.project,
         character_ids: args.characters,
         user_hints_path: args.hints,
+        region_locks_path: args.region_locks,
         debug_dir,
         use_mock_backend: args.mock,
+        pyramid_enabled: args.pyramid,
+        hint_propagation_enabled: args.hint_propagate,
         ..ColorizeRequest::default()
     })?;
 
@@ -645,6 +789,7 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
     let project_path = Arc::new(args.project.clone());
     let output_dir = Arc::new(args.output.clone());
     let use_mock = args.mock;
+    let hint_propagate = args.hint_propagate;
 
     let started_at = Utc::now().to_rfc3339();
     let batch_start = Instant::now();
@@ -692,6 +837,7 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
                 &style_path,
                 &project_path,
                 use_mock,
+                hint_propagate,
             );
             serial.push(summary);
         }
@@ -716,6 +862,7 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
                         &style_path,
                         &project_path,
                         use_mock,
+                        hint_propagate,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -790,6 +937,7 @@ fn process_one_page(
     style_path: &Arc<Option<PathBuf>>,
     project_path: &Arc<Option<PathBuf>>,
     use_mock: bool,
+    hint_propagate: bool,
 ) -> BatchPageSummary {
     let file_name = input.file_name().unwrap_or_default();
     let output = output_dir.join(file_name).with_extension("png");
@@ -809,6 +957,7 @@ fn process_one_page(
         style_path: style_path.as_ref().clone(),
         project_path: project_path.as_ref().clone(),
         use_mock_backend: use_mock,
+        hint_propagation_enabled: hint_propagate,
         ..ColorizeRequest::default()
     });
     match result {
@@ -1111,6 +1260,7 @@ fn run_link_colorize(args: LinkColorizeArgs) -> Result<()> {
             style_path: args.style.clone(),
             project_path: args.project.clone(),
             user_hints_path: args.hints.clone(),
+            region_locks_path: args.region_locks.clone(),
             debug_dir,
             use_mock_backend: args.mock,
             ..ColorizeRequest::default()
@@ -1240,6 +1390,12 @@ fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
         locked_style_path: args
             .locked_style
             .or_else(|| Some(args.output.join("mangahue_locked_style.json"))),
+        palette_memory_path: args
+            .palette_memory
+            .or_else(|| Some(args.output.join("mangahue_palette_memory.json"))),
+        palette_memory_style_path: args
+            .palette_memory_style
+            .or_else(|| Some(args.output.join("mangahue_palette_memory_style.json"))),
         safety_report_path: args
             .safety_report
             .or_else(|| Some(args.output.join("mangahue_safety_gate.json"))),
@@ -1249,6 +1405,7 @@ fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
             preset_path: args.preset,
             style_path: args.style,
             project_path: args.project,
+            region_locks_path: args.region_locks,
             use_mock_backend: args.mock,
             ..ColorizeRequest::default()
         },
@@ -1422,6 +1579,74 @@ fn run_correction(command: CorrectionCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_brain(command: BrainCommand) -> Result<()> {
+    match command {
+        BrainCommand::PaletteMemory(args) => {
+            let report: ChapterBrainReport = serde_json::from_slice(
+                &std::fs::read(&args.brain_report)
+                    .with_context(|| format!("failed to read {}", args.brain_report.display()))?,
+            )
+            .with_context(|| format!("failed to parse {}", args.brain_report.display()))?;
+            let memory = build_palette_memory(
+                &report,
+                PaletteMemoryRequest {
+                    id: args.id,
+                    name: args.name,
+                    source_report_path: Some(args.brain_report),
+                    max_entries: args.max_entries,
+                    min_confidence: args.min_confidence,
+                    lock_entries: true,
+                },
+            );
+            write_palette_memory(&memory, &args.output)?;
+            if let Some(style_output) = args.style_output {
+                let base_style = load_base_style(args.base_style.as_deref())?;
+                write_palette_memory_style(&memory, &base_style, &style_output)?;
+                println!(
+                    "palette memory {} entries -> {}; style {}",
+                    memory.entries.len(),
+                    args.output.display(),
+                    style_output.display()
+                );
+            } else {
+                println!(
+                    "palette memory {} entries -> {}",
+                    memory.entries.len(),
+                    args.output.display()
+                );
+            }
+        }
+        BrainCommand::RegionLocks(args) => {
+            let page = load_image(&args.input)?;
+            let size = ImageSize::new(page.image.width(), page.image.height());
+            let locks = load_region_locks(&args.locks)?;
+            let raster = rasterize_region_locks(&locks, size)?;
+            std::fs::create_dir_all(&args.output)
+                .with_context(|| format!("failed to create {}", args.output.display()))?;
+            save_rgb(args.output.join("region_color_map.png"), &raster.color_map)?;
+            save_gray(
+                args.output.join("region_color_mask.png"),
+                &raster.color_mask,
+            )?;
+            save_gray(
+                args.output.join("region_preserve_mask.png"),
+                &raster.preserve_mask,
+            )?;
+            save_gray(
+                args.output.join("region_exclude_mask.png"),
+                &raster.exclude_mask,
+            )?;
+            println!(
+                "validated {} region lock(s), {} active pixel(s) -> {}",
+                raster.applied_locks,
+                raster.active_pixels,
+                args.output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_model(command: ModelCommand) -> Result<()> {
     match command {
         ModelCommand::Validate { metadata } => {
@@ -1481,6 +1706,13 @@ fn parse_color_opt(value: Option<String>) -> Result<Option<ColorRgb>> {
         .map(ColorRgb::from_str)
         .transpose()
         .map_err(anyhow::Error::from)
+}
+
+fn load_base_style(path: Option<&Path>) -> Result<StyleProfile> {
+    match path {
+        Some(path) => load_style_profile(path),
+        None => Ok(StyleProfile::default()),
+    }
 }
 
 fn doctor_status_label(status: DoctorStatus) -> &'static str {
