@@ -16,8 +16,9 @@ dependencies = [
 mangahue-export-onnx = "mangahue_train.export_onnx:main"
 mangahue-validate-onnx = "mangahue_train.validate_onnx:main"
 mangahue-prepare-dataset = "mangahue_train.prepare_dataset:main"
+mangahue-audit-dataset = "mangahue_train.audit_dataset:main"
+mangahue-evaluate = "mangahue_train.evaluate:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-

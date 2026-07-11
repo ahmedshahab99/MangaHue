@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from .contract import ModelContract, sha256_file
 from .models import build_model
 
 
@@ -43,17 +44,21 @@ def main() -> None:
         opset_version=17,
     )
 
+    contract = ModelContract()
+    contract.validate()
     metadata = {
         "model_name": "MangaHue Hint U-Net",
         "version": "0.1.0",
         "model_type": "hint_unet",
         "input_size": args.input_size,
-        "input_channels": args.input_channels,
+        "input_channels": len(contract.input_channels),
         "output_channels": 3,
         "input_range": "0_1",
         "output_range": "0_1",
         "expects_lineart_inverted": False,
         "supports_style_vector": False,
+        "contract": contract.to_dict(),
+        "onnx_sha256": sha256_file(args.output),
     }
     args.metadata.parent.mkdir(parents=True, exist_ok=True)
     args.metadata.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -80,4 +85,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

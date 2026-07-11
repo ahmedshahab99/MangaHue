@@ -20,7 +20,8 @@ class SamplePaths:
 
 
 def _read_manifest(manifest: Path) -> list[SamplePaths]:
-    rows = json.loads(manifest.read_text(encoding="utf-8"))
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    rows = value.get("samples", value) if isinstance(value, dict) else value
     root = manifest.parent
     samples: list[SamplePaths] = []
     for row in rows:

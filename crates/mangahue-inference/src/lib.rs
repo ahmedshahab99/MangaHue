@@ -6,6 +6,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const SUPPORTED_CONTRACT_ID: &str = "mangahue.colorizer.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelContractMetadata {
+    pub contract_id: String,
+    pub input_name: String,
+    pub output_name: String,
+    pub input_channels: Vec<String>,
+    pub output_channels: Vec<String>,
+    pub input_range: String,
+    pub output_range: String,
+    pub color_space: String,
+    pub lineart_inverted: bool,
+    pub dynamic_spatial_axes: bool,
+    pub spatial_multiple: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMetadata {
     pub model_name: String,
@@ -18,6 +35,10 @@ pub struct ModelMetadata {
     pub output_range: String,
     pub expects_lineart_inverted: bool,
     pub supports_style_vector: bool,
+    #[serde(default)]
+    pub contract: Option<ModelContractMetadata>,
+    #[serde(default)]
+    pub onnx_sha256: Option<String>,
 }
 
 impl ModelMetadata {
@@ -43,6 +64,48 @@ impl ModelMetadata {
         }
         if self.input_range != "0_1" || self.output_range != "0_1" {
             return Err(anyhow!("only 0_1 tensor range is currently supported"));
+        }
+        if let Some(contract) = &self.contract {
+            let expected_inputs = ["lineart", "hint_r", "hint_g", "hint_b", "hint_mask"];
+            let expected_outputs = ["srgb_r", "srgb_g", "srgb_b"];
+            if contract.contract_id != SUPPORTED_CONTRACT_ID {
+                return Err(anyhow!(
+                    "unsupported model contract: {}",
+                    contract.contract_id
+                ));
+            }
+            if contract.input_name != "image_input" || contract.output_name != "color_output" {
+                return Err(anyhow!(
+                    "model tensor names do not match the runtime contract"
+                ));
+            }
+            if contract
+                .input_channels
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                != expected_inputs
+                || contract
+                    .output_channels
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    != expected_outputs
+            {
+                return Err(anyhow!(
+                    "model channel order does not match the runtime contract"
+                ));
+            }
+            if contract.color_space != "srgb" || contract.spatial_multiple == 0 {
+                return Err(anyhow!("unsupported model color space or spatial multiple"));
+            }
+            if self.input_channels as usize != contract.input_channels.len()
+                || self.output_channels as usize != contract.output_channels.len()
+            {
+                return Err(anyhow!(
+                    "legacy metadata dimensions disagree with model contract"
+                ));
+            }
         }
         Ok(())
     }
@@ -368,5 +431,45 @@ mod tests {
         };
         let output = MockColorizationBackend::default().colorize(&input).unwrap();
         assert_eq!(output.dimensions(), (16, 12));
+    }
+
+    #[test]
+    fn model_contract_rejects_reordered_channels() {
+        let mut metadata = ModelMetadata {
+            model_name: "test".into(),
+            version: "1".into(),
+            model_type: "hint_unet".into(),
+            input_size: 768,
+            input_channels: 5,
+            output_channels: 3,
+            input_range: "0_1".into(),
+            output_range: "0_1".into(),
+            expects_lineart_inverted: false,
+            supports_style_vector: false,
+            contract: Some(ModelContractMetadata {
+                contract_id: SUPPORTED_CONTRACT_ID.into(),
+                input_name: "image_input".into(),
+                output_name: "color_output".into(),
+                input_channels: ["lineart", "hint_r", "hint_g", "hint_b", "hint_mask"]
+                    .map(str::to_string)
+                    .to_vec(),
+                output_channels: ["srgb_r", "srgb_g", "srgb_b"].map(str::to_string).to_vec(),
+                input_range: "0_1".into(),
+                output_range: "0_1".into(),
+                color_space: "srgb".into(),
+                lineart_inverted: false,
+                dynamic_spatial_axes: true,
+                spatial_multiple: 8,
+            }),
+            onnx_sha256: None,
+        };
+        assert!(metadata.validate().is_ok());
+        metadata
+            .contract
+            .as_mut()
+            .unwrap()
+            .input_channels
+            .swap(0, 1);
+        assert!(metadata.validate().is_err());
     }
 }

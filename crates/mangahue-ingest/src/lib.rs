@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use url::Url;
@@ -93,7 +94,15 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(45))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            match validate_public_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(error) => attempt.error(error),
+            }
+        }))
         .build()
         .context("failed to build HTTP client")?;
 
@@ -103,6 +112,7 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
         .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
     let source_url = Url::parse(&request.source_url)
         .with_context(|| format!("invalid URL: {}", request.source_url))?;
+    validate_public_url(&source_url)?;
     let mut pages = Vec::new();
     let mut skipped = Vec::new();
 
@@ -137,6 +147,13 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
             extract_image_urls_with_selectors(source_url.as_str(), &html, &request.selectors)?;
         for image_url in image_urls.into_iter().take(max_pages) {
             let parsed = Url::parse(&image_url)?;
+            if let Err(error) = validate_public_url(&parsed) {
+                skipped.push(SkippedAsset {
+                    source_url: image_url,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
             match download_image_url(
                 &client,
                 &user_agent,
@@ -174,6 +191,58 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
     )
     .with_context(|| format!("failed to write {}", report.manifest_path.display()))?;
     Ok(report)
+}
+
+pub fn validate_public_url(url: &Url) -> Result<()> {
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "only HTTP(S) URLs are allowed"
+    );
+    let host = url.host_str().context("URL has no host")?;
+    anyhow::ensure!(
+        !matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "localhost.localdomain"
+        ),
+        "local network URLs are not allowed"
+    );
+    let port = url
+        .port_or_known_default()
+        .context("URL has no valid port")?;
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve URL host {host}"))?
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!addresses.is_empty(), "URL host resolved to no addresses");
+    for address in addresses {
+        anyhow::ensure!(
+            is_public_ip(address.ip()),
+            "private or reserved network URLs are not allowed"
+        );
+    }
+    Ok(())
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.octets()[0] == 0
+                || ip.octets()[0] >= 224)
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast())
+        }
+    }
 }
 
 pub fn extract_image_urls(base_url: &str, html: &str) -> Result<Vec<String>> {
@@ -389,5 +458,22 @@ mod tests {
         let html = r#"<img src="/read/next"><img src="/page.png?token=1">"#;
         let urls = extract_image_urls("https://example.test/chapter/1", html).unwrap();
         assert_eq!(urls, vec!["https://example.test/page.png?token=1"]);
+    }
+
+    #[test]
+    fn rejects_private_and_unsafe_ingest_destinations() {
+        for value in [
+            "http://127.0.0.1/page.png",
+            "http://10.0.0.1/page.png",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/page.png",
+            "file:///etc/passwd",
+        ] {
+            let url = Url::parse(value).unwrap();
+            assert!(
+                validate_public_url(&url).is_err(),
+                "accepted unsafe URL {value}"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 from pathlib import Path
 from typing import Iterable
 
@@ -33,30 +34,42 @@ def _stems(linearts: dict[str, Path], colors: dict[str, Path]) -> list[str]:
     return sorted(keys)
 
 
-def _split(stems: list[str], val_ratio: float, seed: int) -> tuple[list[str], list[str]]:
+def _group_id(stem: str, pattern: str) -> str:
+    match = re.search(pattern, stem)
+    if match:
+        return match.group(1) if match.groups() else match.group(0)
+    return re.sub(r"(?:[-_. ]?(?:page|p)?\d+)$", "", stem, flags=re.IGNORECASE) or stem
+
+
+def _split(stems: list[str], val_ratio: float, seed: int, group_pattern: str) -> tuple[list[str], list[str]]:
     rng = random.Random(seed)
-    pool = list(stems)
+    groups: dict[str, list[str]] = {}
+    for stem in stems:
+        groups.setdefault(_group_id(stem, group_pattern), []).append(stem)
+    pool = sorted(groups)
     rng.shuffle(pool)
-    if not pool:
+    if not stems:
         return [], []
-    cut = max(1, int(round(len(pool) * val_ratio))) if val_ratio > 0 else 0
+    cut = max(1, int(round(len(pool) * val_ratio))) if val_ratio > 0 and len(pool) > 1 else 0
     if cut >= len(pool):
         cut = max(0, len(pool) - 1)
-    val = pool[:cut]
-    train = pool[cut:]
+    val_groups = set(pool[:cut])
+    val = [stem for stem in stems if _group_id(stem, group_pattern) in val_groups]
+    train = [stem for stem in stems if _group_id(stem, group_pattern) not in val_groups]
     return train, val
 
 
 def _emit_manifest(
-    rows: Iterable[tuple[Path, Path, Path | None]],
+    rows: Iterable[tuple[Path, Path, Path | None, str]],
     target: Path,
 ) -> int:
     target.parent.mkdir(parents=True, exist_ok=True)
     rendered = []
-    for lineart, color, hints in rows:
+    for lineart, color, hints, group_id in rows:
         record: dict[str, str] = {
             "lineart": str(lineart).replace("\\", "/"),
             "color": str(color).replace("\\", "/"),
+            "group_id": group_id,
         }
         if hints is not None:
             record["hints"] = str(hints).replace("\\", "/")
@@ -114,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-val", type=Path, help="Optional output JSON manifest for validation split")
     parser.add_argument("--val-ratio", type=float, default=0.1, help="Fraction of pairs held out for validation")
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--group-pattern", default=r"^(.+?)(?:[-_. ]?(?:page|p)?\d+)$", help="Regex whose first group identifies a chapter/series split group")
     parser.add_argument("--synthetic-hints", action="store_true", help="Generate sparse hint JSON sidecars from the color targets")
     parser.add_argument("--hints-dir", type=Path, help="Output directory for synthetic hint JSONs (defaults next to color images)")
     parser.add_argument("--hint-radius", type=float, default=0.025)
@@ -133,9 +147,9 @@ def main() -> None:
     if not stems:
         raise SystemExit("no paired lineart/color images found (file stems must match)")
 
-    train_stems, val_stems = _split(stems, args.val_ratio if args.output_val else 0.0, args.seed)
+    train_stems, val_stems = _split(stems, args.val_ratio if args.output_val else 0.0, args.seed, args.group_pattern)
     if args.output_val and not val_stems:
-        val_stems = [train_stems.pop()] if train_stems else []
+        raise SystemExit("validation split requires at least two distinct groups; adjust --group-pattern")
 
     hints_dir = args.hints_dir or args.colors
     train_targets: list[tuple[Path, Path, Path]] = []
@@ -165,18 +179,18 @@ def main() -> None:
             )
 
     train_rows = [
-        (linearts[s], colors[s], hints_dir / f"{s}.hints.json" if args.synthetic_hints else None)
+        (linearts[s], colors[s], hints_dir / f"{s}.hints.json" if args.synthetic_hints else None, _group_id(s, args.group_pattern))
         for s in train_stems
     ]
-    train_count = _emit_manifest(((la, c, h) for la, c, h in train_rows), args.output_train)
+    train_count = _emit_manifest(iter(train_rows), args.output_train)
     print(f"wrote train manifest with {train_count} samples -> {args.output_train}")
 
     if args.output_val and val_stems:
         val_rows = [
-            (linearts[s], colors[s], hints_dir / f"{s}.hints.json" if args.synthetic_hints else None)
+            (linearts[s], colors[s], hints_dir / f"{s}.hints.json" if args.synthetic_hints else None, _group_id(s, args.group_pattern))
             for s in val_stems
         ]
-        val_count = _emit_manifest(((la, c, h) for la, c, h in val_rows), args.output_val)
+        val_count = _emit_manifest(iter(val_rows), args.output_val)
         print(f"wrote val manifest with {val_count} samples -> {args.output_val}")
     elif args.output_val:
         _emit_manifest(iter([]), args.output_val)
