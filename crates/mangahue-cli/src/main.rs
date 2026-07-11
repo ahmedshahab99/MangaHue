@@ -25,6 +25,7 @@ use mangahue_memory::{
 use mangahue_orchestrator::{ColorizeRequest, InspectRequest, MangaHueEngine};
 use mangahue_platform::PlatformProfile;
 use mangahue_preprocess::preprocess_page;
+use mangahue_production::{sweep_retention, LocalObjectStore, ProductionStore, UserTier};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -99,6 +100,54 @@ enum Commands {
     Serve(ServeArgs),
     Debug(ColorizeArgs),
     Platform(PlatformArgs),
+    Production {
+        #[command(subcommand)]
+        command: ProductionCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProductionCommand {
+    Bootstrap {
+        #[arg(long, default_value = ".mangahue/production.db")]
+        database: PathBuf,
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "admin")]
+        tier: String,
+    },
+    Token {
+        #[arg(long, default_value = ".mangahue/production.db")]
+        database: PathBuf,
+        #[arg(long)]
+        user: String,
+        #[arg(long, default_value = "cli")]
+        label: String,
+        #[arg(long)]
+        expires_days: Option<i64>,
+    },
+    Quota {
+        #[arg(long, default_value = ".mangahue/production.db")]
+        database: PathBuf,
+        #[arg(long)]
+        user: String,
+    },
+    Backup {
+        #[arg(long, default_value = ".mangahue/production.db")]
+        database: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    Retention {
+        #[arg(long, default_value = ".mangahue/production.db")]
+        database: PathBuf,
+        #[arg(long, default_value = ".mangahue/objects")]
+        object_store: PathBuf,
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -540,6 +589,8 @@ struct ServeArgs {
     styles_dir: PathBuf,
     #[arg(long, default_value = "web/studio")]
     studio_dir: PathBuf,
+    #[arg(long, default_value = ".mangahue/production.db")]
+    production_db: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -588,6 +639,7 @@ fn main() -> Result<()> {
         Commands::Model { command } => run_model(command),
         Commands::Serve(args) => run_serve(args),
         Commands::Platform(args) => run_platform(args),
+        Commands::Production { command } => run_production(command),
     }
 }
 
@@ -1697,7 +1749,73 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         jobs_dir: args.jobs_dir,
         styles_dir: args.styles_dir,
         studio_dir: args.studio_dir,
+        production_db: args.production_db,
     }))
+}
+
+fn run_production(command: ProductionCommand) -> Result<()> {
+    match command {
+        ProductionCommand::Bootstrap {
+            database,
+            email,
+            name,
+            tier,
+        } => {
+            let store = ProductionStore::open(database)?;
+            let tier = parse_user_tier(&tier)?;
+            let user = store.create_user(email, name, tier)?;
+            let session = store.issue_token(&user.id, "bootstrap", None)?;
+            println!("user_id={}", user.id);
+            println!("api_token={}", session.token);
+        }
+        ProductionCommand::Token {
+            database,
+            user,
+            label,
+            expires_days,
+        } => {
+            let store = ProductionStore::open(database)?;
+            let expires_at = expires_days.map(|days| Utc::now().timestamp() + days.max(1) * 86_400);
+            let session = store.issue_token(&user, &label, expires_at)?;
+            println!("token_id={}", session.token_id);
+            println!("api_token={}", session.token);
+        }
+        ProductionCommand::Quota { database, user } => {
+            let store = ProductionStore::open(database)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.quota_snapshot(&user)?)?
+            );
+        }
+        ProductionCommand::Backup { database, output } => {
+            let store = ProductionStore::open(database)?;
+            store.backup(&output)?;
+            println!("backup={}", output.display());
+        }
+        ProductionCommand::Retention {
+            database,
+            object_store,
+            limit,
+        } => {
+            let store = ProductionStore::open(database)?;
+            let objects = LocalObjectStore::new(object_store)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sweep_retention(&store, &objects, limit)?)?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_user_tier(value: &str) -> Result<UserTier> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "free" => Ok(UserTier::Free),
+        "creator" => Ok(UserTier::Creator),
+        "studio" => Ok(UserTier::Studio),
+        "admin" => Ok(UserTier::Admin),
+        _ => anyhow::bail!("tier must be free, creator, studio, or admin"),
+    }
 }
 
 fn parse_color_opt(value: Option<String>) -> Result<Option<ColorRgb>> {

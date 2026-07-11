@@ -22,6 +22,10 @@ members = [
   "crates/mangahue-cli",
   "crates/mangahue-api",
   "crates/mangahue-platform",
+  "crates/mangahue-production",
+  "crates/mangahue-worker",
+  "crates/mangahue-intelligence",
+  "crates/mangahue-export",
 ]
 
 [workspace.package]
@@ -62,6 +66,7 @@ zip = { version = "2.2", default-features = false, features = ["deflate"] }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["ndarray", "std"] }
 ndarray = { version = "0.17", features = ["std"] }
 rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 [profile.release]
 lto = "thin"

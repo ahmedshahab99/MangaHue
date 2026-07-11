@@ -23,6 +23,7 @@
           <button class="tab" data-view="chapter">Chapter</button>
           <button class="tab" data-view="jobs">Jobs</button>
           <button class="tab" data-view="memory">Memory</button>
+          <button class="tab" data-view="brain">Brain</button>
           <button class="tab" data-view="doctor">Doctor</button>
         </nav>
         <section class="status" id="health">Connecting...</section>
@@ -202,6 +203,70 @@
               <h3>Memory Output</h3>
               <pre id="memory-output">No correction saved.</pre>
             </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-brain">
+          <header class="section-head">
+            <h2>Spatial Brain</h2>
+            <div class="actions">
+              <button id="region-undo" title="Undo">Undo</button>
+              <button id="region-redo" title="Redo">Redo</button>
+              <button id="region-save">Save Locks</button>
+            </div>
+          </header>
+          <div class="brain-layout">
+            <aside class="panel brain-controls">
+              <label>Source page <input id="region-source" value="examples/input/smoke_page.png" /></label>
+              <label>Colored comparison <input id="region-compare" value="" placeholder="examples/output/page.png" /></label>
+              <label>Locks output <input id="region-output" value="examples/output/page.region-locks.json" /></label>
+              <div class="actions tool-strip" role="toolbar" aria-label="Region tools">
+                <button class="region-tool active" data-tool="polygon">Polygon</button>
+                <button class="region-tool" data-tool="rectangle">Rectangle</button>
+                <button class="region-tool" data-tool="ellipse">Ellipse</button>
+                <button class="region-tool" data-tool="brush">Brush</button>
+                <button class="region-tool" data-tool="fill">Fill</button>
+                <button class="region-tool" data-tool="erase">Erase</button>
+              </div>
+              <label>Semantic
+                <select id="region-semantic">
+                  <option value="hair">Hair</option><option value="eyes">Eyes</option>
+                  <option value="skin">Skin</option><option value="clothing">Clothing</option>
+                  <option value="background">Background</option><option value="speech">Speech</option>
+                  <option value="prop">Prop</option><option value="effect">Effect</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+              <label>Mode
+                <select id="region-mode">
+                  <option value="colorize">Colorize</option>
+                  <option value="preserve">Preserve</option>
+                  <option value="exclude">Exclude hints</option>
+                </select>
+              </label>
+              <label>Color <input id="region-color" type="color" value="#2668bc" /></label>
+              <label>Strength <input id="region-strength" type="range" min="0" max="1" step="0.01" value="0.9" /></label>
+              <label>Feather <input id="region-feather" type="range" min="0" max="32" step="1" value="4" /></label>
+              <label>Compare <input id="region-compare-opacity" type="range" min="0" max="1" step="0.01" value="0" /></label>
+              <button id="region-load">Load Page</button>
+              <button id="region-finish">Finish Shape</button>
+              <button id="region-clear">Clear All</button>
+            </aside>
+            <section class="canvas-workspace">
+              <div class="canvas-frame" id="region-canvas-frame">
+                <canvas id="region-canvas" width="768" height="1024"></canvas>
+              </div>
+              <div class="brain-status" id="region-status">Load a page to begin.</div>
+            </section>
+            <aside class="panel brain-inspector">
+              <h3>Region Layers</h3>
+              <div id="region-layers" class="layer-list"></div>
+              <h3>Consistency</h3>
+              <label>Brain report <input id="consistency-report" value="examples/output/studio_chapter_color/mangahue_chapter_brain.json" /></label>
+              <button id="consistency-load">Load Dashboard</button>
+              <div id="consistency-summary" class="metric-grid"></div>
+              <div id="consistency-pages" class="risk-list"></div>
+            </aside>
           </div>
         </section>
 

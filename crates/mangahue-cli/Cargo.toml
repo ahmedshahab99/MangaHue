@@ -27,6 +27,7 @@ mangahue-memory = { path = "../mangahue-memory" }
 mangahue-orchestrator = { path = "../mangahue-orchestrator" }
 mangahue-platform = { path = "../mangahue-platform" }
 mangahue-preprocess = { path = "../mangahue-preprocess" }
+mangahue-production = { path = "../mangahue-production" }
 rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true

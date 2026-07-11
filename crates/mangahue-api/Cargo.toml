@@ -15,9 +15,11 @@ mangahue-chapter = { path = "../mangahue-chapter" }
 mangahue-config = { path = "../mangahue-config" }
 mangahue-inference = { path = "../mangahue-inference" }
 mangahue-ingest = { path = "../mangahue-ingest" }
+mangahue-intelligence = { path = "../mangahue-intelligence" }
 mangahue-hints = { path = "../mangahue-hints" }
 mangahue-image = { path = "../mangahue-image" }
 mangahue-memory = { path = "../mangahue-memory" }
+mangahue-production = { path = "../mangahue-production" }
 mangahue-core = { path = "../mangahue-core" }
 serde.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,42 @@
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "7878:7878"
+    volumes:
+      - mangahue-data:/data
+      - ./models:/app/models:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7878/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["mangahue-worker"]
+    command: ["--database", "/data/production.db", "--object-store", "/data/objects", "--worker-id", "gpu-worker-1"]
+    volumes:
+      - mangahue-data:/data
+      - ./models:/app/models:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  telegram:
+    build: .
+    restart: unless-stopped
+    profiles: ["telegram"]
+    entrypoint: ["mangahue-telegram"]
+    command: ["--work-dir", "/data/telegram", "--max-pages", "32", "--pyramid", "--hint-propagate"]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    volumes:
+      - mangahue-data:/data
+      - ./models:/app/models:ro
+
+volumes:
+  mangahue-data:

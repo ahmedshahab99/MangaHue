@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,18 +16,26 @@ use mangahue_chapter::{
 };
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb, ImageSize};
-use mangahue_hints::{load_region_locks, rasterize_region_locks};
+use mangahue_hints::{
+    load_region_locks, rasterize_region_locks, validate_region_locks, RegionLockFile,
+};
 use mangahue_image::{
     export_chapter_archive, import_chapter_to_dir, load_image, save_gray, save_rgb,
     write_chapter_manifest, ChapterImportOptions, ChapterManifest,
 };
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestReport, IngestRequest};
+use mangahue_intelligence::{
+    analyze_semantics, character_observations, curate_dataset, semantic_region_locks,
+    track_characters, CuratedSample, CuratorCandidate, SemanticAnalysisConfig, SemanticClass,
+    SemanticPageReport,
+};
 use mangahue_memory::{
     add_correction, create_character, create_project_directory, export_correction_hints,
     export_correction_training_manifest, export_corrections_jsonl, NewCorrection, ProjectMemory,
 };
 use mangahue_orchestrator::{ColorizeRequest, InspectRequest, MangaHueEngine, PageInspection};
+use mangahue_production::{DurableJob, NewJob, ProductionStore, QuotaSnapshot, UserAccount};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -174,6 +182,7 @@ pub struct ApiState {
     pub studio_dir: PathBuf,
     pub cancel_tokens: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
+    pub production: ProductionStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +191,17 @@ pub struct ApiServerConfig {
     pub jobs_dir: PathBuf,
     pub styles_dir: PathBuf,
     pub studio_dir: PathBuf,
+    pub production_db: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiDurableJobRequest {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +289,39 @@ pub struct ApiRegionLockPreviewRequest {
     pub input_path: PathBuf,
     pub region_locks_path: PathBuf,
     pub output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiRegionLockSaveRequest {
+    pub output_path: PathBuf,
+    pub document: RegionLockFile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSemanticAnalyzeRequest {
+    pub input_path: PathBuf,
+    pub report_output: Option<PathBuf>,
+    pub locks_output: Option<PathBuf>,
+    #[serde(default)]
+    pub palette: HashMap<SemanticClass, ColorRgb>,
+    #[serde(default)]
+    pub config: SemanticAnalysisConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiCharacterTrackRequest {
+    pub reports: Vec<PathBuf>,
+    pub output: Option<PathBuf>,
+    #[serde(default = "default_character_similarity")]
+    pub similarity_threshold: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiDatasetCurateRequest {
+    pub candidates: Vec<CuratorCandidate>,
+    pub brain_report: PathBuf,
+    pub safety_report: PathBuf,
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -412,6 +465,7 @@ impl IntoResponse for ApiError {
 pub async fn serve(config: ApiServerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.jobs_dir)
         .with_context(|| format!("failed to create {}", config.jobs_dir.display()))?;
+    let production = ProductionStore::open(&config.production_db)?;
     let state = ApiState {
         jobs: Arc::new(RwLock::new(HashMap::new())),
         jobs_dir: config.jobs_dir,
@@ -419,6 +473,7 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         studio_dir: config.studio_dir,
         cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
         event_channels: Arc::new(RwLock::new(HashMap::new())),
+        production,
     };
     let app = router(state);
     let listener = TcpListener::bind(config.addr).await?;
@@ -433,6 +488,7 @@ pub fn router(state: ApiState) -> Router {
     let studio_dir = state.studio_dir.clone();
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route(
             "/api/doctor",
             get(run_doctor_default).post(run_doctor_custom),
@@ -456,11 +512,22 @@ pub fn router(state: ApiState) -> Router {
             "/api/brain/region-locks/preview",
             post(preview_region_locks),
         )
+        .route("/api/brain/region-locks/save", post(save_region_locks))
+        .route("/api/brain/semantics", post(analyze_page_semantics))
+        .route("/api/brain/characters/track", post(track_page_characters))
+        .route("/api/brain/dataset/curate", post(curate_training_dataset))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:id", get(get_job))
         .route("/api/jobs/:id/events", get(job_events_sse))
         .route("/api/jobs/:id/cancel", post(cancel_job))
         .route("/api/jobs/:id/result", get(get_job_result))
+        .route(
+            "/api/v1/jobs",
+            get(list_durable_jobs).post(create_durable_job),
+        )
+        .route("/api/v1/jobs/:id", get(get_durable_job))
+        .route("/api/v1/jobs/:id/cancel", post(cancel_durable_job))
+        .route("/api/v1/quota", get(get_quota))
         .route("/api/projects", post(create_project))
         .route("/api/projects/status", post(project_status))
         .route("/api/projects/export-corrections", post(export_corrections))
@@ -493,6 +560,115 @@ async fn health() -> Json<serde_json::Value> {
         "engine": "MangaHue Engine",
         "role": "manga color director"
     }))
+}
+
+async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
+    let metrics = state.production.metrics()?;
+    let body = format!(
+        "# TYPE mangahue_users gauge\n\
+         mangahue_users {}\n\
+         # TYPE mangahue_jobs gauge\n\
+         mangahue_jobs{{status=\"queued\"}} {}\n\
+         mangahue_jobs{{status=\"running\"}} {}\n\
+         mangahue_jobs{{status=\"complete\"}} {}\n\
+         mangahue_jobs{{status=\"failed\"}} {}\n\
+         mangahue_jobs{{status=\"dead_letter\"}} {}\n\
+         # TYPE mangahue_artifacts gauge\n\
+         mangahue_artifacts {}\n\
+         mangahue_artifact_bytes {}\n\
+         mangahue_pages_24h {}\n",
+        metrics.users,
+        metrics.queued_jobs,
+        metrics.running_jobs,
+        metrics.completed_jobs,
+        metrics.failed_jobs,
+        metrics.dead_letter_jobs,
+        metrics.artifacts,
+        metrics.artifact_bytes,
+        metrics.pages_24h,
+    );
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
+}
+
+async fn create_durable_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payload): Json<ApiDurableJobRequest>,
+) -> Result<Json<DurableJob>, ApiError> {
+    let user = authenticated_user(&state, &headers)?;
+    let job = state.production.enqueue(NewJob {
+        user_id: user.id,
+        kind: payload.kind,
+        payload: payload.payload,
+        priority: payload.priority,
+        max_attempts: payload.max_attempts,
+    })?;
+    Ok(Json(job))
+}
+
+async fn list_durable_jobs(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DurableJob>>, ApiError> {
+    let user = authenticated_user(&state, &headers)?;
+    Ok(Json(state.production.jobs_for_user(&user.id, 100)?))
+}
+
+async fn get_durable_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<DurableJob>, ApiError> {
+    let user = authenticated_user(&state, &headers)?;
+    let job = state
+        .production
+        .job(&id)?
+        .filter(|job| job.user_id == user.id || user.tier == mangahue_production::UserTier::Admin)
+        .context("job not found")?;
+    Ok(Json(job))
+}
+
+async fn cancel_durable_job(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user = authenticated_user(&state, &headers)?;
+    let cancelled = state.production.cancel(&id, &user.id)?;
+    Ok(Json(serde_json::json!({"id": id, "cancelled": cancelled})))
+}
+
+async fn get_quota(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<QuotaSnapshot>, ApiError> {
+    let user = authenticated_user(&state, &headers)?;
+    Ok(Json(state.production.quota_snapshot(&user.id)?))
+}
+
+fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<UserAccount> {
+    let value = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .context("missing Authorization header")?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .context("Authorization must use Bearer token")?;
+    let user = state
+        .production
+        .authenticate(token)?
+        .context("invalid or expired API token")?;
+    let requests_per_minute = match user.tier {
+        mangahue_production::UserTier::Free => 30,
+        mangahue_production::UserTier::Creator => 120,
+        mangahue_production::UserTier::Studio => 600,
+        mangahue_production::UserTier::Admin => 10_000,
+    };
+    state
+        .production
+        .enforce_rate_limit(&user.id, requests_per_minute, 60)?;
+    Ok(user)
 }
 
 async fn run_doctor_default(State(state): State<ApiState>) -> Json<DoctorReport> {
@@ -1123,6 +1299,89 @@ async fn preview_region_locks(
     })))
 }
 
+async fn save_region_locks(
+    Json(payload): Json<ApiRegionLockSaveRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    validate_region_locks(&payload.document)?;
+    if let Some(parent) = payload.output_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let document = serde_json::to_vec_pretty(&payload.document).map_err(anyhow::Error::from)?;
+    std::fs::write(&payload.output_path, document).with_context(|| {
+        format!(
+            "failed to save region locks {}",
+            payload.output_path.display()
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "output_path": payload.output_path,
+        "locks": payload.document.locks.len()
+    })))
+}
+
+async fn analyze_page_semantics(
+    Json(payload): Json<ApiSemanticAnalyzeRequest>,
+) -> Result<Json<SemanticPageReport>, ApiError> {
+    let report = analyze_semantics(&payload.input_path, &payload.config)?;
+    if let Some(path) = payload.report_output.as_deref() {
+        write_json_file(path, &report)?;
+    }
+    if let Some(path) = payload.locks_output.as_deref() {
+        let locks = semantic_region_locks(&report, &payload.palette, &payload.config);
+        write_json_file(path, &locks)?;
+    }
+    Ok(Json(report))
+}
+
+async fn track_page_characters(
+    Json(payload): Json<ApiCharacterTrackRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut observations = Vec::new();
+    for path in &payload.reports {
+        let report: SemanticPageReport = serde_json::from_slice(
+            &std::fs::read(path)
+                .with_context(|| format!("failed to read semantic report {}", path.display()))?,
+        )
+        .with_context(|| format!("failed to parse semantic report {}", path.display()))?;
+        observations.extend(character_observations(&report));
+    }
+    let tracks = track_characters(&observations, payload.similarity_threshold.clamp(0.0, 1.0));
+    let result = serde_json::json!({"observations": observations.len(), "tracks": tracks});
+    if let Some(path) = payload.output.as_deref() {
+        write_json_file(path, &result)?;
+    }
+    Ok(Json(result))
+}
+
+async fn curate_training_dataset(
+    Json(payload): Json<ApiDatasetCurateRequest>,
+) -> Result<Json<Vec<CuratedSample>>, ApiError> {
+    let brain: ChapterBrainReport = read_json_file(&payload.brain_report)?;
+    let safety: mangahue_brain::ChapterSafetyReport = read_json_file(&payload.safety_report)?;
+    let samples = curate_dataset(payload.candidates, &brain, &safety);
+    if let Some(path) = payload.output.as_deref() {
+        write_json_file(path, &samples)?;
+    }
+    Ok(Json(samples))
+}
+
+fn write_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(value)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
+    serde_json::from_slice(
+        &std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", path.display()))
+}
+
 async fn create_project(
     Json(payload): Json<ApiProjectCreateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -1461,6 +1720,14 @@ fn default_retry_tone_threshold() -> f32 {
 
 fn default_retry_max_pages() -> usize {
     24
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+fn default_character_similarity() -> f32 {
+    0.92
 }
 
 fn default_palette_memory_max_entries() -> usize {

@@ -1,0 +1,23 @@
+[package]
+name = "mangahue-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mangahue-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+mangahue-chapter = { path = "../mangahue-chapter" }
+mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+mangahue-production = { path = "../mangahue-production" }
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

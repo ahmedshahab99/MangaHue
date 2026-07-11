@@ -1,0 +1,9 @@
+target
+.git
+.mangahue
+.venv
+__pycache__
+examples/output
+*.pt
+*.pth
+*.safetensors

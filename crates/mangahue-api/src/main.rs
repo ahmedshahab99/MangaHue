@@ -15,6 +15,8 @@ struct Args {
     styles_dir: PathBuf,
     #[arg(long, default_value = "web/studio")]
     studio_dir: PathBuf,
+    #[arg(long, default_value = ".mangahue/production.db")]
+    production_db: PathBuf,
 }
 
 #[tokio::main]
@@ -28,6 +30,7 @@ async fn main() -> Result<()> {
         jobs_dir: args.jobs_dir,
         styles_dir: args.styles_dir,
         studio_dir: args.studio_dir,
+        production_db: args.production_db,
     })
     .await
 }
