@@ -131,3 +131,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"audited {report['sample_count']} samples in {report['group_count']} groups -> {args.output}")
+
+
+if __name__ == "__main__":
+    main()

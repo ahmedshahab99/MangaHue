@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageStat
+from PIL import Image
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -51,6 +51,7 @@ def main() -> None:
     candidates = [
         path for path in args.root.rglob("*")
         if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES and output not in path.parents
+        and "data/data" not in str(path.relative_to(args.root)).replace("\\", "/")
     ]
     manifests: dict[str, list[dict[str, object]]] = {"train": [], "validation": [], "test": []}
     rejected = 0
@@ -73,6 +74,7 @@ def main() -> None:
                 "color": str(color_path.relative_to(output)).replace("\\", "/"),
                 "provenance": "ktaebum/anime-sketch-colorization-pair",
                 "license": "CC0-1.0",
+                "source_path": str(path.relative_to(args.root)).replace("\\", "/"),
             })
         except (OSError, ValueError):
             rejected += 1
