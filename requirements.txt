@@ -1,0 +1,4 @@
+httpx>=0.25
+beautifulsoup4>=4.12
+lxml>=5.0
+python-telegram-bot>=20.0
