@@ -10,7 +10,8 @@ ENV PYTHONUNBUFFERED=1 \
 RUN useradd --create-home --uid 10001 mangahue
 WORKDIR /app
 COPY python /app/python
-RUN pip install --no-cache-dir -e /app/python
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
+    && pip install --no-cache-dir -e '/app/python[pretrained]'
 COPY --from=rust-builder /src/target/release/mangahue-api /usr/local/bin/mangahue-api
 COPY --from=rust-builder /src/target/release/mangahue-worker /usr/local/bin/mangahue-worker
 COPY --from=rust-builder /src/target/release/mangahue-telegram /usr/local/bin/mangahue-telegram

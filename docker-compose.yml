@@ -38,5 +38,29 @@ services:
       - mangahue-data:/data
       - ./models:/app/models:ro
 
+  telegram-small:
+    build: .
+    restart: unless-stopped
+    profiles: ["telegram-small"]
+    entrypoint: ["mangahue-telegram"]
+    command:
+      - "--work-dir"
+      - "/data/telegram"
+      - "--max-pages"
+      - "32"
+      - "--max-concurrent-jobs"
+      - "1"
+      - "--model"
+      - "/app/models/pretrained/manga-colorization-v2"
+      - "--preset"
+      - "/app/configs/engine.pretrained-small.yaml"
+      - "--hint-propagate"
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+    volumes:
+      - mangahue-data:/data
+      - ${MANGAHUE_PRETRAINED_MODEL_DIR:-./models/pretrained/manga-colorization-v2}:/app/models/pretrained/manga-colorization-v2:ro
+
 volumes:
   mangahue-data:

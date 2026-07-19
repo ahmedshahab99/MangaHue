@@ -325,8 +325,10 @@ impl MangaHueEngine {
         let colored_tiles: Vec<(TileInfo, RgbImage)>;
         let mut ensemble_report: Option<mangahue_ensemble::EnsembleReport> = None;
         let mut confidence_map: Option<ConfidenceMap> = None;
+        let backend_name: String;
 
         if use_ensemble {
+            backend_name = "ensemble".to_string();
             let ens = build_ensembler(&request, &config)?;
             info!(
                 ensemble_variants = 1usize + request.ensemble_model_paths.len(),
@@ -397,6 +399,7 @@ impl MangaHueEngine {
             } else {
                 raw_backend
             };
+            backend_name = backend.name().to_string();
             info!(
                 backend = backend.name(),
                 jobs = parallel_jobs,
@@ -460,12 +463,6 @@ impl MangaHueEngine {
 
         let merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
-        let backend_name = if use_ensemble {
-            "ensemble".to_string()
-        } else {
-            select_backend_label(&request, &config, &style)
-                .unwrap_or_else(|_| "unknown".to_string())
-        };
         let mut inference_report = StageReport::new("inference")
             .note(format!("backend={}", backend_name))
             .metric("parallel_jobs", parallel_jobs as f64)
@@ -701,6 +698,15 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
+    if mangahue_inference::is_pretrained_model_dir(model_path) {
+        return Ok(Box::new(
+            mangahue_inference::PretrainedWorkerBackend::shared(
+                model_path,
+                &config.inference.device,
+                config.inference.input_size,
+            )?,
+        ));
+    }
     if model_path.extension().and_then(|value| value.to_str()) == Some("placeholder") {
         return Err(anyhow!(
             "real colorization requires an ONNX model; pass --model path/to/model.onnx or use --mock for pipeline verification"
@@ -948,15 +954,6 @@ fn build_ensembler(request: &ColorizeRequest, config: &EngineConfig) -> Result<E
         return Err(anyhow!("ensemble requires at least one model path"));
     }
     Ensembler::from_onnx(&model_paths, metadata_path)
-}
-
-fn select_backend_label(
-    request: &ColorizeRequest,
-    config: &EngineConfig,
-    style: &StyleProfile,
-) -> Result<String> {
-    let backend = select_backend(request, config, style)?;
-    Ok(backend.name().to_string())
 }
 
 fn check_cancel(cancel: &Option<Arc<AtomicBool>>) -> bool {
