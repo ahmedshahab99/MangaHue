@@ -812,13 +812,13 @@ fn handle_callback(
     if data == "cancel_job" {
         state.cancel(chat_id);
         if let Some(ref msg) = cb.message {
-            edit_message(
+            let _ = edit_message(
                 client,
                 token,
                 chat_id,
                 msg.message_id,
                 "Cancelled by user.",
-            )?;
+            );
         }
         return Ok(());
     }
@@ -1057,13 +1057,13 @@ fn handle_link(
 
     for batch_idx in 0..total_batches {
         if cancel_token.load(Ordering::Acquire) {
-            edit_message(
+            let _ = edit_message(
                 client,
                 token,
                 chat_id,
                 progress_msg_id,
                 &format!("Cancelled after {sent} page(s) colored.",),
-            )?;
+            );
             cleanup_dir(&job_dir);
             return Ok(());
         }
@@ -1101,8 +1101,6 @@ fn handle_link(
             }
             std::thread::sleep(Duration::from_millis(400));
         }
-
-        let mut batch_outputs: Vec<(usize, PathBuf, String)> = Vec::new();
 
         for (position, page) in &batch_pages {
             if cancel_token.load(Ordering::Acquire) {
@@ -1195,7 +1193,17 @@ fn handle_link(
                             .director_verdict
                             .unwrap_or_else(|| "colored".to_string())
                     );
-                    batch_outputs.push((*position, output_path, caption));
+                    send_chat_action(client, token, chat_id, "upload_document")?;
+                    if let Err(e) = send_document(client, token, chat_id, &output_path, &caption)
+                    {
+                        tracing::error!(error = %e, "send failed");
+                        failed += 1;
+                    } else {
+                        sent += 1;
+                    }
+                    let _ = std::fs::remove_file(&output_path);
+                    let _ = std::fs::remove_file(local_path);
+                    state.record_pages(chat_id, 1);
                 }
                 Err(error) => {
                     if cancel_token.load(Ordering::Acquire) {
@@ -1223,7 +1231,7 @@ fn handle_link(
                 }
             }
 
-            let done = start + batch_outputs.len() + failed.min((*position + 1) - start);
+            let done = start + sent.min((*position + 1) - start) + failed.min((*position + 1) - start);
             let eta = estimate_eta(&page_times, done, effective_total);
             let _ = edit_message(
                 client,
@@ -1241,46 +1249,6 @@ fn handle_link(
             );
         }
 
-        if !batch_outputs.is_empty() && !cancel_token.load(Ordering::Acquire) {
-            let mut files_for_media: Vec<(Vec<u8>, String, String)> = Vec::new();
-            for (_, path, caption) in &batch_outputs {
-                let data = std::fs::read(path)
-                    .with_context(|| format!("failed to read {}", path.display()))?;
-                let fname = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("page.png")
-                    .to_string();
-                files_for_media.push((data, fname, caption.clone()));
-            }
-
-            send_chat_action(client, token, chat_id, "upload_document")?;
-            match send_media_group(client, token, chat_id, &files_for_media) {
-                Ok(()) => {
-                    sent += batch_outputs.len();
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "media group send failed, sending individually");
-                    for ((_, path, caption), (_, _, _)) in
-                        batch_outputs.iter().zip(files_for_media.iter())
-                    {
-                        rate_limit_wait(chat_id);
-                        if let Err(e2) = send_document(client, token, chat_id, path, caption) {
-                            tracing::error!(error = %e2, "individual page send failed");
-                            failed += 1;
-                        } else {
-                            sent += 1;
-                        }
-                    }
-                }
-            }
-
-            state.record_pages(chat_id, batch_outputs.len());
-        }
-
-        for (_, path, _) in &batch_outputs {
-            let _ = std::fs::remove_file(path);
-        }
         for (_, path) in &batch_pages {
             let _ = std::fs::remove_file(path);
         }
@@ -1306,7 +1274,7 @@ fn handle_link(
         ));
     }
 
-    edit_message(client, token, chat_id, status_msg_id, &final_text)?;
+    let _ = edit_message(client, token, chat_id, status_msg_id, &final_text);
 
     send_message(
         client,
@@ -1316,13 +1284,13 @@ fn handle_link(
         Some(&serde_json::to_string(&completion_kb).unwrap_or_default()),
     )?;
 
-    edit_message(
+    let _ = edit_message(
         client,
         token,
         chat_id,
         progress_msg_id,
         &format!("Complete: *{sent}* sent, *{failed}* failed.",),
-    )?;
+    );
 
     Ok(())
 }
