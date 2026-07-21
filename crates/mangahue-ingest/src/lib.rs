@@ -1,7 +1,7 @@
 mod extractors;
 
 use anyhow::{Context, Result};
-use extractors::extract_manga_urls;
+pub use extractors::extract_manga_urls;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
 use scraper::{Html, Selector};
@@ -286,7 +286,7 @@ pub fn extract_image_urls_with_selectors(
     Ok(urls)
 }
 
-fn download_image_url(
+pub fn download_image_url(
     client: &Client,
     user_agent: &str,
     url: Url,

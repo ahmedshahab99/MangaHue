@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use mangahue_ingest::{ingest_url, IngestRequest};
+use mangahue_ingest::extract_manga_urls;
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::{Form, Part};
 use reqwest::blocking::Client;
+use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -972,22 +974,43 @@ fn handle_link(
         None,
     )?;
 
-    let ingest = ingest_url(IngestRequest {
-        source_url: url.to_string(),
-        output_dir: downloads_dir.clone(),
-        max_pages: args.max_pages,
-        max_bytes_per_page: args.max_bytes_per_page,
-        min_request_interval: Duration::from_millis(500),
-        selectors: mangahue_ingest::default_selectors(),
-        user_agent: None,
-    })?;
+    let source_url = url::Url::parse(url)
+        .with_context(|| format!("invalid URL: {url}"))?;
+    let page_resp = client
+        .get(url)
+        .header(USER_AGENT, "MangaHueBot/1.0")
+        .send()
+        .with_context(|| format!("failed to fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("server rejected {url}"))?;
 
-    if ingest.pages.is_empty() {
+    let content_type = page_resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let all_image_urls: Vec<String> = if content_type.starts_with("image/") {
+        vec![url.to_string()]
+    } else {
+        let html = page_resp
+            .text()
+            .with_context(|| format!("failed to read HTML from {url}"))?;
+        extract_manga_urls(
+            &client,
+            &source_url,
+            &html,
+            &source_url,
+            args.max_pages,
+        )?
+    };
+
+    if all_image_urls.is_empty() {
         cleanup_dir(&job_dir);
         anyhow::bail!("no page images were found at that URL");
     }
 
-    let total = ingest.pages.len();
+    let total = all_image_urls.len();
     let remaining = state.remaining_pages_today(chat_id);
     let effective_total = total.min(remaining);
     if effective_total == 0 {
@@ -1047,11 +1070,37 @@ fn handle_link(
 
         let start = batch_idx * batch_size;
         let end = ((batch_idx + 1) * batch_size).min(effective_total);
-        let batch_pages: Vec<_> = ingest.pages[start..end]
+        let batch_urls: Vec<(usize, String)> = all_image_urls[start..end]
             .iter()
             .enumerate()
-            .map(|(i, page)| (start + i, page.clone()))
+            .map(|(i, u)| (start + i, u.clone()))
             .collect();
+
+        // ── Download this batch ──
+        let mut batch_pages: Vec<(usize, PathBuf)> = Vec::new();
+        for (pos, img_url) in &batch_urls {
+            if cancel_token.load(Ordering::Acquire) {
+                break;
+            }
+            let ext = Path::new(img_url)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+            let local_path = downloads_dir.join(format!("page_{:03}.{}", pos + 1, ext));
+            match download_image_url_telegram(
+                client,
+                img_url,
+                &local_path,
+                args.max_bytes_per_page,
+            ) {
+                Ok(()) => batch_pages.push((*pos, local_path)),
+                Err(e) => {
+                    tracing::warn!(url = %img_url, error = %e, "download failed, skipping");
+                    failed += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
 
         let mut batch_outputs: Vec<(usize, PathBuf, String)> = Vec::new();
 
@@ -1061,8 +1110,8 @@ fn handle_link(
             }
 
             let page_start = Instant::now();
-            let stem = page
-                .local_path
+            let local_path = page;
+            let stem = local_path
                 .file_stem()
                 .and_then(|v| v.to_str())
                 .unwrap_or("page");
@@ -1103,7 +1152,7 @@ fn handle_link(
             });
 
             let result = engine.colorize(ColorizeRequest {
-                input_path: page.local_path.clone(),
+                input_path: local_path.clone(),
                 output_path: output_path.clone(),
                 model_path: args.model.clone(),
                 config_path: args.config.clone(),
@@ -1161,7 +1210,7 @@ fn handle_link(
                         return Ok(());
                     }
                     failed += 1;
-                    failed_pages.push(page.local_path.clone());
+                    failed_pages.push(local_path.clone());
                     if args.fail_fast {
                         cleanup_dir(&job_dir);
                         return Err(error);
@@ -1232,8 +1281,8 @@ fn handle_link(
         for (_, path, _) in &batch_outputs {
             let _ = std::fs::remove_file(path);
         }
-        for page in &batch_pages {
-            let _ = std::fs::remove_file(&page.1.local_path);
+        for (_, path) in &batch_pages {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -1332,6 +1381,36 @@ fn cleanup_dir(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_dir_all(path);
     }
+}
+
+fn download_image_url_telegram(
+    client: &Client,
+    url: &str,
+    output: &Path,
+    max_bytes: u64,
+) -> Result<()> {
+    let resp = client
+        .get(url)
+        .header(USER_AGENT, "MangaHueBot/1.0")
+        .timeout(Duration::from_secs(60))
+        .send()
+        .with_context(|| format!("failed to fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("server rejected {url}"))?;
+    let mut reader = resp.take(max_bytes + 1);
+    let mut data = Vec::new();
+    reader
+        .read_to_end(&mut data)
+        .with_context(|| format!("failed to read bytes from {url}"))?;
+    if data.len() as u64 > max_bytes {
+        anyhow::bail!("image exceeds {max_bytes} bytes");
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, &data)
+        .with_context(|| format!("failed to write {}", output.display()))?;
+    Ok(())
 }
 
 fn rate_limit_wait(_chat_id: i64) {
