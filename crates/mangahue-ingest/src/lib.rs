@@ -1,4 +1,7 @@
+mod extractors;
+
 use anyhow::{Context, Result};
+use extractors::extract_manga_urls;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
 use scraper::{Html, Selector};
@@ -143,8 +146,13 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
         let html = response
             .text()
             .with_context(|| format!("failed to read HTML from {source_url}"))?;
-        let image_urls =
-            extract_image_urls_with_selectors(source_url.as_str(), &html, &request.selectors)?;
+        let image_urls = extract_manga_urls(
+            &client,
+            &source_url,
+            &html,
+            &source_url,
+            max_pages,
+        )?;
         for image_url in image_urls.into_iter().take(max_pages) {
             let parsed = Url::parse(&image_url)?;
             if let Err(error) = validate_public_url(&parsed) {
