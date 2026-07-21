@@ -183,22 +183,32 @@ fn extract_nhentai(
 }
 
 fn nhentai_thumb_to_full(src: &str) -> String {
-    // Convert thumb CDN → full image CDN
-    // t.nhentai.net/galleries/X/1t.jpg → i.nhentai.net/galleries/X/1.jpg
-    let s = src
-        .replace("//t.nhentai.net", "//i.nhentai.net")
-        .replace("//t7.nhentai.net", "//i7.nhentai.net")
-        .replace("//t5.nhentai.net", "//i5.nhentai.net")
-        .replace("//t3.nhentai.net", "//i3.nhentai.net");
+    // Convert any //t, //t1, //t2, ... //t999 subdomain to //i, //i1, //i2, ...
+    let mut s = src.to_string();
+    if let Some(t_pos) = s.find("//t") {
+        let after_slash = &s[t_pos + 2..];
+        let mut end = 1; // after 't'
+        while end < after_slash.len() && after_slash.as_bytes()[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end < after_slash.len() && &after_slash[end..end + 12] == ".nhentai.net" {
+            let new_host = format!("//i{}.nhentai.net", &after_slash[1..end]);
+            s = format!("{}{}{}", &s[..t_pos], new_host, &s[t_pos + 2 + end + 12..]);
+        } else if end < after_slash.len() && &after_slash[end..end + 11] == ".nhentai.to" {
+            let new_host = format!("//i{}.nhentai.to", &after_slash[1..end]);
+            s = format!("{}{}{}", &s[..t_pos], new_host, &s[t_pos + 2 + end + 11..]);
+        }
+    }
 
-    // Remove 't' suffix before extension: 1t.jpg → 1.jpg
-    if s.contains(".jpg") || s.contains(".png") || s.contains(".webp") {
-        let ext_dot = s.rfind('.').unwrap();
+    // Remove 't' suffix before extension: 1t.jpg → 1.jpg, 23t.png → 23.png
+    if let Some(ext_dot) = s.rfind('.') {
         let base = &s[..ext_dot];
-        if base.ends_with('t') && base.len() > 0 {
+        let ext = &s[ext_dot..];
+        if base.ends_with('t') {
             let without_t = &base[..base.len() - 1];
-            let ext = &s[ext_dot..];
-            return format!("{}{}", without_t, ext);
+            if !without_t.is_empty() && without_t.ends_with(|c: char| c.is_ascii_digit()) {
+                return format!("{}{}", without_t, ext);
+            }
         }
     }
     s

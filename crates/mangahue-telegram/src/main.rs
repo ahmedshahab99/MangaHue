@@ -1126,7 +1126,7 @@ fn handle_link(
             match result {
                 Ok(colorize_result) => {
                     if cancel_token.load(Ordering::Acquire) {
-                        edit_message(
+                        let _ = edit_message(
                             client,
                             token,
                             chat_id,
@@ -1134,7 +1134,7 @@ fn handle_link(
                             &format!(
                                 "Cancelled after {sent} page(s)."
                             ),
-                        )?;
+                        );
                         cleanup_dir(&job_dir);
                         return Ok(());
                     }
@@ -1150,13 +1150,13 @@ fn handle_link(
                 }
                 Err(error) => {
                     if cancel_token.load(Ordering::Acquire) {
-                        edit_message(
+                        let _ = edit_message(
                             client,
                             token,
                             chat_id,
                             progress_msg_id,
                             "Cancelled.",
-                        )?;
+                        );
                         cleanup_dir(&job_dir);
                         return Ok(());
                     }
@@ -1176,7 +1176,7 @@ fn handle_link(
 
             let done = start + batch_outputs.len() + failed.min((*position + 1) - start);
             let eta = estimate_eta(&page_times, done, effective_total);
-            edit_message(
+            let _ = edit_message(
                 client,
                 token,
                 chat_id,
@@ -1189,7 +1189,7 @@ fn handle_link(
                     eta,
                     failed,
                 ),
-            )?;
+            );
         }
 
         if !batch_outputs.is_empty() && !cancel_token.load(Ordering::Acquire) {
