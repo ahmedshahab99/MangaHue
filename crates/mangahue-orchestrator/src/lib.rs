@@ -698,6 +698,15 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
+    if mangahue_inference::is_manga_ninja_model_dir(model_path) {
+        return Ok(Box::new(
+            mangahue_inference::MangaNinjaBackend::shared(
+                model_path,
+                &config.inference.device,
+                50,
+            )?,
+        ));
+    }
     if mangahue_inference::is_pretrained_model_dir(model_path) {
         return Ok(Box::new(
             mangahue_inference::PretrainedWorkerBackend::shared(

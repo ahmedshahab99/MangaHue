@@ -13,6 +13,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+models/pretrained/
 examples/output/
 projects/*/history/*.png
 projects/*/corrections/*.png

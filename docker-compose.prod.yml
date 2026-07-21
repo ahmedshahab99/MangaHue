@@ -1,0 +1,199 @@
+services:
+  api:
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-7878}:7878"
+    environment:
+      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
+      MANGAHUE_PYTHON: ${MANGAHUE_PYTHON:-python}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+    volumes:
+      - mangahue-data:/data
+      - mangahue-models:/app/models:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:7878/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  worker:
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    entrypoint: ["mangahue-worker"]
+    command:
+      - "--database"
+      - "/data/production.db"
+      - "--object-store"
+      - "/data/objects"
+      - "--worker-id"
+      - "${WORKER_ID:-gpu-worker-1}"
+      - "--no-telemetry"
+    environment:
+      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
+      MANGAHUE_PYTHON: ${MANGAHUE_PYTHON:-python}
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+    volumes:
+      - mangahue-data:/data
+      - mangahue-models:/app/models:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mangahue-worker || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4096M
+        reservations:
+          cpus: "1.0"
+          memory: 2048M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  telegram:
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["telegram"]
+    entrypoint: ["mangahue-telegram"]
+    command:
+      - "--work-dir"
+      - "/data/telegram"
+      - "--max-pages"
+      - "${TELEGRAM_MAX_PAGES:-32}"
+      - "--pyramid"
+      - "--hint-propagate"
+      - "--daily-page-limit"
+      - "${DAILY_PAGE_LIMIT:-100}"
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
+      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      CLEANUP_AFTER_HOURS: ${CLEANUP_AFTER_HOURS:-24}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+    volumes:
+      - mangahue-data:/data
+      - mangahue-models:/app/models:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mangahue-telegram || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "1.0"
+          memory: 1024M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  telegram-small:
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-small}
+    pull_policy: always
+    restart: unless-stopped
+    profiles: ["telegram-small"]
+    entrypoint: ["mangahue-telegram"]
+    command:
+      - "--work-dir"
+      - "/data/telegram"
+      - "--max-pages"
+      - "${TELEGRAM_MAX_PAGES:-32}"
+      - "--max-concurrent-jobs"
+      - "1"
+      - "--model"
+      - "/app/models/pretrained/manga-colorization-v2"
+      - "--preset"
+      - "/app/configs/engine.pretrained-small.yaml"
+      - "--hint-propagate"
+      - "--daily-page-limit"
+      - "${DAILY_PAGE_LIMIT:-100}"
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
+      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      CLEANUP_AFTER_HOURS: ${CLEANUP_AFTER_HOURS:-24}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+    volumes:
+      - mangahue-data:/data
+      - mangahue-models:/app/models:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f mangahue-telegram || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1536M
+        reservations:
+          cpus: "1.0"
+          memory: 768M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+volumes:
+  mangahue-data:
+    driver: local
+  mangahue-models:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${MANGAHUE_MODEL_DIR:-./models}

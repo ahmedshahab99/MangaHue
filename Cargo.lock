@@ -1773,6 +1773,7 @@ name = "mangahue-telegram"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "mangahue-ingest",
  "mangahue-orchestrator",
@@ -1783,6 +1784,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

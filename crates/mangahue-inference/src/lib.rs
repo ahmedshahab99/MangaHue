@@ -400,6 +400,226 @@ impl ColorizationBackend for PretrainedWorkerBackend {
     }
 }
 
+pub fn is_manga_ninja_model_dir(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.join("checkpoints")
+        .join("StableDiffusion")
+        .join("vae")
+        .is_dir()
+        && path.join("checkpoints").join("MangaNinjia").is_dir()
+}
+
+#[derive(Debug, Clone)]
+struct MangaNinjaWorkerLaunch {
+    python: String,
+    model_root: PathBuf,
+    device: String,
+    denoise_steps: u32,
+    worker_threads: usize,
+}
+
+impl MangaNinjaWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let mut child = Command::new(&self.python)
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.manga_ninja_worker")
+            .arg("--model-root")
+            .arg(&self.model_root)
+            .arg("--device")
+            .arg(&self.device)
+            .arg("--denoise-steps")
+            .arg(self.denoise_steps.to_string())
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to launch manga-ninja worker with '{}'; install MangaHue's Python package and model dependencies",
+                    self.python
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("manga-ninja worker stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("manga-ninja worker stdout unavailable")?;
+        let mut process = PretrainedWorkerProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let mut ready = String::new();
+        process
+            .stdout
+            .read_line(&mut ready)
+            .context("manga-ninja worker exited before readiness handshake")?;
+        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
+            .with_context(|| format!("invalid manga-ninja worker handshake: {}", ready.trim()))?;
+        if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
+            return Err(anyhow!(
+                "manga-ninja worker did not become ready: {handshake}"
+            ));
+        }
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+pub struct MangaNinjaBackend {
+    launch: MangaNinjaWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+impl MangaNinjaBackend {
+    pub fn new(model_root: impl AsRef<Path>, device: &str, denoise_steps: u32) -> Result<Self> {
+        let model_root = model_root.as_ref();
+        if !is_manga_ninja_model_dir(model_root) {
+            return Err(anyhow!(
+                "manga-ninja model directory is incomplete: {}",
+                model_root.display()
+            ));
+        }
+        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let launch = MangaNinjaWorkerLaunch {
+            python,
+            model_root: model_root.to_path_buf(),
+            device: if device.eq_ignore_ascii_case("cuda") {
+                "cuda".to_string()
+            } else {
+                "cpu".to_string()
+            },
+            denoise_steps,
+            worker_threads,
+        };
+        let process = launch.spawn()?;
+        Ok(Self {
+            launch,
+            process: Mutex::new(process),
+        })
+    }
+
+    pub fn shared(
+        model_root: impl AsRef<Path>,
+        device: &str,
+        denoise_steps: u32,
+    ) -> Result<Arc<Self>> {
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<MangaNinjaBackend>>>> =
+            OnceLock::new();
+        let model_root = model_root.as_ref();
+        let canonical = model_root.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve manga-ninja model directory {}",
+                model_root.display()
+            )
+        })?;
+        let key = format!(
+            "{}|{}|{}",
+            canonical.display(),
+            device.to_ascii_lowercase(),
+            denoise_steps
+        );
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|error| anyhow!("manga-ninja worker registry poisoned: {error}"))?;
+        if let Some(worker) = workers.get(&key) {
+            return Ok(Arc::clone(worker));
+        }
+        let worker = Arc::new(Self::new(&canonical, device, denoise_steps)?);
+        workers.insert(key, Arc::clone(&worker));
+        Ok(worker)
+    }
+}
+
+impl ColorizationBackend for MangaNinjaBackend {
+    fn name(&self) -> &str {
+        "manga-ninja"
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        if input.hint_map.dimensions() != input.lineart.dimensions()
+            || input.hint_mask.dimensions() != input.lineart.dimensions()
+        {
+            return Err(EngineError::DimensionMismatch(
+                "manga-ninja input maps must share dimensions".to_string(),
+            ));
+        }
+        let temp = tempfile::tempdir().map_err(|error| {
+            EngineError::Inference(format!(
+                "failed to create manga-ninja worker temp dir: {error}"
+            ))
+        })?;
+        let lineart_path = temp.path().join("lineart.png");
+        let hint_map_path = temp.path().join("hint_map.png");
+        let hint_mask_path = temp.path().join("hint_mask.png");
+        let output_path = temp.path().join("output.png");
+        input.lineart.save(&lineart_path).map_err(|error| {
+            EngineError::Inference(format!("failed to save manga-ninja lineart tile: {error}"))
+        })?;
+        input.hint_map.save(&hint_map_path).map_err(|error| {
+            EngineError::Inference(format!("failed to save manga-ninja hint tile: {error}"))
+        })?;
+        input.hint_mask.save(&hint_mask_path).map_err(|error| {
+            EngineError::Inference(format!("failed to save manga-ninja hint mask: {error}"))
+        })?;
+
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "hint_map": hint_map_path,
+            "hint_mask": hint_mask_path,
+            "output": output_path,
+        });
+        let mut process = self.process.lock().map_err(|error| {
+            EngineError::Inference(format!("manga-ninja worker lock poisoned: {error}"))
+        })?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "manga-ninja worker failed ({first_error}) and restart failed: {restart_error:#}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "manga-ninja worker failed after one restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!(
+                "manga-ninja worker failed: {}",
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+            )));
+        }
+        image::open(&output_path)
+            .map(|image| image.to_rgb8())
+            .map_err(|error| {
+                EngineError::Inference(format!("failed to read manga-ninja output: {error}"))
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockColorizationBackend {
     #[allow(dead_code)]
