@@ -1,0 +1,19 @@
+id: natural_manga
+name: Natural Manga
+saturation: 0.62
+contrast: 1.12
+brightness: -0.01
+shadow_strength: 0.78
+highlight_strength: 0.18
+line_strength: 1.08
+palette:
+  - "#c4957a"
+  - "#434a54"
+  - "#78524a"
+  - "#6a7a5c"
+  - "#a08a6e"
+  - "#4a5a6c"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Muted natural tones for realistic manga. Low saturation, earthy palette, strong ink preservation."

@@ -22,11 +22,11 @@ const MIN_SEND_INTERVAL_MS: u64 = 3100;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
 
 const BUILTIN_STYLES: &[(&str, &str)] = &[
-    ("anime_cel", "Anime Cel (default)"),
-    ("watercolor", "Watercolor"),
-    ("vintage", "Vintage Manga"),
-    ("noir", "Noir / High Contrast"),
-    ("pastel", "Pastel Soft"),
+    ("natural_manga", "Natural Manga (default)"),
+    ("realistic_comic", "Realistic Comic"),
+    ("dark_seinen", "Dark Seinen"),
+    ("watercolor_soft", "Watercolor Soft"),
+    ("retro_90s_anime", "Retro 90s Anime"),
 ];
 
 #[derive(Debug, Clone, Parser)]
