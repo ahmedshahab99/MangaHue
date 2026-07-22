@@ -975,6 +975,8 @@ use ort::{session::Session, value::Tensor};
 pub struct RustOnnxBackend {
     session: Mutex<Session>,
     metadata: ModelMetadata,
+    input_name: String,
+    output_name: String,
 }
 
 #[cfg(feature = "native-onnx")]
@@ -986,9 +988,17 @@ impl RustOnnxBackend {
             .map_err(|e| anyhow!("failed to create ONNX session: {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("failed to load ONNX model {}: {e}", model_path.display()))?;
+        let input_name = metadata.contract.as_ref()
+            .map(|c| c.input_name.clone())
+            .unwrap_or_else(|| "image_input".to_string());
+        let output_name = metadata.contract.as_ref()
+            .map(|c| c.output_name.clone())
+            .unwrap_or_else(|| "color_output".to_string());
         Ok(Self {
             session: Mutex::new(session),
             metadata,
+            input_name,
+            output_name,
         })
     }
 }
@@ -1034,10 +1044,12 @@ impl ColorizationBackend for RustOnnxBackend {
             .session
             .lock()
             .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
+        let in_name = &self.input_name;
+        let out_name = &self.output_name;
         let outputs = session
-            .run(ort::inputs!["image_input" => tensor])
+            .run(ort::inputs![in_name.clone() => tensor])
             .map_err(|e| EngineError::Inference(format!("ONNX inference failed: {e}")))?;
-        let (_, output_data) = outputs["color_output"]
+        let (_, output_data) = outputs[out_name.as_str()]
             .try_extract_tensor::<f32>()
             .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
 

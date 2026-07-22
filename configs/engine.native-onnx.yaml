@@ -1,0 +1,52 @@
+engine:
+  mode: balanced
+  parallel_jobs: 1
+  pyramid_enabled: false
+  hint_propagation_enabled: true
+
+preprocess:
+  denoise_enabled: true
+  denoise_strength: 1
+  max_input_dimension: 2400
+  line_sharpening: 0.45
+
+layout:
+  tiling_enabled: true
+  tile_size: 576
+  tile_overlap: 96
+
+inference:
+  model_path: /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx
+  model_metadata_path: /opt/MangaHue/models/manga-onnx/metadata.json
+  device: cpu
+  batch_size: 1
+  input_size: 576
+  fp16_enabled: false
+  resize_policy: fit
+
+hints:
+  user_hints_enabled: true
+  character_memory_enabled: true
+  style_hints_enabled: true
+  hint_blur_radius: 6.0
+  hint_strength: 1.0
+
+postprocess:
+  restore_lines: true
+  line_strength: 1.15
+  bubble_cleanup: true
+  bleeding_correction: true
+  palette_correction: true
+  final_sharpening: 0.06
+
+output:
+  format: png
+  quality: 95
+  write_report: false
+  write_intermediates: false
+
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.18

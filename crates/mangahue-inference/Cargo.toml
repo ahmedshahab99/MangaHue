@@ -6,15 +6,15 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = []
-native-onnx = ["ort", "ndarray"]
+default = ["native-onnx"]
+native-onnx = []
 
 [dependencies]
 anyhow.workspace = true
 image.workspace = true
 mangahue-core = { path = "../mangahue-core" }
-ndarray = { workspace = true, optional = true }
-ort = { workspace = true, optional = true }
+ndarray.workspace = true
+ort.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

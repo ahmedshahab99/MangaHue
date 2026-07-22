@@ -245,8 +245,9 @@ struct MangaColorLUT {
 
 impl MangaColorLUT {
     fn new(style: &StyleProfile) -> Self {
-        let warmth = (style.saturation - 0.5).clamp(0.02, 0.15) * 1.2;
-        let w = warmth;
+        let contrast = style.contrast.clamp(0.9, 1.15);
+        let sat = style.saturation.clamp(0.7, 1.0);
+        let bright = style.brightness * 15.0;
         let mut table = vec![[[Rgb([0; 3]); LUT_SIZE]; LUT_SIZE]; LUT_SIZE];
 
         for ri in 0..LUT_SIZE {
@@ -256,37 +257,18 @@ impl MangaColorLUT {
                     let g = gi as f32 * 16.0;
                     let b = bi as f32 * 16.0;
 
-                    // Warm-tone matrix
-                    let wr = r * (1.0 + w)       + g * (w * 0.5)   - b * (w * 0.75);
-                    let wg = r * (-w * 0.25)     + g * (1.0 + w * 0.25) + b * (w * 0.25);
-                    let wb = r * (-w * 1.0)      - g * (w * 0.25)  + b * (1.0 - w * 0.5);
+                    // Subtle desaturate toward grayscale (natural manga look)
+                    let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+                    let sr = gray + (r - gray) * sat;
+                    let sg = gray + (g - gray) * sat;
+                    let sb = gray + (b - gray) * sat;
 
-                    // Paper tone (cream tint in highlights)
-                    let luma = 0.2126 * wr + 0.7152 * wg + 0.0722 * wb;
-                    let pt = ((luma - 128.0) / 127.0).clamp(0.0, 1.0);
-                    let pr = wr + pt * 7.6;
-                    let pg = wg + pt * 2.5;
-                    let pb = wb - pt * 5.1;
+                    // Gentle contrast around 128
+                    let cr = ((sr - 128.0) * contrast + 128.0 + bright).clamp(0.0, 255.0) as u8;
+                    let cg = ((sg - 128.0) * contrast + 128.0 + bright).clamp(0.0, 255.0) as u8;
+                    let cb = ((sb - 128.0) * contrast + 128.0 + bright).clamp(0.0, 255.0) as u8;
 
-                    // Highlight compression
-                    let compress = |c: f32| -> f32 {
-                        if c <= 225.0 { return c; }
-                        let t = (c - 225.0) / 30.0;
-                        225.0 + t * 20.0 + (c - 235.0).max(0.0) * 0.3
-                    };
-                    let hr = compress(pr);
-                    let _hg = compress(pg);
-                    let hb = compress(pb);
-
-                    // Shadow tint (warm-brown + faint blue)
-                    let sf = if luma < 80.0 { (1.0 - luma / 80.0).powi(2) } else { 0.0 };
-                    let sr = hr + sf * 5.5;
-                    let sb = hb + sf * 4.5;
-
-                    let contrast = style.contrast;
-                    let mc = |v: f32| -> u8 { ((v - 128.0) * contrast + 128.0).clamp(0.0, 255.0) as u8 };
-
-                    table[ri][gi][bi] = Rgb([mc(sr), mc(wg.max(sr - 15.0)), mc(sb)]);
+                    table[ri][gi][bi] = Rgb([cr, cg, cb]);
                 }
             }
         }
