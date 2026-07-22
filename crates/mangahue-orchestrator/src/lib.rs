@@ -699,6 +699,16 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
+    if mangahue_inference::is_ddcolor_model_dir(model_path) {
+        return Ok(Box::new(
+            mangahue_inference::DdColorBackend::shared(
+                model_path,
+                &config.inference.device,
+                512,
+                "tiny",
+            )?,
+        ));
+    }
     if mangahue_inference::is_manga_ninja_model_dir(model_path) {
         return Ok(Box::new(
             mangahue_inference::MangaNinjaBackend::shared(

@@ -136,6 +136,154 @@ impl<T: ColorizationBackend + ?Sized> ColorizationBackend for Arc<T> {
     }
 }
 
+pub fn is_ddcolor_model_dir(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.join("pytorch_model.pt").is_file()
+        || path.join("models").is_dir()
+}
+
+#[derive(Debug, Clone)]
+struct DdColorWorkerLaunch {
+    python: String,
+    model_path: PathBuf,
+    device: String,
+    input_size: u32,
+    model_size: String,
+    worker_threads: usize,
+}
+
+impl DdColorWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let mut child = Command::new(&self.python)
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.ddcolor_worker")
+            .arg("--model-path")
+            .arg(&self.model_path)
+            .arg("--device")
+            .arg(&self.device)
+            .arg("--input-size")
+            .arg(self.input_size.to_string())
+            .arg("--model-size")
+            .arg(&self.model_size)
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!("failed to launch ddcolor worker with '{}'", self.python)
+            })?;
+        let stdin = child.stdin.take().context("ddcolor worker stdin unavailable")?;
+        let stdout = child.stdout.take().context("ddcolor worker stdout unavailable")?;
+        let mut process = PretrainedWorkerProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let mut ready = String::new();
+        process.stdout.read_line(&mut ready)
+            .context("ddcolor worker exited before readiness handshake")?;
+        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
+            .with_context(|| format!("invalid ddcolor handshake: {}", ready.trim()))?;
+        if handshake.get("status").and_then(|v| v.as_str()) != Some("ready") {
+            return Err(anyhow!("ddcolor worker did not become ready: {handshake}"));
+        }
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+pub struct DdColorBackend {
+    launch: DdColorWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+impl DdColorBackend {
+    pub fn new(model_dir: impl AsRef<Path>, device: &str, input_size: u32, model_size: &str) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let model_path = if model_dir.join("pytorch_model.pt").is_file() {
+            model_dir.join("pytorch_model.pt")
+        } else {
+            let snapshots = model_dir.join("models");
+            let mut found = None;
+            if snapshots.is_dir() {
+                for entry in std::fs::read_dir(&snapshots).with_context(|| format!("cannot read {}", snapshots.display()))? {
+                    let entry = entry?;
+                    let candidate = entry.path().join("snapshots").join("master").join("pytorch_model.pt");
+                    if candidate.is_file() {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            found.context("ddcolor pytorch_model.pt not found in model directory")?
+        };
+
+        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, 8);
+        let launch = DdColorWorkerLaunch {
+            python,
+            model_path,
+            device: if device.eq_ignore_ascii_case("cuda") { "cuda".to_string() } else { "cpu".to_string() },
+            input_size,
+            model_size: model_size.to_string(),
+            worker_threads,
+        };
+        let process = launch.spawn()?;
+        Ok(Self { launch, process: Mutex::new(process) })
+    }
+
+    pub fn shared(model_dir: impl AsRef<Path>, device: &str, input_size: u32, model_size: &str) -> Result<Arc<Self>> {
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<DdColorBackend>>>> = OnceLock::new();
+        let canonical = model_dir.as_ref().canonicalize()
+            .with_context(|| format!("cannot resolve ddcolor dir {}", model_dir.as_ref().display()))?;
+        let key = format!("{}|{}|{}|{}", canonical.display(), device.to_ascii_lowercase(), input_size, model_size);
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut w = workers.lock().map_err(|e| anyhow!("ddcolor registry poisoned: {e}"))?;
+        if let Some(worker) = w.get(&key) {
+            return Ok(Arc::clone(worker));
+        }
+        let worker = Arc::new(Self::new(&canonical, device, input_size, model_size)?);
+        w.insert(key, Arc::clone(&worker));
+        Ok(worker)
+    }
+}
+
+impl ColorizationBackend for DdColorBackend {
+    fn name(&self) -> &str { "ddcolor" }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let temp = tempfile::tempdir().map_err(|e| EngineError::Inference(format!("ddcolor temp dir: {e}")))?;
+        let lineart_path = temp.path().join("lineart.png");
+        let output_path = temp.path().join("output.png");
+        input.lineart.save(&lineart_path).map_err(|e| EngineError::Inference(format!("ddcolor save: {e}")))?;
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "output": output_path,
+        });
+        let mut process = self.process.lock().map_err(|e| EngineError::Inference(format!("ddcolor lock: {e}")))?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(r) => r,
+            Err(first) => {
+                *process = self.launch.spawn().map_err(|restart| EngineError::Inference(format!("ddcolor worker failed ({first}) and restart failed: {restart}")))?;
+                exchange_worker_request(&mut process, &request).map_err(|second| EngineError::Inference(format!("ddcolor failed after restart: {second}")))?
+            }
+        };
+        if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!("ddcolor failed: {}", response.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"))));
+        }
+        image::open(&output_path).map(|i| i.to_rgb8())
+            .map_err(|e| EngineError::Inference(format!("ddcolor output: {e}")))
+    }
+}
+
 pub fn is_pretrained_model_dir(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
     path.join("colorizator.py").is_file()
