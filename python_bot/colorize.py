@@ -10,6 +10,8 @@ from typing import Optional
 import numpy as np
 from PIL import Image, ImageFilter
 
+from hints import SmartHintGenerator, hints_to_model_tensor
+
 logger = logging.getLogger(__name__)
 
 _MODEL_ROOT = Path(__file__).resolve().parents[1] / "models" / "manga-onnx"
@@ -389,13 +391,26 @@ class Colorizer:
         logger.info("Loading ONNX model: %s", self._onnx_model_path)
 
         orig = Image.open(image_path)
-        padded = pad_to_multiple(orig, multiple=32)
 
-        tensor = pil_to_tensor(padded)
+        # Generate smart colour hints from the original grayscale image
+        orig_gray = np.asarray(orig.convert("L"), dtype=np.uint8)
+        gen = SmartHintGenerator()
+        hint_map, hint_mask = gen.generate(orig_gray)
+
+        # hint_map / hint_mask are pre-padded to multiples of 32
+        pad_h = hint_map.shape[0] - orig_gray.shape[0]
+        pad_w = hint_map.shape[1] - orig_gray.shape[1]
+
+        gray_f32 = orig_gray.astype(np.float32) / 255.0
+        if pad_h > 0 or pad_w > 0:
+            gray_f32 = np.pad(
+                gray_f32, ((0, pad_h), (0, pad_w)), mode="reflect"
+            )
+        tensor = gray_f32[None, None, :, :]  # (1, 1, H_pad, W_pad)
         _, _, h, w = tensor.shape
 
-        hint = np.zeros((1, 4, h, w), dtype=np.float32)
-        x = np.concatenate([tensor, hint], axis=1).astype(np.float32)
+        hint_tensor = hints_to_model_tensor(hint_map, hint_mask)  # (1, 4, H_pad, W_pad)
+        x = np.concatenate([tensor, hint_tensor], axis=1).astype(np.float32)
 
         session = ort.InferenceSession(
             str(self._onnx_model_path),
