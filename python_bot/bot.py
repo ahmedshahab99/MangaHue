@@ -287,173 +287,56 @@ class MangaDownloader:
 
 # -- SmartHintGenerator -----------------------------------------------------
 class SmartHintGenerator:
-    SKIN = [(255, 218, 185), (245, 200, 170), (238, 188, 158), (250, 210, 180), (240, 195, 165)]
-    HAIR = [(35, 25, 20), (55, 42, 35), (45, 32, 28), (160, 125, 90), (85, 60, 40), (180, 140, 105)]
-    CLOTHING = [(160, 45, 40), (45, 75, 155), (55, 45, 80), (40, 80, 60), (195, 175, 155), (75, 55, 48), (95, 125, 165), (155, 135, 125)]
-    BACKGROUND = [(252, 250, 245), (248, 244, 238), (242, 238, 230)]
-    EYES = [(25, 35, 110), (75, 155, 190), (45, 95, 170)]
-    PAL = {"skin": SKIN, "hair": HAIR, "clothing": CLOTHING, "bg": BACKGROUND, "eyes": EYES}
-    MS = 800
-    MH = 12
+    COLORS = [
+        (248,210,182), (240,195,168), (235,185,158), (250,218,192), (228,178,150), (242,205,175),
+        (38,28,22), (52,40,32), (45,35,28), (155,120,88), (78,58,42), (170,132,98), (58,45,38), (120,90,65),
+        (155,48,42), (42,72,148), (52,42,75), (38,75,55), (185,168,148), (72,50,44),
+        (90,118,160), (148,128,118), (62,85,55), (140,110,95), (55,60,70), (165,145,130),
+        (28,38,105), (68,142,178), (42,88,160),
+        (248,246,240), (240,236,228), (235,230,220), (250,248,244),
+        (200,60,50), (45,115,175), (165,135,55), (145,105,125),
+    ]
 
     @staticmethod
-    def _lines(g: np.ndarray) -> np.ndarray:
-        f = g.astype(np.float64)
-        h, w = f.shape
-        diag = np.sqrt(h * h + w * w)
-        s = int(np.clip(diag * 0.035, 11, 51))
-        s = s if s % 2 == 1 else s + 1
-        p = np.pad(f, ((1, 0), (1, 0)), mode="constant")
-        i = p.cumsum(axis=0).cumsum(axis=1)
-        r = s // 2
-        y, x = np.ogrid[:h, :w]
-        y0 = np.maximum(0, y - r); x0 = np.maximum(0, x - r)
-        y1 = np.minimum(h, y + r + 1); x1 = np.minimum(w, x + r + 1)
-        area = (y1 - y0) * (x1 - x0)
-        sums = i[y1, x1] - i[y0, x1] - i[y1, x0] + i[y0, x0]
-        ratio = f / np.maximum(sums / area, 1.0)
-        m = 1.0 - np.clip(ratio / 0.82, 0.0, 1.0)
-        return (m * m * 255).clip(0, 255).astype(np.uint8)
-
-    @staticmethod
-    def _regions(lines: np.ndarray, h: int, w: int) -> list[dict]:
-        vis = np.zeros((h, w), dtype=bool)
-        reg = []
-        d8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-        for y in range(h):
-            for x in range(w):
-                if vis[y, x] or lines[y, x] > 70:
-                    continue
-                q = deque([(x, y)])
-                vis[y, x] = True
-                px = []
-                mnx, mny, mxx, mxy = x, y, x, y
-                while q:
-                    cx, cy = q.popleft()
-                    px.append((cx, cy))
-                    mnx = min(mnx, cx); mny = min(mny, cy)
-                    mxx = max(mxx, cx); mxy = max(mxy, cy)
-                    for dx, dy in d8:
-                        nx, ny = cx + dx, cy + dy
-                        if 0 <= nx < w and 0 <= ny < h and not vis[ny, nx] and lines[ny, nx] <= 70:
-                            vis[ny, nx] = True
-                            q.append((nx, ny))
-                area = len(px)
-                if area >= SmartHintGenerator.MS:
-                    bw, bh = mxx - mnx + 1, mxy - mny + 1
-                    density = area / max(bw * bh, 1)
-                    reg.append({"cx": sum(p[0] for p in px) / area,
-                                "cy": sum(p[1] for p in px) / area,
-                                "w": bw, "h": bh,
-                                "area": area, "density": density,
-                                "x0": mnx, "y0": mny, "x1": mxx, "y1": mxy})
-        reg.sort(key=lambda r: r["w"] * r["h"], reverse=True)
-        return reg[:SmartHintGenerator.MH]
-
-    @staticmethod
-    def _classify(r: dict, h: int, w: int) -> str:
-        rh, rw = r["cy"] / h, r["cx"] / w
-        density = r["density"]
-        area = r["area"]
-        x0, y0, x1, y1 = r["x0"], r["y0"], r["x1"], r["y1"]
-        edge_slack = min(w, h) * 0.08
-        near_edge = (x0 < edge_slack or y0 < edge_slack or x1 > w - edge_slack or y1 > h - edge_slack)
-        if density > 0.55 and area < 3000 and 0.2 < rh < 0.55 and 0.25 < rw < 0.75:
-            return "eyes"
-        if density > 0.45 and area > 1500:
-            return "hair"
-        if rh < 0.35 and area > 2000 and density > 0.3:
-            return "hair"
-        if 0.05 <= density <= 0.2 and 500 < area < 6000 and not near_edge and rh > 0.15 and 0.1 < rw < 0.9:
-            return "skin"
-        if area > 3000 and rh > 0.3 and not near_edge:
-            return "clothing"
-        if 0.45 < rh < 0.85 and density > 0.1:
-            return "clothing"
-        return "bg"
-
-    @staticmethod
-    def _pick_color(label: str, idx: int, used: set) -> tuple:
-        pal = SmartHintGenerator.PAL.get(label, SmartHintGenerator.BACKGROUND)
-        offset = idx * 3
-        for i in range(len(pal)):
-            c = pal[(offset + i) % len(pal)]
-            if c not in used:
-                used.add(c)
-                return c
-        c = pal[hash(str(idx)) % len(pal)]
-        used.add(c)
-        return c
-
-    @staticmethod
-    def _strength(r: dict, label: str) -> float:
-        if label == "eyes":
-            return 0.7
-        if label == "hair":
-            return 0.6
-        if label == "skin":
-            return 0.55
-        if label == "clothing":
-            density, area = r["density"], r["area"]
-            conf = min(1.0, (area / 8000) * 0.3 + density * 0.5)
-            return 0.4 + conf * 0.3
-        return 0.45
-
-    @staticmethod
-    def _seed(reg, hm, hk, h, w):
-        used = set()
-        for idx, r in enumerate(reg):
-            label = SmartHintGenerator._classify(r, h, w)
-            col = SmartHintGenerator._pick_color(label, idx, used)
-            strength = SmartHintGenerator._strength(r, label)
-            cx, cy = int(r["cx"]), int(r["cy"])
-            rad = max(int(max(r["w"], r["h"]) * 0.35), 8)
-            y0, y1 = max(0, cy - rad), min(h, cy + rad + 1)
-            x0, x1 = max(0, cx - rad), min(w, cx + rad + 1)
-            rr = rad * rad
-
-            py_grid, px_grid = np.ogrid[y0:y1, x0:x1]
-            d2 = (px_grid - cx) ** 2 + (py_grid - cy) ** 2
-            mask = d2 < rr
-            alpha = np.where(mask, (1.0 - (np.where(mask, d2, rr) / rr) ** 0.5) * strength, 0.0)
-            am = (alpha * 255).astype(np.uint8)
-
-            hk_slice = hk[y0:y1, x0:x1]
-            hk_slice[:] = np.maximum(hk_slice, am)
-
-            hm_slice = hm[y0:y1, x0:x1].astype(np.float32)
-            alpha3 = alpha[:, :, np.newaxis]
-            col_arr = np.array(col, dtype=np.float32).reshape(1, 1, 3)
-            blended = hm_slice * (1.0 - alpha3) + col_arr * alpha3
-            hm[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
-
-    @staticmethod
-    def _bg_gradient(hm, hk, h, w):
-        y_ramp = np.linspace(0.15, 0.35, h)[:, np.newaxis, np.newaxis]
-        x_ramp = np.linspace(-0.08, 0.08, w)[np.newaxis, :, np.newaxis]
-        grad_val = y_ramp + x_ramp
-        bg0 = np.array(SmartHintGenerator.BACKGROUND[0], dtype=np.float32)
-        bg1 = np.array(SmartHintGenerator.BACKGROUND[-1], dtype=np.float32)
-        bg = bg0 * (1.0 - grad_val) + bg1 * grad_val
-        bg = np.clip(bg, 0, 255).astype(np.uint8)
-
-        thin = hk < 20
-        thin3 = thin[:, :, np.newaxis]
-        hm_f = hm.astype(np.float32)
-        bg_f = bg.astype(np.float32)
-        hm_f = np.where(thin3, hm_f * 0.5 + bg_f * 0.5, hm_f)
-        hm[:] = np.clip(hm_f, 0, 255).astype(np.uint8)
-        hk[thin] = np.maximum(hk[thin], 15)
-
-    def generate(self, gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def generate(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        import cv2
         h, w = gray.shape
         hm = np.zeros((h, w, 3), dtype=np.uint8)
         hk = np.zeros((h, w), dtype=np.uint8)
-        lines = self._lines(gray)
-        regions = self._regions(lines, h, w)
-        if regions:
-            self._seed(regions, hm, hk, h, w)
-        self._bg_gradient(hm, hk, h, w)
+
+        local_mean = cv2.blur(gray.astype(np.float32), (21, 21))
+        content_mask = gray < np.maximum(local_mean * 0.9, 220)
+        content_pct = content_mask.mean()
+        grid = max(10, min(20, int(10 + content_pct * 16)))
+        sy, sx = max(1, h // grid), max(1, w // grid)
+
+        cols = SmartHintGenerator.COLORS
+        for gy in range(grid):
+            for gx in range(grid):
+                cy = int(gy * sy + sy * 0.5)
+                cx = int(gx * sx + sx * 0.5)
+                if cy >= h or cx >= w or not content_mask[cy, cx]:
+                    continue
+                idx = (gy * 7 + gx * 13) % len(cols)
+                col = cols[idx]
+                r = max(2, min(sy, sx) // 8)
+                y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+                x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+                if y1 <= y0 or x1 <= x0:
+                    continue
+                py, px = np.ogrid[y0:y1, x0:x1]
+                d2 = (px - cx) ** 2 + (py - cy) ** 2
+                m = d2 < r * r
+                if not np.any(m):
+                    continue
+                alpha = (1.0 - d2[m] / (r * r)) * 0.28
+                am = np.clip(alpha * 255, 0, 255).astype(np.uint8)
+                hk_view = hk[y0:y1, x0:x1]
+                np.maximum(hk_view[m], am, out=hk_view[m])
+                for ch in range(3):
+                    sl = hm[y0:y1, x0:x1, ch].astype(np.float32)
+                    sl[m] = sl[m] * (1.0 - alpha) + col[ch] * alpha
+                    hm[y0:y1, x0:x1, ch] = np.clip(sl, 0, 255).astype(np.uint8)
         return hm, hk
 
 # -- Colorizer (ONNX + smart hints) -----------------------------------------
@@ -468,7 +351,12 @@ class Colorizer:
         if k not in Colorizer._CC:
             if not self._mp.is_file():
                 raise RuntimeError(f"Model not found: {self._mp}")
-            Colorizer._CC[k] = ort.InferenceSession(k, providers=["CPUExecutionProvider"])
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 2
+            opts.intra_op_num_threads = 2
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.enable_mem_pattern = True
+            Colorizer._CC[k] = ort.InferenceSession(k, opts, providers=["CPUExecutionProvider"])
         return Colorizer._CC[k]
 
     async def colorize(self, in_path: str, out_path: str) -> bool:
@@ -482,10 +370,8 @@ class Colorizer:
         orig_w, orig_h = img.size
         orig_arr = np.array(img, dtype=np.float32) / 255.0
 
-        # Generate hints ONCE for the full image
         gen = SmartHintGenerator()
         hm, hk = gen.generate(np.array(img))
-        # Blur hints to remove visible circles (sigma=8 smooths transitions)
         hm_pil = PILImage.fromarray(hm)
         hk_pil = PILImage.fromarray(hk)
         hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=8))
@@ -493,17 +379,14 @@ class Colorizer:
         hm = np.array(hm_pil)
         hk = np.array(hk_pil)
 
-        TILE = 512
+        # 384px = model's native input size (2x faster than 512)
+        TILE = 384
         OVERLAP = 48
         STEP = TILE - OVERLAP
+        result = np.zeros((orig_h, orig_w, 3), dtype=np.float32)
+        weight = np.zeros((orig_h, orig_w), dtype=np.float32)
 
-        if orig_w <= TILE and orig_h <= TILE:
-            result = self._infer_tile_from_hints(orig_arr, hm, hk)
-        else:
-            result = np.zeros((orig_h, orig_w, 3), dtype=np.float32)
-            weight = np.zeros((orig_h, orig_w), dtype=np.float32)
-
-            for y in range(0, orig_h, STEP):
+        for y in range(0, orig_h, STEP):
                 for x in range(0, orig_w, STEP):
                     x2 = min(x + TILE, orig_w)
                     y2 = min(y + TILE, orig_h)
@@ -523,9 +406,9 @@ class Colorizer:
                     result[y1:y2, x1:x2] += tile_rgb * blend[:, :, None]
                     weight[y1:y2, x1:x2] += blend
 
-            mask = weight > 1e-6
-            result[mask] /= weight[mask, None]
-            result = (result * 255).clip(0, 255).astype(np.uint8)
+        mask = weight > 1e-6
+        result[mask] /= weight[mask, None]
+        result = (result * 255).clip(0, 255).astype(np.uint8)
 
         res_img = PILImage.fromarray(result)
         res_img.save(out_path)
@@ -555,61 +438,44 @@ def apply_manga_pipeline(colored_path: str, original_path: str, output_path: str
     im = np.array(Image.open(colored_path).convert("RGB"), dtype=np.float64)
     gray = np.array(orig, dtype=np.float64)
 
-    # 1. Highlight-based white balance (top 5% brightest → white)
-    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
-    mask = lum >= np.percentile(lum, 95)
-    if mask.sum() > 0:
-        hm = im[mask].mean(axis=0)
-        gain = np.clip(255.0 / hm, 0.5, 2.0)
+    # 1. Gray-world white balance (more neutral than highlight-based)
+    means = im.mean(axis=(0, 1))
+    g = means.mean()
+    if g > 1e-6:
+        gain = np.clip(g / np.maximum(means, 1e-6), 0.7, 1.4)
         im = np.clip(im * gain[None, None, :], 0, 255)
 
-    # 2. Manga toning: subtle warm shift (+3%R, -2%B) in midtones
-    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
-    m = np.clip(1.0 - np.abs(lum / 127.5 - 1.0), 0, 1)
-    im[:, :, 0] = np.clip(im[:, :, 0] + m * 7.65, 0, 255)
-    im[:, :, 2] = np.clip(im[:, :, 2] - m * 5.1, 0, 255)
+    # 2. Ink mask for protection
+    ink = cv2.dilate((gray < 55).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(np.float64)
 
-    # 3. Local-variance mask (high var = screentone, low var = flat color)
-    gf = gray.astype(np.float32)
-    g2 = cv2.blur(gf, (5, 5))
-    var = cv2.blur(gf * gf, (5, 5)) - g2 * g2
-    vmask = np.clip(var / max(var.max(), 1.0), 0, 1)
-
-    # 4. Screentone-aware desaturation
-    desat = 0.78 + 0.22 * vmask  # flat→0.78, screentone→1.0
-    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
-    im = np.clip(lum[:, :, None] + desat[:, :, None] * (im - lum[:, :, None]), 0, 255)
-
-    # 5. Better line extraction (binary threshold + 1px dilate)
-    ink = cv2.dilate((gray < 60).astype(np.uint8),
-                     np.ones((3, 3), np.uint8), iterations=1).astype(np.float64)
-
-    # 6. Edge-aware smooth (edgePreservingFilter or median fallback)
+    # 3. Edge-aware smooth (preserve ink, smooth colors)
     try:
-        smooth = cv2.edgePreservingFilter(
-            im.astype(np.uint8), flags=1, sigma_s=30, sigma_r=25)
+        smooth = cv2.edgePreservingFilter(im.astype(np.uint8), flags=1, sigma_s=25, sigma_r=20)
         smooth_f = smooth.astype(np.float64)
     except Exception:
-        smooth_f = np.array(
-            Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.MedianFilter(3)),
-            dtype=np.float64)
-    ew = np.clip(1.0 - ink[:, :, None] * 0.6, 0.4, 1.0)
-    im = smooth_f * (1.0 - ew) + im * ew
+        smooth_f = np.array(Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.MedianFilter(3)), dtype=np.float64)
+    blend = np.clip(1.0 - ink[:, :, None] * 0.7, 0.35, 1.0)
+    im = smooth_f * (1.0 - blend) + im * blend
 
-    # 7. Line restoration
-    im = np.clip(im * (1.0 - 0.1 * ink[:, :, None]), 0, 255)
-
-    # 8. Color boost in flat areas (let model color shine through)
+    # 4. Gentle desaturation (manga should be slightly muted)
     lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
-    boost = 1.0 + 0.15 * (1.0 - vmask)
-    chroma = im - lum[:, :, None]
-    im = np.clip(lum[:, :, None] + boost[:, :, None] * chroma, 0, 255)
+    im = np.clip(lum[:, :, None] + 0.90 * (im - lum[:, :, None]), 0, 255)
 
-    # 9. Gentle unsharp mask
-    blurred = np.array(
-        Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=1.5)),
-        dtype=np.float64)
-    im = np.clip(im + 0.5 * (im - blurred), 0, 255)
+    # 5. Screentone-aware desaturation (high variance areas stay natural)
+    gf = gray.astype(np.float32)
+    g2 = cv2.blur(gf, (7, 7))
+    var = np.maximum(cv2.blur(gf * gf, (7, 7)) - g2 * g2, 0)
+    vmask = np.clip(var / max(var.max(), 1.0), 0, 1)
+    desat = 0.85 + 0.15 * vmask
+    im = np.clip(lum[:, :, None] + desat[:, :, None] * (im - lum[:, :, None]), 0, 255)
+
+    # 6. Adaptive line restoration (darker ink = stronger darkening)
+    line_strength = np.clip(ink * 1.2, 0, 1)
+    im = np.clip(im * (1.0 - 0.12 * line_strength[:, :, None]), 0, 255)
+
+    # 7. Gentle sharpen
+    blurred = np.array(Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=1.2)), dtype=np.float64)
+    im = np.clip(im + 0.4 * (im - blurred), 0, 255)
 
     Image.fromarray(im.astype(np.uint8)).save(output_path)
 
