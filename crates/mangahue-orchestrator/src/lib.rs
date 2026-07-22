@@ -705,7 +705,7 @@ fn select_backend(
                 model_path,
                 &config.inference.device,
                 512,
-                "tiny",
+                "large",
             )?,
         ));
     }

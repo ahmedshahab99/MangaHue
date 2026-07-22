@@ -46,7 +46,8 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     }
 
     if input.config.palette_correction {
-        apply_manga_color_grading(&mut output, input.style, input.original_grayscale);
+        let lut = MangaColorLUT::new(input.style);
+        apply_lut_grading(&mut output, &lut, input.line_mask, input.original_grayscale);
     }
 
     if let Some(tone_mask) = input.tone_mask {
@@ -58,6 +59,8 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut report.tone_pixels_preserved,
         );
     }
+
+    edge_aware_smooth(&mut output, input.line_mask);
 
     if input.config.bubble_cleanup {
         clean_speech_bubbles(
@@ -233,58 +236,187 @@ pub fn apply_palette_curve(image: &mut RgbImage, style: &StyleProfile) {
     }
 }
 
-/// Apply manga-specific color grading: warm-tone shift, ink-area darkening,
-/// and per-pixel desaturation based on original grayscale value.
-pub fn apply_manga_color_grading(
-    image: &mut RgbImage,
-    style: &StyleProfile,
-    original_gray: &GrayImage,
-) {
-    let saturation = style.saturation.clamp(0.2, 2.0);
-    let contrast = style.contrast.clamp(0.5, 2.0);
-    let brightness = style.brightness * 255.0;
-    let w = image.width() as usize;
+// ── 3D LUT Manga Color Grading ──────────────────────────────────────────
+const LUT_SIZE: usize = 17;
 
-    for (idx, pixel) in image.pixels_mut().enumerate() {
-        let x = (idx % w) as u32;
-        let y = (idx / w) as u32;
-        let orig = original_gray.get_pixel(x, y)[0] as f32;
+struct MangaColorLUT {
+    table: Vec<[[Rgb<u8>; LUT_SIZE]; LUT_SIZE]>,
+}
 
-        // In dark/ink areas, keep colors muted
-        let ink_factor = if orig < 80.0 {
-            (orig / 80.0).powf(0.6)
-        } else {
-            1.0
-        };
+impl MangaColorLUT {
+    fn new(style: &StyleProfile) -> Self {
+        let warmth = (style.saturation - 0.5).clamp(0.02, 0.15) * 1.2;
+        let w = warmth;
+        let mut table = vec![[[Rgb([0; 3]); LUT_SIZE]; LUT_SIZE]; LUT_SIZE];
 
-        let gray = 0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        for ri in 0..LUT_SIZE {
+            for gi in 0..LUT_SIZE {
+                for bi in 0..LUT_SIZE {
+                    let r = ri as f32 * 16.0;
+                    let g = gi as f32 * 16.0;
+                    let b = bi as f32 * 16.0;
 
-        // Warm-tone shift: push toward sepia/warm in mid-tones
-        let warmth = (0.5 - (orig / 255.0 - 0.5).abs()) * 2.0 * 0.08;
-        let warm_r = pixel[0] as f32 * (1.0 + warmth);
-        let warm_g = pixel[1] as f32 * (1.0 + warmth * 0.5);
-        let warm_b = pixel[2] as f32 * (1.0 - warmth);
+                    // Warm-tone matrix
+                    let wr = r * (1.0 + w)       + g * (w * 0.5)   - b * (w * 0.75);
+                    let wg = r * (-w * 0.25)     + g * (1.0 + w * 0.25) + b * (w * 0.25);
+                    let wb = r * (-w * 1.0)      - g * (w * 0.25)  + b * (1.0 - w * 0.5);
 
-        // Desaturate based on original paper tone (whiter areas = less saturation)
-        let paper_desat = if orig > 200.0 {
-            0.85 + 0.15 * (1.0 - (orig - 200.0) / 55.0)
-        } else {
-            1.0
-        };
+                    // Paper tone (cream tint in highlights)
+                    let luma = 0.2126 * wr + 0.7152 * wg + 0.0722 * wb;
+                    let pt = ((luma - 128.0) / 127.0).clamp(0.0, 1.0);
+                    let pr = wr + pt * 7.6;
+                    let pg = wg + pt * 2.5;
+                    let pb = wb - pt * 5.1;
 
-        let final_sat = saturation * ink_factor * paper_desat;
+                    // Highlight compression
+                    let compress = |c: f32| -> f32 {
+                        if c <= 225.0 { return c; }
+                        let t = (c - 225.0) / 30.0;
+                        225.0 + t * 20.0 + (c - 235.0).max(0.0) * 0.3
+                    };
+                    let hr = compress(pr);
+                    let _hg = compress(pg);
+                    let hb = compress(pb);
 
-        let mut channels = [warm_r, warm_g, warm_b];
-        for channel in &mut channels {
-            let saturated = gray + (*channel - gray) * final_sat;
-            let contrasted = (saturated - 128.0) * contrast + 128.0;
-            *channel = (contrasted + brightness).round().clamp(0.0, 255.0);
+                    // Shadow tint (warm-brown + faint blue)
+                    let sf = if luma < 80.0 { (1.0 - luma / 80.0).powi(2) } else { 0.0 };
+                    let sr = hr + sf * 5.5;
+                    let sb = hb + sf * 4.5;
+
+                    let contrast = style.contrast;
+                    let mc = |v: f32| -> u8 { ((v - 128.0) * contrast + 128.0).clamp(0.0, 255.0) as u8 };
+
+                    table[ri][gi][bi] = Rgb([mc(sr), mc(wg.max(sr - 15.0)), mc(sb)]);
+                }
+            }
         }
-        *pixel = Rgb([
-            channels[0] as u8,
-            channels[1] as u8,
-            channels[2] as u8,
-        ]);
+
+        MangaColorLUT { table }
+    }
+}
+
+fn lut_lookup(lut: &MangaColorLUT, r: u8, g: u8, b: u8) -> Rgb<u8> {
+    let rf = r as f32 / 16.0;
+    let gf = g as f32 / 16.0;
+    let bf = b as f32 / 16.0;
+    let r0 = (rf.floor() as usize).min(LUT_SIZE - 2);
+    let g0 = (gf.floor() as usize).min(LUT_SIZE - 2);
+    let b0 = (bf.floor() as usize).min(LUT_SIZE - 2);
+    let rd = rf - r0 as f32;
+    let gd = gf - g0 as f32;
+    let bd = bf - b0 as f32;
+
+    let c000 = lut.table[r0][g0][b0];
+    let c001 = lut.table[r0][g0][b0 + 1];
+    let c010 = lut.table[r0][g0 + 1][b0];
+    let c011 = lut.table[r0][g0 + 1][b0 + 1];
+    let c100 = lut.table[r0 + 1][g0][b0];
+    let c101 = lut.table[r0 + 1][g0][b0 + 1];
+    let c110 = lut.table[r0 + 1][g0 + 1][b0];
+    let c111 = lut.table[r0 + 1][g0 + 1][b0 + 1];
+
+    let i = |a: u8, b: u8, c: u8, d: u8| -> u8 {
+        let ab = a as f32 * (1.0 - rd) + c as f32 * rd;
+        let cd = b as f32 * (1.0 - rd) + d as f32 * rd;
+        (ab * (1.0 - gd) + cd * gd) as u8
+    };
+
+    Rgb([
+        (i(c000[0], c001[0], c100[0], c101[0]) as f32 * (1.0 - bd)
+            + i(c010[0], c011[0], c110[0], c111[0]) as f32 * bd)
+            .clamp(0.0, 255.0) as u8,
+        (i(c000[1], c001[1], c100[1], c101[1]) as f32 * (1.0 - bd)
+            + i(c010[1], c011[1], c110[1], c111[1]) as f32 * bd)
+            .clamp(0.0, 255.0) as u8,
+        (i(c000[2], c001[2], c100[2], c101[2]) as f32 * (1.0 - bd)
+            + i(c010[2], c011[2], c110[2], c111[2]) as f32 * bd)
+            .clamp(0.0, 255.0) as u8,
+    ])
+}
+
+fn apply_lut_grading(
+    image: &mut RgbImage,
+    lut: &MangaColorLUT,
+    line_mask: &GrayImage,
+    original: &GrayImage,
+) {
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
+        if ink > 0.85 { continue; }
+
+        let mapped = lut_lookup(lut, pixel[0], pixel[1], pixel[2]);
+        let orig_luma = original.get_pixel(x, y)[0] as f32;
+        let new_luma = 0.2126 * mapped[0] as f32 + 0.7152 * mapped[1] as f32 + 0.0722 * mapped[2] as f32;
+        let anchor = 0.10;
+        let diff = orig_luma - new_luma;
+
+        pixel[0] = (mapped[0] as f32 + diff * anchor).clamp(0.0, 255.0) as u8;
+        pixel[1] = (mapped[1] as f32 + diff * anchor).clamp(0.0, 255.0) as u8;
+        pixel[2] = (mapped[2] as f32 + diff * anchor).clamp(0.0, 255.0) as u8;
+    }
+}
+
+// ── Edge-Aware Color Smoothness ──────────────────────────────────────────
+fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
+    let (w, h) = image.dimensions();
+    let src: Vec<Rgb<u8>> = image.pixels().copied().collect();
+    let spatial_sigma = 2.5f32;
+    let range_sigma = 35.0f32;
+    let radius: i32 = 3;
+
+    let spatial_w: Vec<f32> = (0..=radius)
+        .map(|d| (-(d * d) as f32 / (2.0 * spatial_sigma * spatial_sigma)).exp())
+        .collect();
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            let ink = line_mask.get_pixel(x, y)[0];
+
+            if ink > 200 {
+                continue;
+            }
+
+            let center = src[idx];
+            let center_luma = 0.2126 * center[0] as f32 + 0.7152 * center[1] as f32 + 0.0722 * center[2] as f32;
+            let mut sum = [0.0f32; 3];
+            let mut total_w = 0.0f32;
+
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let nx = (x as i32 + dx).clamp(0, w as i32 - 1) as u32;
+                    let ny = (y as i32 + dy).clamp(0, h as i32 - 1) as u32;
+                    let n_id = (ny * w + nx) as usize;
+
+                    let n_ink = line_mask.get_pixel(nx, ny)[0] as f32 / 255.0;
+                    if n_ink > 0.85 { continue; }
+                    let ink_w = (1.0 - n_ink).powi(3);
+
+                    let n = src[n_id];
+                    let n_luma = 0.2126 * n[0] as f32 + 0.7152 * n[1] as f32 + 0.0722 * n[2] as f32;
+
+                    let dist = dx.abs().max(dy.abs()) as usize;
+                    let sw = spatial_w[dist];
+
+                    let r_diff = (center_luma - n_luma).abs();
+                    let rw = (-r_diff * r_diff / (2.0 * range_sigma * range_sigma)).exp();
+
+                    let weight = sw * rw * ink_w;
+                    sum[0] += n[0] as f32 * weight;
+                    sum[1] += n[1] as f32 * weight;
+                    sum[2] += n[2] as f32 * weight;
+                    total_w += weight;
+                }
+            }
+
+            if total_w > 0.0 {
+                image.put_pixel(x, y, Rgb([
+                    (sum[0] / total_w).clamp(0.0, 255.0) as u8,
+                    (sum[1] / total_w).clamp(0.0, 255.0) as u8,
+                    (sum[2] / total_w).clamp(0.0, 255.0) as u8,
+                ]));
+            }
+        }
     }
 }
 
