@@ -10,6 +10,7 @@ pub struct PostprocessInput<'a> {
     pub original_grayscale: &'a GrayImage,
     pub line_mask: &'a GrayImage,
     pub bubble_mask: &'a GrayImage,
+    pub tone_mask: Option<&'a GrayImage>,
     pub protected_mask: Option<&'a GrayImage>,
     pub style: &'a StyleProfile,
     pub config: &'a PostprocessSection,
@@ -20,6 +21,7 @@ pub struct PostprocessReport {
     pub bubble_pixels_restored: u64,
     pub protected_pixels_restored: u64,
     pub bleed_pixels_corrected: u64,
+    pub tone_pixels_preserved: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
 }
@@ -30,12 +32,33 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         bubble_pixels_restored: 0,
         protected_pixels_restored: 0,
         bleed_pixels_corrected: 0,
+        tone_pixels_preserved: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
     };
-    if input.config.palette_correction {
-        apply_palette_curve(&mut output, input.style);
+
+    if input.config.bleeding_correction {
+        reduce_color_near_ink(
+            &mut output,
+            input.line_mask,
+            &mut report.bleed_pixels_corrected,
+        );
     }
+
+    if input.config.palette_correction {
+        apply_manga_color_grading(&mut output, input.style, input.original_grayscale);
+    }
+
+    if let Some(tone_mask) = input.tone_mask {
+        preserve_screentones(
+            &mut output,
+            input.original_grayscale,
+            tone_mask,
+            input.config.line_strength,
+            &mut report.tone_pixels_preserved,
+        );
+    }
+
     if input.config.bubble_cleanup {
         clean_speech_bubbles(
             &mut output,
@@ -52,20 +75,15 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             );
         }
     }
-    if input.config.bleeding_correction {
-        reduce_color_near_ink(
-            &mut output,
-            input.line_mask,
-            &mut report.bleed_pixels_corrected,
-        );
-    }
+
     if input.config.restore_lines {
-        restore_lines(
+        restore_lines_adaptive(
             &mut output,
             input.line_mask,
             input.config.line_strength * input.style.line_strength,
         );
     }
+
     if input.config.final_sharpening > 0.0 {
         sharpen_lightly(&mut output, input.config.final_sharpening);
     }
@@ -212,6 +230,109 @@ pub fn apply_palette_curve(image: &mut RgbImage, style: &StyleProfile) {
             *channel = brightened.round().clamp(0.0, 255.0) as u8;
         }
         *pixel = Rgb(channels);
+    }
+}
+
+/// Apply manga-specific color grading: warm-tone shift, ink-area darkening,
+/// and per-pixel desaturation based on original grayscale value.
+pub fn apply_manga_color_grading(
+    image: &mut RgbImage,
+    style: &StyleProfile,
+    original_gray: &GrayImage,
+) {
+    let saturation = style.saturation.clamp(0.2, 2.0);
+    let contrast = style.contrast.clamp(0.5, 2.0);
+    let brightness = style.brightness * 255.0;
+    let w = image.width() as usize;
+
+    for (idx, pixel) in image.pixels_mut().enumerate() {
+        let x = (idx % w) as u32;
+        let y = (idx / w) as u32;
+        let orig = original_gray.get_pixel(x, y)[0] as f32;
+
+        // In dark/ink areas, keep colors muted
+        let ink_factor = if orig < 80.0 {
+            (orig / 80.0).powf(0.6)
+        } else {
+            1.0
+        };
+
+        let gray = 0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+
+        // Warm-tone shift: push toward sepia/warm in mid-tones
+        let warmth = (0.5 - (orig / 255.0 - 0.5).abs()) * 2.0 * 0.08;
+        let warm_r = pixel[0] as f32 * (1.0 + warmth);
+        let warm_g = pixel[1] as f32 * (1.0 + warmth * 0.5);
+        let warm_b = pixel[2] as f32 * (1.0 - warmth);
+
+        // Desaturate based on original paper tone (whiter areas = less saturation)
+        let paper_desat = if orig > 200.0 {
+            0.85 + 0.15 * (1.0 - (orig - 200.0) / 55.0)
+        } else {
+            1.0
+        };
+
+        let final_sat = saturation * ink_factor * paper_desat;
+
+        let mut channels = [warm_r, warm_g, warm_b];
+        for channel in &mut channels {
+            let saturated = gray + (*channel - gray) * final_sat;
+            let contrasted = (saturated - 128.0) * contrast + 128.0;
+            *channel = (contrasted + brightness).round().clamp(0.0, 255.0);
+        }
+        *pixel = Rgb([
+            channels[0] as u8,
+            channels[1] as u8,
+            channels[2] as u8,
+        ]);
+    }
+}
+
+/// Blend original grayscale back into screentone regions so the dot/line
+/// patterns remain visible instead of being painted over with flat color.
+pub fn preserve_screentones(
+    image: &mut RgbImage,
+    original_gray: &GrayImage,
+    tone_mask: &GrayImage,
+    strength: f32,
+    count: &mut u64,
+) {
+    let blend = strength.clamp(0.2, 1.0);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if tone_mask.get_pixel(x, y)[0] == 0 {
+            continue;
+        }
+        let orig = original_gray.get_pixel(x, y)[0] as f32 / 255.0;
+
+        // In screentone areas, blend 60-80% original value with colorized
+        let t = blend * (0.6 + 0.2 * orig);
+        let orig_val = (orig * 255.0) as u8;
+
+        for c in 0..3 {
+            let colored = pixel[c] as f32;
+            pixel[c] = (colored * (1.0 - t) + orig_val as f32 * t).round() as u8;
+        }
+        *count += 1;
+    }
+}
+
+/// Adaptive line restoration: stronger in dark ink areas, gentler near edges,
+/// preserving colored details in thin-line regions.
+pub fn restore_lines_adaptive(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {
+    let strength = strength.clamp(0.0, 2.0);
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
+        if ink <= 0.01 {
+            continue;
+        }
+
+        // Progressive darkening: heavier ink = more black, lighter ink = subtle darkening
+        let factor = ink.powf(1.8) * strength;
+        let keep = (1.0 - factor).clamp(0.0, 1.0);
+
+        pixel[0] = (pixel[0] as f32 * keep).round() as u8;
+        pixel[1] = (pixel[1] as f32 * keep).round() as u8;
+        pixel[2] = (pixel[2] as f32 * keep).round() as u8;
     }
 }
 

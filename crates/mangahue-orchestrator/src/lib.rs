@@ -492,6 +492,7 @@ impl MangaHueEngine {
             original_grayscale: &preprocess.original_grayscale,
             line_mask: &preprocess.line_mask,
             bubble_mask: &preprocess.bubble_mask,
+            tone_mask: Some(&preprocess.tone_mask),
             protected_mask: Some(&preprocess.protected_mask),
             style: &style,
             config: &config.postprocess,
