@@ -407,7 +407,7 @@ class SmartHintGenerator:
             col = SmartHintGenerator._pick_color(label, idx, used)
             strength = SmartHintGenerator._strength(r, label)
             cx, cy = int(r["cx"]), int(r["cy"])
-            rad = max(int(max(r["w"], r["h"]) * 0.55), 12)
+            rad = max(int(max(r["w"], r["h"]) * 0.35), 8)
             y0, y1 = max(0, cy - rad), min(h, cy + rad + 1)
             x0, x1 = max(0, cx - rad), min(w, cx + rad + 1)
             rr = rad * rad
@@ -472,24 +472,69 @@ class Colorizer:
         return Colorizer._CC[k]
 
     async def colorize(self, in_path: str, out_path: str) -> bool:
-        img = Image.open(in_path).convert("L")
-        orig_w, orig_h = img.size
-        
-        # Resize to max 512px long side (saves RAM, model works at any multiple of 32)
-        max_side = 512
-        if max(orig_w, orig_h) > max_side:
-            scale = max_side / max(orig_w, orig_h)
-            new_w, new_h = int(orig_w * scale), int(orig_h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
-        
-        arr = np.array(img, dtype=np.float32) / 255.0
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._colorize_sync, in_path, out_path)
 
+    def _colorize_sync(self, in_path: str, out_path: str) -> bool:
+        from PIL import Image as PILImage, ImageFilter
+        
+        img = PILImage.open(in_path).convert("L")
+        orig_w, orig_h = img.size
+        orig_arr = np.array(img, dtype=np.float32) / 255.0
+
+        # Generate hints ONCE for the full image
         gen = SmartHintGenerator()
         hm, hk = gen.generate(np.array(img))
+        # Blur hints to remove visible circles (sigma=8 smooths transitions)
+        hm_pil = PILImage.fromarray(hm)
+        hk_pil = PILImage.fromarray(hk)
+        hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=8))
+        hk_pil = hk_pil.filter(ImageFilter.GaussianBlur(radius=8))
+        hm = np.array(hm_pil)
+        hk = np.array(hk_pil)
+
+        TILE = 512
+        OVERLAP = 48
+        STEP = TILE - OVERLAP
+
+        if orig_w <= TILE and orig_h <= TILE:
+            result = self._infer_tile_from_hints(orig_arr, hm, hk)
+        else:
+            result = np.zeros((orig_h, orig_w, 3), dtype=np.float32)
+            weight = np.zeros((orig_h, orig_w), dtype=np.float32)
+
+            for y in range(0, orig_h, STEP):
+                for x in range(0, orig_w, STEP):
+                    x2 = min(x + TILE, orig_w)
+                    y2 = min(y + TILE, orig_h)
+                    x1 = max(0, x2 - TILE)
+                    y1 = max(0, y2 - TILE)
+
+                    tile_arr = orig_arr[y1:y2, x1:x2]
+                    tile_hm = hm[y1:y2, x1:x2]
+                    tile_hk = hk[y1:y2, x1:x2]
+                    tile_rgb = self._infer_tile_from_hints(tile_arr, tile_hm, tile_hk)
+
+                    th, tw = tile_rgb.shape[:2]
+                    wy = np.hanning(th)[:, None].astype(np.float32)
+                    wx = np.hanning(tw)[None, :].astype(np.float32)
+                    blend = wy * wx
+
+                    result[y1:y2, x1:x2] += tile_rgb * blend[:, :, None]
+                    weight[y1:y2, x1:x2] += blend
+
+            mask = weight > 1e-6
+            result[mask] /= weight[mask, None]
+            result = (result * 255).clip(0, 255).astype(np.uint8)
+
+        res_img = PILImage.fromarray(result)
+        res_img.save(out_path)
+        return True
+
+    def _infer_tile_from_hints(self, arr: np.ndarray, hm: np.ndarray, hk: np.ndarray) -> np.ndarray:
+        h, w = arr.shape
         hf = hm.astype(np.float32) / 255.0
         hkf = hk.astype(np.float32) / 255.0
-
-        h, w = arr.shape
         ph, pw = ((h + 31) // 32) * 32, ((w + 31) // 32) * 32
         t = np.zeros((1, 5, ph, pw), dtype=np.float32)
         t[0, 0, :h, :w] = arr
@@ -497,20 +542,11 @@ class Colorizer:
         t[0, 2, :h, :w] = hf[:, :, 1]
         t[0, 3, :h, :w] = hf[:, :, 2]
         t[0, 4, :h, :w] = hkf
-
         sess = self._sess()
         iname = sess.get_inputs()[0].name
         oname = sess.get_outputs()[0].name
-        loop = asyncio.get_running_loop()
-        out = await loop.run_in_executor(None, lambda: sess.run([oname], {iname: t})[0])
-        result = (out[0].transpose(1, 2, 0)[:h, :w] * 255).clip(0, 255).astype(np.uint8)
-        
-        # Resize back to original dimensions
-        res_img = Image.fromarray(result)
-        if res_img.size != (orig_w, orig_h):
-            res_img = res_img.resize((orig_w, orig_h), Image.LANCZOS)
-        res_img.save(out_path)
-        return True
+        out = sess.run([oname], {iname: t})[0]
+        return out[0].transpose(1, 2, 0)[:h, :w]
 
 # -- Post-processing pipeline -----------------------------------------------
 def apply_manga_pipeline(colored_path: str, original_path: str, output_path: str):
@@ -735,6 +771,14 @@ async def _process(u, c, url: str, cid: int, cancel: asyncio.Event):
                     op = out_dir / f"page_{pi:03d}.png"
                     ok = False
                     try:
+                        # Show progress BEFORE starting (tiling takes time)
+                        try:
+                            await msg.edit_text(
+                                f"`{_bar(sent + failed, total)}` {(sent + failed) / total * 100:.0f}%\n"
+                                f"Coloring p.{pi + 1}/{total}...",
+                                parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+                        except Exception:
+                            pass
                         ok = await cr.colorize(str(lp), str(op))
                         if ok:
                             apply_manga_pipeline(str(op), str(lp), str(op))
