@@ -101,6 +101,15 @@ class BotState:
         e.set()
         return True
 
+# -- optional cloudflare bypass --------------------------------------------
+try:
+    import cloudscraper
+    _scraper = cloudscraper.create_scraper()
+    HAS_CLOUDSCRAPER = True
+except Exception:
+    _scraper = None
+    HAS_CLOUDSCRAPER = False
+
 # -- MangaDownloader --------------------------------------------------------
 class MangaDownloader:
     def __init__(self):
@@ -147,11 +156,23 @@ class MangaDownloader:
             return []
         gid = m.group(1)
         pages: dict[int, str] = {}
-        try:
-            async with sess.get(uri) as r:
-                html = await r.text()
-        except Exception:
-            html = ""
+        
+        # Try cloudscraper first (bypasses Cloudflare)
+        if HAS_CLOUDSCRAPER:
+            try:
+                r = _scraper.get(uri, timeout=30)
+                if r.status_code == 200 and len(r.text) > 1000 and "cloudflare" not in r.text.lower()[:500]:
+                    html = r.text
+                else:
+                    html = ""
+            except Exception:
+                html = ""
+        else:
+            try:
+                async with sess.get(uri, headers={"User-Agent": UA}) as r:
+                    html = await r.text() if r.status == 200 else ""
+            except Exception:
+                html = ""
         if html:
             soup = BeautifulSoup(html, "html.parser")
             for ns in soup.find_all("noscript"):
@@ -164,8 +185,15 @@ class MangaDownloader:
                             pages.setdefault(int(pm.group(1)), s)
         if not pages:
             try:
-                async with sess.get(f"https://nhentai.net/api/gallery/{gid}") as r:
-                    d = await r.json()
+                api_url = f"https://nhentai.net/api/gallery/{gid}"
+                if HAS_CLOUDSCRAPER:
+                    r = _scraper.get(api_url, timeout=20)
+                    d = r.json()
+                else:
+                    async with sess.get(api_url, headers={"User-Agent": UA, "Accept": "application/json"}) as r:
+                        if r.status != 200:
+                            return []
+                        d = await r.json()
                 mid, n = d.get("media_id"), int(d.get("num_pages", 0))
                 em = {1: "png", 2: "jpg", 3: "png", 4: "webp", 5: "gif"}
                 ext = "jpg"
