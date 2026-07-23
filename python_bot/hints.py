@@ -103,8 +103,8 @@ def _delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> float:
 
 
 def _rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
-    arr = (rgb.astype(np.float64) / 255.0).reshape(1,1,3).astype(np.float32)
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)[0,0].astype(np.float64)
+    arr = (rgb / np.float32(255.0)).reshape(1, 1, 3)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)[0, 0].astype(np.float64)
 
 # ===========================================================================
 # AdvancedHintGenerator
@@ -124,6 +124,7 @@ class AdvancedHintGenerator:
     def __init__(self) -> None:
         self._skin_i = self._hair_i = self._cloth_i = self._bg_i = self._eyes_i = 0
         self._rng = np.random.default_rng()
+        self._kernel_cache: dict[int, np.ndarray] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -314,34 +315,46 @@ class AdvancedHintGenerator:
         if not cell_indices:
             return {}
 
+        n = len(cell_indices)
         cell_w = cells[cell_indices[0]][2] - cells[cell_indices[0]][0]
         max_dist = cell_w * 2.5
 
-        centers = {}
-        for ci in cell_indices:
+        # Precompute all cell centres as a numpy array (n, 2) for vectorised queries
+        centres_arr = np.zeros((n, 2), np.float64)
+        for idx_i, ci in enumerate(cell_indices):
             cx1, cy1, cx2, cy2 = cells[ci]
-            centers[ci] = ((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5)
+            centres_arr[idx_i, 0] = (cx1 + cx2) * 0.5
+            centres_arr[idx_i, 1] = (cy1 + cy2) * 0.5
 
-        unassigned = set(cell_indices)
+        unassigned = set(range(n))
         result: dict[int, int] = {}
         cluster_id = 0
 
         while unassigned:
-            seed = unassigned.pop()
-            cluster = [seed]
-            queue = [seed]
-            while queue:
-                cur = queue.pop()
-                cx, cy = centers[cur]
-                for ci in list(unassigned):
-                    ux, uy = centers[ci]
-                    if abs(cx - ux) <= max_dist and abs(cy - uy) <= max_dist:
-                        cluster.append(ci)
-                        queue.append(ci)
-                        unassigned.discard(ci)
+            seed_idx = unassigned.pop()
+            cluster: list[int] = [seed_idx]
+            queue: list[int] = [seed_idx]
 
-            for ci in cluster:
-                result[ci] = cluster_id
+            while queue:
+                cur_idx = queue.pop()
+                cx, cy = centres_arr[cur_idx]
+
+                remaining = np.array(list(unassigned))
+                if len(remaining) == 0:
+                    break
+
+                u_xy = centres_arr[remaining]
+                dx = np.abs(u_xy[:, 0] - cx)
+                dy = np.abs(u_xy[:, 1] - cy)
+                within = remaining[(dx <= max_dist) & (dy <= max_dist)]
+
+                for wi in within.tolist():
+                    cluster.append(wi)
+                    queue.append(wi)
+                    unassigned.discard(wi)
+
+            for idx in cluster:
+                result[cell_indices[idx]] = cluster_id
             cluster_id += 1
 
         return result
@@ -420,7 +433,7 @@ class AdvancedHintGenerator:
             if lb == "skin":
                 hc = skin_clusters.get(i, 0)
                 base_idx, offset = skin_cluster_base.get(hc, (0, np.float32([0, 0, 0])))
-                base = _SKIN[self._skin_i % len(_SKIN)].copy()
+                base = _SKIN[base_idx % len(_SKIN)].copy()
                 colours[i] = np.clip(base + offset, 0, 255)
                 self._skin_i += 1
                 if cy > 0.65 * img_h:
@@ -452,20 +465,27 @@ class AdvancedHintGenerator:
                 self._eyes_i += 1
 
         # CIEDE2000 harmony: push apart too-similar adjacent colours
-        for i in range(NC):
-            if labels[i] in ("skip", "background"):
-                continue
-            cxi, cyi = (cells[i][0] + cells[i][2]) * 0.5, (cells[i][1] + cells[i][3]) * 0.5
-            for j in range(NC):
-                if i == j or labels[j] == "skip":
-                    continue
-                cxj, cyj = (cells[j][0] + cells[j][2]) * 0.5, (cells[j][1] + cells[j][3]) * 0.5
-                if abs(cxi - cxj) > 2.0 * cell_sz or abs(cyi - cyj) > 2.0 * cell_sz:
-                    continue
-                de = _delta_e_2000(_rgb_to_lab(colours[i]), _rgb_to_lab(colours[j]))
-                if de < 15.0:
-                    colours[i] = np.clip(colours[i] * np.float32([1.03, 0.97, 0.97]), 0, 255)
-                    break
+        # Precompute LAB values and cell centres for non-skip/non-bg cells
+        valid_indices = [i for i in range(NC) if labels[i] not in ("skip", "background")]
+        if len(valid_indices) > 1:
+            valid_labs = np.empty((len(valid_indices), 3), np.float64)
+            valid_xy = np.empty((len(valid_indices), 2), np.float64)
+            for pi, i in enumerate(valid_indices):
+                valid_labs[pi] = _rgb_to_lab(colours[i])
+                valid_xy[pi, 0] = (cells[i][0] + cells[i][2]) * 0.5
+                valid_xy[pi, 1] = (cells[i][1] + cells[i][3]) * 0.5
+
+            for pi, i in enumerate(valid_indices):
+                dx = np.abs(valid_xy[:, 0] - valid_xy[pi, 0])
+                dy = np.abs(valid_xy[:, 1] - valid_xy[pi, 1])
+                neighbours = np.where((dx <= 2.0 * cell_sz) & (dy <= 2.0 * cell_sz))[0]
+                neighbours = neighbours[neighbours != pi]
+
+                for pj in neighbours:
+                    de = _delta_e_2000(valid_labs[pi], valid_labs[pj])
+                    if de < 15.0:
+                        colours[i] = np.clip(colours[i] * np.float32([1.03, 0.97, 0.97]), 0, 255)
+                        break
 
         return colours
 
@@ -529,23 +549,44 @@ class AdvancedHintGenerator:
         hint_mask = (bnz.astype(np.uint8)) * 255
         return hint_map, hint_mask
 
-    @staticmethod
-    def _raster_hint(hint_acc: np.ndarray, weight_acc: np.ndarray,
+    def _raster_hint(self, hint_acc: np.ndarray, weight_acc: np.ndarray,
                      cx: int, cy: int, radius: int,
                      colour: np.ndarray, strength: float) -> None:
-        """Draw a single Gaussian-weighted circular hint."""
+        """Draw a single Gaussian-weighted circular hint using a cached kernel."""
         h, w = hint_acc.shape[:2]
-        y1, y2 = max(0, cy - radius), min(h, cy + radius + 1)
-        x1, x2 = max(0, cx - radius), min(w, cx + radius + 1)
+
+        if radius not in self._kernel_cache:
+            k = 2 * radius + 1
+            yy, xx = np.ogrid[:k, :k]
+            dist2 = (yy - radius).astype(np.float64) ** 2 + (xx - radius).astype(np.float64) ** 2
+            sigma = radius * 0.5
+            kern = np.exp(-dist2 / (2.0 * sigma * sigma))
+            kern[dist2 > radius * radius] = 0.0
+            self._kernel_cache[radius] = kern
+
+        kern = self._kernel_cache[radius]
+        ks = 2 * radius + 1
+
+        y1 = cy - radius
+        x1 = cx - radius
+        y2 = y1 + ks
+        x2 = x1 + ks
+
+        ky1 = max(0, -y1)
+        kx1 = max(0, -x1)
+        ky2 = ks - max(0, y2 - h)
+        kx2 = ks - max(0, x2 - w)
+
+        y1 = max(0, y1)
+        x1 = max(0, x1)
+        y2 = min(h, y2)
+        x2 = min(w, x2)
+
         if y2 <= y1 or x2 <= x1:
             return
 
-        yy, xx = np.ogrid[y1:y2, x1:x2]
-        dist2 = (xx - cx).astype(np.float64) ** 2 + (yy - cy).astype(np.float64) ** 2
-        sigma = radius * 0.5
-        falloff = np.exp(-dist2 / (2.0 * sigma * sigma)) * strength
+        falloff = kern[ky1:ky2, kx1:kx2] * strength
         falloff[falloff < 0.001] = 0.0
-        falloff[dist2 > radius * radius] = 0.0
 
         if not np.any(falloff > 0):
             return
@@ -558,16 +599,24 @@ class AdvancedHintGenerator:
     # ==================================================================
 
     def _fallback_grid(self, gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Uniform 5x7 grid for pages with too few usable regions."""
+        """Adaptive grid for pages with too few usable regions."""
         h, w = gray.shape
-        cw, ch = w // 5, h // 7
+        aspect = w / max(h, 1)
+        if aspect > 1.5:
+            cols, rows = 7, 5
+        elif aspect < 0.67:
+            cols, rows = 5, 7
+        else:
+            cols, rows = 6, 6
+
+        cw, ch = w // cols, h // rows
         acc_c = np.zeros((h, w, 3), np.float64)
         acc_w = np.zeros((h, w), np.float64)
         pal_cycle = [_SKIN[0], _BACKGROUND[0], _CLOTH_COOL[0],
                      _SKIN[1], _CLOTH_WARM[0], _BACKGROUND[1], _SKIN[2]]
 
-        for ry in range(7):
-            for rx in range(5):
+        for ry in range(rows):
+            for rx in range(cols):
                 px = cw // 2 + rx * cw
                 py = ch // 2 + ry * ch
                 colour = pal_cycle[(ry + rx) % len(pal_cycle)]
@@ -601,6 +650,7 @@ class AdvancedHintGenerator:
     def _reset(self) -> None:
         self._skin_i = self._hair_i = self._cloth_i = self._bg_i = self._eyes_i = 0
         self._rng = np.random.default_rng()
+        self._kernel_cache.clear()
 
 # ===========================================================================
 # Backward compatibility

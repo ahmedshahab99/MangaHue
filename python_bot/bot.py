@@ -2,8 +2,7 @@
 MangaHue — Local Manga Colorization Bot
 Uses local ONNX model with smart semantic hints for beautiful, natural manga colors.
 """
-import asyncio, concurrent.futures, json, os, random, re, shutil, signal, sys, tempfile, threading, time, traceback
-from collections import deque
+import asyncio, concurrent.futures, json, os, random, re, shutil, signal, sys, threading, time, traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -13,7 +12,6 @@ import numpy as np
 from PIL import Image, ImageFilter
 import onnxruntime as ort
 import aiohttp
-from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters,
@@ -21,14 +19,15 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 
+from config import *
+
 # -- config -----------------------------------------------------------------
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-LIMIT = int(os.environ.get("DAILY_PAGE_LIMIT", "100"))
-BSIZE = int(os.environ.get("DEFAULT_BATCH_SIZE", "5"))
+LIMIT = int(os.environ.get("DAILY_PAGE_LIMIT", str(DAILY_PAGE_LIMIT)))
+BSIZE = int(os.environ.get("DEFAULT_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
 WDIR = Path(os.environ.get("MANGAHUE_WORK_DIR", ".mangahue/telegram"))
-MPATH = Path(os.environ.get("MANGAHUE_MODEL_PATH",
-    str(Path(__file__).resolve().parents[1] / "models" / "manga-onnx" / "manga-colorize-fp16.onnx")))
-MAX_CONC = int(os.environ.get("MAX_CONCURRENT_JOBS", "2"))
+MPATH = Path(os.environ.get("MANGAHUE_MODEL_PATH", MODEL_PATH))
+MAX_CONC = int(os.environ.get("MAX_CONCURRENT_JOBS", str(MAX_CONCURRENT_JOBS)))
 DELAY = float(os.environ.get("MIN_SEND_INTERVAL", "3.1"))
 ADMIN_ID = int(os.environ.get("ADMIN_CHAT_ID", "0") or "0")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36"
@@ -36,7 +35,7 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 JUNK_KW = {"avatar", "logo", "icon", "spinner", "loading", "thumbnail", "banner",
            "cover", "preview", "profile", "rating", "badge", "button", "pixel",
            "tracker", "analytics", "favicon", "default", "placeholder", "blur"}
-MAX_IMG = 50 * 1024 * 1024
+MAX_IMG = MAX_IMAGE_BYTES
 MEDIA_GROUP_DELAY = 2.0
 
 # -- BotState ---------------------------------------------------------------
@@ -177,6 +176,11 @@ class Colorizer:
 
     def __init__(self, mp: str = ""):
         self._mp = Path(mp) if mp else MPATH
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+
+    def __del__(self):
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False)
 
     def _sess(self):
         k = str(self._mp)
@@ -188,7 +192,11 @@ class Colorizer:
             opts.intra_op_num_threads = 2
             opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             opts.enable_mem_pattern = True
-            Colorizer._CC[k] = (ort.InferenceSession(k, opts, providers=["CPUExecutionProvider"]), threading.Lock())
+            providers = ["CPUExecutionProvider"]
+            for p in ("CUDAExecutionProvider", "DirectMLExecutionProvider"):
+                if p in ort.get_available_providers():
+                    providers.insert(0, p)
+            Colorizer._CC[k] = (ort.InferenceSession(k, opts, providers=providers), threading.Lock())
         return Colorizer._CC[k]
 
     async def colorize(self, in_path: str, out_path: str) -> bool:
@@ -212,8 +220,8 @@ class Colorizer:
         hk = np.array(hk_pil)
 
         # 384px = model's native input size (2x faster than 512)
-        TILE = 384
-        OVERLAP = 48
+        TILE = TILE_SIZE
+        OVERLAP = TILE_OVERLAP
         STEP = TILE - OVERLAP
         result = np.zeros((orig_h, orig_w, 3), dtype=np.float32)
         weight = np.zeros((orig_h, orig_w), dtype=np.float32)
@@ -265,17 +273,13 @@ class Colorizer:
             with lock:
                 return sess.run([oname], {iname: t})[0]
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = self._executor.submit(_run_onnx)
         try:
-            future = executor.submit(_run_onnx)
-            try:
-                out = future.result(timeout=120)
-            except concurrent.futures.TimeoutError:
-                sys.stderr.write("[onnx] tile inference timed out after 120s — skipping page\n")
-                future.cancel()
-                raise RuntimeError("ONNX inference timed out")
-        finally:
-            executor.shutdown(wait=False)
+            out = future.result(timeout=120)
+        except concurrent.futures.TimeoutError:
+            sys.stderr.write("[onnx] tile inference timed out after 120s — skipping page\n")
+            future.cancel()
+            raise RuntimeError("ONNX inference timed out")
         return out[0].transpose(1, 2, 0)[:h, :w]
 
 # -- Feature 4: Screentone detection via FFT --------------------------------
@@ -1108,58 +1112,6 @@ async def _admin_limits(u: Update, c):
     await s._save_users()
     await safe_send(u.message.reply_text, f"Limit for `{target}` set to *{new_limit}*.", parse_mode=ParseMode.MARKDOWN)
 
-# -- health server ----------------------------------------------------------
-def _run_health_server(port: int):
-    from aiohttp import web
-
-    async def health(request):
-        checks = {}
-        status = "ok"
-
-        checks["model"] = len(Colorizer._CC) > 0
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.telegram.org/bot{TOKEN}/getMe",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    checks["telegram"] = resp.status == 200
-        except Exception:
-            checks["telegram"] = False
-
-        try:
-            usage = shutil.disk_usage(WDIR)
-            free_pct = round(usage.free / usage.total * 100, 1)
-            checks["disk"] = {"free_pct": free_pct}
-            if free_pct < 5:
-                status = "degraded"
-        except Exception:
-            checks["disk"] = {"free_pct": -1}
-            status = "degraded"
-
-        if not checks.get("model") or not checks.get("telegram"):
-            status = "degraded"
-
-        return web.json_response({"status": status, "checks": checks})
-
-    async def start():
-        app = web.Application()
-        app.router.add_get("/health", health)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", port)
-        await site.start()
-        while True:
-            await asyncio.sleep(3600)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(start())
-    except Exception:
-        pass
-
 # -- main -------------------------------------------------------------------
 def main():
     if not TOKEN:
@@ -1182,34 +1134,55 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, _on_image))
     app.add_handler(CallbackQueryHandler(_callback))
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    def _make_shutdown(sig_name):
-        def handler():
-            log.info("Received %s, shutting down...", sig_name)
-            asyncio.create_task(app.stop())
-        return handler
-
-    for sig_name, sig_val in [("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)]:
-        try:
-            loop.add_signal_handler(sig_val, _make_shutdown(sig_name))
-        except (NotImplementedError, ValueError):
-            pass
-
-    health_port = os.environ.get("HEALTH_PORT", "")
-    if health_port:
-        t = threading.Thread(target=_run_health_server, args=(int(health_port),),
-                             daemon=True, name="health-server")
-        t.start()
+    async def _start_health(post_app):
+        health_port = os.environ.get("HEALTH_PORT", "")
+        if not health_port:
+            return
+        from aiohttp import web
+        async def health(request):
+            checks = {}
+            status = "ok"
+            checks["model"] = len(Colorizer._CC) > 0
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"https://api.telegram.org/bot{TOKEN}/getMe",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        checks["telegram"] = resp.status == 200
+            except Exception:
+                checks["telegram"] = False
+            try:
+                usage = shutil.disk_usage(WDIR)
+                free_pct = round(usage.free / usage.total * 100, 1)
+                checks["disk"] = {"free_pct": free_pct}
+                if free_pct < 5:
+                    status = "degraded"
+            except Exception:
+                checks["disk"] = {"free_pct": -1}
+                status = "degraded"
+            if not checks.get("model") or not checks.get("telegram"):
+                status = "degraded"
+            return web.json_response({"status": status, "checks": checks})
+        web_app = web.Application()
+        web_app.router.add_get("/health", health)
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(health_port))
+        await site.start()
+        post_app.bot_data["_health"] = (runner, site)
         log.info("Health server listening on :%s", health_port)
+
+    app.post_init = _start_health
 
     log.info("MangaHue bot starting (long-polling)...")
     try:
         app.run_polling(allowed_updates=["message", "callback_query"])
     finally:
         log.info("Cleaning up temp files...")
-        shutil.rmtree(WDIR, ignore_errors=True)
+        jobs_dir = WDIR / "jobs"
+        if jobs_dir.exists():
+            shutil.rmtree(jobs_dir, ignore_errors=True)
         log.info("Shutdown complete.")
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import random
 import re
 import time
 from enum import Enum, auto
@@ -11,7 +11,6 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
-from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +19,41 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Safari/537.36"
 )
+
+BROWSER_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;"
+        "q=0.8,application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+BACKUP_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+CF_CHALLENGE_MARKERS = [
+    "cf-challenge",
+    "cf-browser-verify",
+    "challenge-platform",
+    "jschl-answer",
+    "__cf_chl",
+    "cf-wrapper",
+    "cf-captcha",
+    "Just a moment",
+    "Checking your browser",
+]
+
 
 HTML_TIMEOUT = aiohttp.ClientTimeout(total=30)
 IMAGE_TIMEOUT = aiohttp.ClientTimeout(total=60)
@@ -77,7 +111,7 @@ def is_direct_image(url: str) -> bool:
 
 
 def is_high_res(url: str) -> bool:
-    """Return False if `url` looks like a low-res / thumbnail variant."""
+    """Return False if ``url`` looks like a low-res / thumbnail variant."""
     lower = url.lower()
 
     if re.search(r"(thumb|thumbnail|_t|_thumb|small|icon|avatar|logo)", lower):
@@ -89,17 +123,25 @@ def is_high_res(url: str) -> bool:
     return True
 
 
+def _is_cf_challenge(html: str) -> bool:
+    """Detect Cloudflare challenge pages from HTML content."""
+    if not html:
+        return False
+    lower = html.lower()
+    for marker in CF_CHALLENGE_MARKERS:
+        if marker.lower() in lower:
+            return True
+    return False
+
+
 def _normalise_nhentai_url(url: str) -> str:
     """Convert nhentai thumbnail → full-res CDN URL."""
     lower = url.lower()
     if "/galleries/" not in lower and "/g/" not in lower:
         return url
 
-    # subdomain: i{n} for galleries, t{n} for thumbnails
     url = re.sub(r"://t(\d*)\.", r"://i\1.", url)
     url = re.sub(r"://t(\d*)\.nhentai\.net", r"://i\1.nhentai.net", url)
-
-    # remove thumbnail markers inside path
     url = re.sub(r"/(\d+)t\.(jpg|png|webp|gif)", r"/\1.\2", url)
     return url
 
@@ -129,7 +171,7 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
 
     # Strategy 1: scrape CDN images from HTML (fastest)
     try:
-        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+        async with session.get(url, timeout=HTML_TIMEOUT) as resp:
             html = await resp.text()
     except Exception as exc:
         logger.warning("nhentai HTML fetch failed for %s: %s", url, exc)
@@ -138,7 +180,6 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
     if html:
         soup = BeautifulSoup(html, "html.parser")
 
-        # <noscript><img src="..."></noscript>
         for noscript in soup.find_all("noscript"):
             inner = BeautifulSoup(noscript.decode_contents(), "html.parser")
             for img in inner.find_all("img"):
@@ -150,7 +191,6 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
                         page_num = int(match_page.group(1))
                         pages_map.setdefault(page_num, src)
 
-        # inline <img> fallback
         for img in soup.find_all("img"):
             src = img.get("src")
             if not src or not isinstance(src, str):
@@ -163,7 +203,7 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
                 page_num = int(match_page.group(1))
                 pages_map.setdefault(page_num, src)
 
-        # <script> JSON approach
+        import json
         for script in soup.find_all("script"):
             text = script.string or ""
             if "media_id" in text and "num_pages" in text:
@@ -175,7 +215,7 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
                     num_pages = data.get("num_pages", 0)
                     ext = data.get("images", {}).get("cover", {}).get("t", "jpg")
                     if isinstance(ext, str) and ext not in ("j", "p", "g", "w"):
-                        pass  # keep as-is
+                        pass
                     else:
                         ext = {1: "png", 2: "jpg", 3: "png", 4: "webp", 5: "gif"}.get(
                             data.get("images", {}).get("cover", {}).get("t", "jpg") if isinstance(data.get("images", {}).get("cover", {}).get("t"), int) else None,
@@ -194,7 +234,7 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
     if not pages_map:
         try:
             api_url = f"https://nhentai.net/api/gallery/{gallery_id}"
-            async with session.get(api_url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+            async with session.get(api_url, timeout=HTML_TIMEOUT) as resp:
                 data = await resp.json()
             media_id = data.get("media_id")
             num_pages = int(data.get("num_pages", 0))
@@ -228,7 +268,7 @@ async def _extract_mangadex(url: str, session: aiohttp.ClientSession, max_pages:
     chapter_id = match.group(1)
 
     api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}"
-    async with session.get(api_url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+    async with session.get(api_url, timeout=HTML_TIMEOUT) as resp:
         if resp.status != 200:
             raise RuntimeError(f"MangaDex API returned {resp.status} for chapter {chapter_id}")
         data = await resp.json()
@@ -249,7 +289,7 @@ async def _extract_mangadex(url: str, session: aiohttp.ClientSession, max_pages:
 
 async def _extract_generic(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
     try:
-        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+        async with session.get(url, timeout=HTML_TIMEOUT) as resp:
             html = await resp.text()
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
@@ -257,13 +297,11 @@ async def _extract_generic(url: str, session: aiohttp.ClientSession, max_pages: 
     soup = BeautifulSoup(html, "html.parser")
     candidates: set[str] = set()
 
-    # 1) og:image meta tag
     for meta in soup.find_all("meta", attrs={"property": "og:image"}):
         content = meta.get("content")
         if content and isinstance(content, str):
             candidates.add(content)
 
-    # 2) img tags with relevant src patterns
     for img in soup.find_all("img"):
         for attr in ("src", "data-src", "data-original", "data-lazy-src"):
             src = img.get(attr)
@@ -273,7 +311,6 @@ async def _extract_generic(url: str, session: aiohttp.ClientSession, max_pages: 
             if any(kw in lowered for kw in ("chapter", "page", "galleries", "scan", "manga")):
                 candidates.add(src)
 
-    # 3) broader img scan (filter aggressively)
     for img in soup.find_all("img"):
         src = img.get("src") or img.get("data-src") or img.get("data-original")
         if not src or not isinstance(src, str):
@@ -283,13 +320,12 @@ async def _extract_generic(url: str, session: aiohttp.ClientSession, max_pages: 
         if _is_valid_page_url(src) and is_high_res(src):
             candidates.add(src)
 
-    # deduplicate, filter, sort
     result = sorted(c for c in candidates if _is_valid_page_url(c) and is_high_res(c))
     return result[:max_pages]
 
 
 async def _extract_ehentai(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
-    headers = {"User-Agent": USER_AGENT}
+    headers = {"Referer": url}
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     scheme = parsed.scheme
@@ -317,7 +353,6 @@ async def _extract_ehentai(url: str, session: aiohttp.ClientSession, max_pages: 
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # collet pagination links from the first page visited
         if gallery_url == base_url:
             for link in soup.select("table.ptt a"):
                 href = link.get("href")
@@ -385,7 +420,6 @@ async def _extract_mangaplus(url: str, session: aiohttp.ClientSession, max_pages
     chapter_id = match.group(1)
 
     headers = {
-        "User-Agent": USER_AGENT,
         "Referer": url,
         "Origin": "https://mangaplus.shueisha.co.jp",
     }
@@ -410,9 +444,9 @@ async def _extract_mangaplus(url: str, session: aiohttp.ClientSession, max_pages
             pages = data["success"]["mangaViewer"]["pages"]
             for page in pages[:max_pages]:
                 manga_page = page.get("mangaPage", page)
-                image_url = manga_page.get("imageUrl")
-                if image_url and isinstance(image_url, str):
-                    result.append(image_url)
+                image_url_val = manga_page.get("imageUrl")
+                if image_url_val and isinstance(image_url_val, str):
+                    result.append(image_url_val)
             if result:
                 break
         except (KeyError, TypeError) as exc:
@@ -424,7 +458,7 @@ async def _extract_mangaplus(url: str, session: aiohttp.ClientSession, max_pages
 
 async def _extract_webtoons(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
     try:
-        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+        async with session.get(url, timeout=HTML_TIMEOUT) as resp:
             html = await resp.text()
     except Exception as exc:
         logger.warning("Webtoons fetch failed for %s: %s", url, exc)
@@ -473,7 +507,6 @@ async def _extract_webtoons(url: str, session: aiohttp.ClientSession, max_pages:
 
 async def _extract_batoto(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
     headers = {
-        "User-Agent": USER_AGENT,
         "Referer": url,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
@@ -517,7 +550,7 @@ async def _extract_batoto(url: str, session: aiohttp.ClientSession, max_pages: i
 
 async def _extract_generic_enhanced(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
     try:
-        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+        async with session.get(url, timeout=HTML_TIMEOUT) as resp:
             html = await resp.text()
     except Exception as exc:
         raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
@@ -614,6 +647,7 @@ class MangaDownloader:
         image_timeout: int = 60,
         max_image_size: int = MAX_IMAGE_SIZE,
         session: Optional[aiohttp.ClientSession] = None,
+        cf_bypass: bool = True,
     ) -> None:
         self._user_agent = user_agent
         self._request_delay = request_delay
@@ -623,12 +657,20 @@ class MangaDownloader:
         self._own_session = session is None
         self._session = session
         self._last_request_time = 0.0
+        self._cf_bypass = cf_bypass
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None:
+            connector = aiohttp.TCPConnector(ssl=False, limit=10)
+            headers = {
+                "User-Agent": self._user_agent,
+            }
+            if self._cf_bypass:
+                headers.update(BROWSER_HEADERS)
             self._session = aiohttp.ClientSession(
-                headers={"User-Agent": self._user_agent},
+                headers=headers,
                 timeout=self._html_timeout,
+                connector=connector,
             )
         return self._session
 
@@ -676,7 +718,7 @@ class MangaDownloader:
         else:
             raise ValueError(f"Unknown site type for URL: {url}")
 
-        logger.info("extract_urls(%s) → %d image URLs", url, len(result))
+        logger.info("extract_urls(%s) -> %d image URLs", url, len(result))
         return result
 
     async def download_batch(
@@ -685,34 +727,43 @@ class MangaDownloader:
         output_dir: str,
         start_index: int = 1,
     ) -> list[str]:
-        """Download a batch of image URLs to *output_dir*, returning
-        the list of local file paths (in order).
+        """Download a batch of image URLs to *output_dir* concurrently,
+        returning the list of local file paths (in order).
 
         Files are named ``{index:04d}.{ext}`` with *index* starting at
         *start_index*.
+
+        Downloads run with a semaphore limiting to 3 concurrent requests.
         """
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
 
         session = await self._get_session()
-        saved: list[str] = []
+        semaphore = asyncio.Semaphore(3)
 
-        for idx, image_url in enumerate(urls, start=start_index):
-            await self._rate_limit()
+        async def _download_one(idx: int, image_url: str) -> Optional[str]:
+            async with semaphore:
+                await self._rate_limit()
 
-            ext = Path(urlparse(image_url).path).suffix
-            if not ext or ext.lower() not in IMAGE_EXTENSIONS:
-                ext = ".jpg"
+                ext = Path(urlparse(image_url).path).suffix
+                if not ext or ext.lower() not in IMAGE_EXTENSIONS:
+                    ext = ".jpg"
 
-            filepath = out / f"{idx:04d}{ext}"
-            try:
-                await self._download_single(session, image_url, filepath)
-                saved.append(str(filepath))
-                logger.debug("downloaded %s → %s", image_url, filepath)
-            except Exception as exc:
-                logger.warning("failed to download %s: %s", image_url, exc)
+                filepath = out / f"{idx:04d}{ext}"
+                try:
+                    await self._download_single(session, image_url, filepath)
+                    logger.debug("downloaded %s -> %s", image_url, filepath)
+                    return str(filepath)
+                except Exception as exc:
+                    logger.warning("failed to download %s: %s", image_url, exc)
+                    return None
 
-        return saved
+        tasks = [
+            _download_one(idx, url)
+            for idx, url in enumerate(urls, start=start_index)
+        ]
+        results = await asyncio.gather(*tasks)
+        return [r for r in results if r is not None]
 
     async def _download_single(
         self,
@@ -720,35 +771,45 @@ class MangaDownloader:
         image_url: str,
         filepath: Path,
     ) -> None:
+        headers = {
+            "User-Agent": self._user_agent,
+            "Referer": image_url,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
         async with session.get(
             image_url,
             timeout=self._image_timeout,
-            headers={
-                "User-Agent": self._user_agent,
-                "Referer": image_url,
-            },
+            headers=headers,
         ) as resp:
-            if resp.status != 200:
+            if resp.status == 403 or resp.status == 503:
+                content_type = resp.headers.get("Content-Type", "")
+                if _is_cf_challenge(await resp.text()):
+                    await asyncio.sleep(3.0)
+                    headers["User-Agent"] = random.choice(BACKUP_USER_AGENTS)
+                    async with session.get(
+                        image_url,
+                        timeout=self._image_timeout,
+                        headers=headers,
+                    ) as retry_resp:
+                        if retry_resp.status != 200:
+                            raise RuntimeError(
+                                f"HTTP {retry_resp.status} for {image_url} (CF bypass failed)"
+                            )
+                        data = await retry_resp.read()
+                else:
+                    raise RuntimeError(f"HTTP {resp.status} for {image_url}")
+            elif resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status} for {image_url}")
+            else:
+                data = await resp.read()
 
-            content_type = resp.headers.get("Content-Type", "")
-            content_length = resp.headers.get("Content-Length")
-
-            if content_length and int(content_length) > self._max_image_size:
-                raise RuntimeError(
-                    f"Image too large ({int(content_length)} bytes, "
-                    f"max {self._max_image_size}) at {image_url}"
-                )
-
-            data = await resp.read()
-
-            if len(data) > self._max_image_size:
-                raise RuntimeError(
-                    f"Image exceeds max size ({len(data)} bytes) at {image_url}"
-                )
-
-            if content_type and "image" not in content_type.lower():
-                logger.warning("non-image content-type %s for %s", content_type, image_url)
+        content_length = len(data)
+        if content_length > self._max_image_size:
+            raise RuntimeError(
+                f"Image exceeds max size ({content_length} bytes) at {image_url}"
+            )
 
         filepath.write_bytes(data)
 
@@ -756,7 +817,7 @@ class MangaDownloader:
     # context manager
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> MangaDownloader:
+    async def __aenter__(self) -> "MangaDownloader":
         await self._get_session()
         return self
 
