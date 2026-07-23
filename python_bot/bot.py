@@ -102,15 +102,9 @@ class BotState:
         return True
 
 # -- optional cloudflare bypass --------------------------------------------
-try:
-    import cloudscraper
-    _scraper = cloudscraper.create_scraper()
-    HAS_CLOUDSCRAPER = True
-except Exception:
-    _scraper = None
-    HAS_CLOUDSCRAPER = False
+from hints import AdvancedHintGenerator
+from postprocess import apply_manga_pipeline
 
-# -- MangaDownloader --------------------------------------------------------
 class MangaDownloader:
     def __init__(self):
         self._s: Optional[aiohttp.ClientSession] = None
@@ -494,12 +488,12 @@ class Colorizer:
         orig_w, orig_h = img.size
         orig_arr = np.array(img, dtype=np.float32) / 255.0
 
-        gen = SmartHintGenerator()
+        gen = AdvancedHintGenerator()
         hm, hk = gen.generate(np.array(img))
         hm_pil = PILImage.fromarray(hm)
         hk_pil = PILImage.fromarray(hk)
-        hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=8))
-        hk_pil = hk_pil.filter(ImageFilter.GaussianBlur(radius=8))
+        hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=6))
+        hk_pil = hk_pil.filter(ImageFilter.GaussianBlur(radius=6))
         hm = np.array(hm_pil)
         hk = np.array(hk_pil)
 

@@ -1,621 +1,300 @@
 """
-Advanced algorithmic post-processing module for colorized manga images.
-
-Produces natural, professional, manga-authentic results using pure algorithms
-(no neural networks).  Provides a full pipeline: white balance, LUT colour
-grading, screentone preservation, edge‑preserving smoothing, adaptive line
-restoration, and smart sharpening.
-
-All functions have typed signatures, docstrings, and sensible fallback paths
-so that **nothing** hard-depends on OpenCV.
+Advanced manga post-processing pipeline — 11-stage professional colour grading.
+All stages are algorithmic (no neural networks), designed for natural results
+with screentone preservation, crisp ink lines, and harmonious colour.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Optional, Tuple, Union
+from typing import Optional
 
+import cv2
 import numpy as np
 from PIL import Image
 
-# ---------------------------------------------------------------------------
-# Optional OpenCV – imported once; everything else works without it
-# ---------------------------------------------------------------------------
-try:
-    import cv2
+# ============================================================================
+# Module-level LUT cache
+# ============================================================================
+_GRADING_LUT: Optional[np.ndarray] = None
 
-    _HAS_CV2 = True
-except ImportError:
-    _HAS_CV2 = False
 
-# ---------------------------------------------------------------------------
-# Module-level LUT cache (compute once per parameter set)
-# ---------------------------------------------------------------------------
-_MANGALUT_CACHE: dict[Tuple[float, float, float], np.ndarray] = {}
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Internal helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-
-def _gray_world_gain(image: np.ndarray) -> np.ndarray:
-    """Return per-channel gain that makes the average colour neutral."""
-    means = image.astype(np.float64).mean(axis=(0, 1))  # (3,)
-    gray = means.mean()
-    # Avoid division by zero for degenerate channels
-    gain = np.where(means > 1e-6, gray / means, 1.0)
-    gain = np.clip(gain, 0.5, 2.0)
-    return gain.astype(np.float32)
-
-
-def _rgb_to_gray(image: np.ndarray) -> np.ndarray:
-    """Standard ITU-R BT.601 luminance."""
+def _cie_lum(rgb: np.ndarray) -> np.ndarray:
+    """CIE 1931 relative luminance: 0.2126*R + 0.7152*G + 0.0722*B."""
     return (
-        0.299 * image[..., 0].astype(np.float64)
-        + 0.587 * image[..., 1].astype(np.float64)
-        + 0.114 * image[..., 2].astype(np.float64)
+        0.2126 * rgb[..., 0]
+        + 0.7152 * rgb[..., 1]
+        + 0.0722 * rgb[..., 2]
     )
 
 
-def _box_blur_gray(arr: np.ndarray, kernel_size: int) -> np.ndarray:
-    """Fast box-blur on a 2-D float array (vectorised integral-image).
+def _smoothstep(x: np.ndarray) -> np.ndarray:
+    """Hermite smoothstep  x²·(3 − 2x)  on [0,1]."""
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
 
-    Falls back to an O(1)-per-pixel integral-image implementation when
-    OpenCV is unavailable.
+
+# ============================================================================
+# Stage 1 — Advanced White Balance  (white-patch retinex)
+# ============================================================================
+
+def _white_balance(rgb: np.ndarray) -> np.ndarray:
+    """Per-channel gain from top‑2 % brightest pixels, applied above median luminance."""
+    lum = _cie_lum(rgb)
+    thresh = np.percentile(lum, 98)
+    brightest = rgb[lum >= thresh]
+    if brightest.shape[0] < 10:
+        return rgb
+    gain = np.clip(
+        255.0 / np.maximum(brightest.mean(axis=0), 1.0), 0.6, 1.8
+    ).astype(np.float64)
+
+    med = np.median(lum)
+    ref = max(np.percentile(lum, 80) - med, 1.0)
+    ramp = np.clip((lum - med) / ref, 0.0, 1.0) ** 0.5  # smooth transition
+    final = 1.0 + (gain[None, None, :] - 1.0) * ramp[..., None]
+    return np.clip(rgb * final, 0.0, 255.0)
+
+
+# ============================================================================
+# Stage 3 — Multi-Scale FFT Screentone Detection
+# ============================================================================
+
+def _detect_screentones(gray: np.ndarray) -> np.ndarray:
+    """FFT-based screentone detector — 3 scales (16, 32, 64) with 50 % overlap.
+
+    Returns float64 mask in [0, 1] where 1 = screentone.
     """
-    if _HAS_CV2 and kernel_size > 1:
-        # cv2.blur expects uint8/float32 and a (kw,kh) tuple
-        ksize = (kernel_size, kernel_size)
-        return cv2.blur(arr.astype(np.float32), ksize)
+    H, W = gray.shape
+    scales = [16, 32, 64]
+    mask = np.zeros((H, W), dtype=np.float64)
+    gray_f = gray.astype(np.float64)
 
-    H, W = arr.shape
-    r = kernel_size // 2
-    if r < 1:
-        return arr.astype(np.float64)
+    for bs in scales:
+        step = max(bs // 2, 1)
+        wy = np.hanning(bs)[:, None]
+        wx = np.hanning(bs)[None, :]
+        win2d = wy * wx
+        sm = np.zeros((H, W), dtype=np.float64)
 
-    # Build integral image: intg[i+1, j+1] = sum of arr[0:i+1, 0:j+1]
-    padded = np.pad(arr.astype(np.float64), ((1, 0), (1, 0)), mode="constant")
-    intg = np.cumsum(np.cumsum(padded, axis=0), axis=1)
+        for y0 in range(0, H - bs + 1, step):
+            for x0 in range(0, W - bs + 1, step):
+                block = gray_f[y0 : y0 + bs, x0 : x0 + bs]
+                windowed = (block - block.mean()) * win2d
+                fshift = np.fft.fftshift(np.fft.fft2(windowed))
+                mag = np.abs(fshift)
+                cy, cx = bs // 2, bs // 2
+                dc = mag[cy, cx]
+                if dc < 1e-8:
+                    continue
+                ac = mag.copy()
+                ac[cy - 2 : cy + 3, cx - 2 : cx + 3] = 0.0
+                if ac.max() / dc > 6.0:
+                    sm[y0 : y0 + bs, x0 : x0 + bs] = 1.0
 
-    y_idx = np.arange(H)
-    x_idx = np.arange(W)
-    y0 = np.maximum(0, y_idx - r)[:, np.newaxis]
-    x0 = np.maximum(0, x_idx - r)[np.newaxis, :]
-    y1 = (np.minimum(H, y_idx + r + 1))[:, np.newaxis]
-    x1 = (np.minimum(W, x_idx + r + 1))[np.newaxis, :]
+        mask = np.maximum(mask, sm)  # OR across scales
 
-    area = (y1 - y0) * (x1 - x0)
-    summed = intg[y1, x1] - intg[y0, x1] - intg[y1, x0] + intg[y0, x0]
-    return summed / area
-
-
-def _box_blur_rgb(image: np.ndarray, kernel_size: int) -> np.ndarray:
-    """Per-channel box blur for an (H,W,3) uint8 image."""
-    out = np.empty_like(image, dtype=np.float64)
-    for c in range(3):
-        out[..., c] = _box_blur_gray(image[..., c].astype(np.float64), kernel_size)
-    return out
-
-
-def _box_blur_gray_uint8(arr_uint8: np.ndarray, kernel_size: int) -> np.ndarray:
-    """Box blur returning a float64 array but accepting uint8 input."""
-    return _box_blur_gray(arr_uint8.astype(np.float64), kernel_size)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask.astype(np.float32), cv2.MORPH_CLOSE, kernel)
+    return np.clip(mask, 0.0, 1.0).astype(np.float64)
 
 
-# ---------------------------------------------------------------------------
-# 1.  Manga colour LUT
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Stage 5 — Perceptual Colour Grading LUT  (17³)
+# ============================================================================
 
-_LUT_STEPS = 17
-_LUT_STEP_SIZE = 256.0 / (_LUT_STEPS - 1)
+def _build_grading_lut() -> np.ndarray:
+    """17³ 3D LUT: S-curve contrast + shadow lift + highlight rolloff + midtone warmth."""
+    global _GRADING_LUT
+    if _GRADING_LUT is not None:
+        return _GRADING_LUT
 
+    N = 17
+    vals = np.linspace(0.0, 255.0, N, dtype=np.float64)
+    R, G, B = np.meshgrid(vals, vals, vals, indexing="ij")
+    rgb = np.stack([R, G, B], axis=-1)  # (17,17,17,3)
 
-def generate_manga_lut(
-    saturation: float = 0.85,
-    contrast: float = 1.05,
-    brightness: float = 0.0,
-) -> np.ndarray:
-    """Build a :math:`17^3` trilinear 3-D LUT for manga grading.
+    lp = (0.2126 * R + 0.7152 * G + 0.0722 * B) / 255.0  # norm. lum [0,1]
 
-    Parameters
-    ----------
-    saturation : float
-        How much saturation to keep (1.0 = no change, 0.0 = full greyscale).
-    contrast : float
-        Gentle S‑curve multiplier centred on 128.
-    brightness : float
-        Uniform brightness offset in [‑255, 255].
+    # (a) Gentle S-curve contrast
+    t = rgb / 255.0
+    rgb = (t + 0.07 * (_smoothstep(t) - t)) * 255.0
 
-    Returns
-    -------
-    lut : np.ndarray  shape (17, 17, 17, 3)  dtype float32
-        Look‑up table.  Apply with :func:`_apply_lut_to_image`.
-    """
-    key = (saturation, contrast, brightness)
-    if key in _MANGALUT_CACHE:
-        return _MANGALUT_CACHE[key]
+    # (b) Shadow lift — +3 % in bottom 15 % luminance
+    shadow = np.maximum(0.0, 1.0 - lp / 0.15)
+    rgb += shadow[..., None] * 0.03 * 255.0
 
-    # Sample positions [0, step, 2*step, ..., 255]
-    samples = np.linspace(0.0, 255.0, _LUT_STEPS, dtype=np.float32)
+    # (c) Highlight rolloff — soft clip above 92 % luminance
+    hl = np.maximum(0.0, (lp - 0.92) / 0.08)
+    rgb = rgb * (1.0 - hl[..., None] * 0.12) + 255.0 * hl[..., None] * 0.12
 
-    R, G, B = np.meshgrid(samples, samples, samples, indexing="ij")  # noqa: N806
-    rgb = np.stack([R, G, B], axis=-1).astype(np.float32)  # (17,17,17,3)
+    # (d) Midtone warmth — subtle +2 red in 40–60 % luminance
+    mt = np.maximum(0.0, 1.0 - np.abs(lp - 0.50) / 0.10)
+    rgb[..., 0] += mt * 2.0
 
-    # --- desaturation --------------------------------------------------------
-    gray = (
-        0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
-    )[..., np.newaxis]
-    rgb = gray + saturation * (rgb - gray)
-
-    # --- soft contrast around 128 --------------------------------------------
-    rgb = 128.0 + (rgb - 128.0) * contrast
-
-    # --- brightness -----------------------------------------------------------
-    rgb = rgb + brightness
-
-    # Clamp & cast
-    rgb = np.clip(rgb, 0.0, 255.0).astype(np.float32)
-
-    _MANGALUT_CACHE[key] = rgb
-    return rgb
+    _GRADING_LUT = np.clip(rgb, 0.0, 255.0).astype(np.float32)
+    return _GRADING_LUT
 
 
-def _apply_lut_to_image(image: np.ndarray, lut: np.ndarray) -> np.ndarray:
-    """Apply a 17³ LUT with trilinear interpolation.
+def _apply_lut(image: np.ndarray, lut: np.ndarray) -> np.ndarray:
+    """Trilinear interpolation through a 17³ 3D LUT."""
+    H, W = image.shape[:2]
+    scaled = image.astype(np.float64) / (256.0 / 16.0)  # → [0, 16]
+    i0 = np.clip(np.floor(scaled).astype(np.int32), 0, 15)
+    i1 = np.clip(i0 + 1, 0, 16)
+    f = scaled - i0.astype(np.float64)
 
-    Parameters
-    ----------
-    image : np.ndarray  (H,W,3)  uint8
-    lut : np.ndarray    (17,17,17,3)  float32
+    r0, g0, b0 = i0[..., 0], i0[..., 1], i0[..., 2]
+    r1, g1, b1 = i1[..., 0], i1[..., 1], i1[..., 2]
+    fr, fg, fb = f[..., 0:1], f[..., 1:2], f[..., 2:3]
 
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    H, W = image.shape[:2]  # noqa: N806
-    scaled = image.astype(np.float32) / _LUT_STEP_SIZE  # [0, 16]
+    wR0, wR1 = 1.0 - fr, fr
+    wG0, wG1 = 1.0 - fg, fg
+    wB0, wB1 = 1.0 - fb, fb
 
-    idx0 = np.clip(np.floor(scaled).astype(np.int32), 0, _LUT_STEPS - 2)
-    idx1 = np.clip(idx0 + 1, 0, _LUT_STEPS - 1)
-    frac = scaled - idx0.astype(np.float32)
-
-    r0, g0, b0 = idx0[..., 0], idx0[..., 1], idx0[..., 2]
-    r1, g1, b1 = idx1[..., 0], idx1[..., 1], idx1[..., 2]
-
-    fr = frac[..., 0:1]  # (H,W,1)
-    fg = frac[..., 1:2]
-    fb = frac[..., 2:3]
-
-    wr0, wr1 = 1.0 - fr, fr
-    wg0, wg1 = 1.0 - fg, fg
-    wb0, wb1 = 1.0 - fb, fb
-
-    result = np.zeros((H, W, 3), dtype=np.float32)
-    result += lut[r0, g0, b0] * wr0 * wg0 * wb0
-    result += lut[r0, g0, b1] * wr0 * wg0 * wb1
-    result += lut[r0, g1, b0] * wr0 * wg1 * wb0
-    result += lut[r0, g1, b1] * wr0 * wg1 * wb1
-    result += lut[r1, g0, b0] * wr1 * wg0 * wb0
-    result += lut[r1, g0, b1] * wr1 * wg0 * wb1
-    result += lut[r1, g1, b0] * wr1 * wg1 * wb0
-    result += lut[r1, g1, b1] * wr1 * wg1 * wb1
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+    r = np.zeros((H, W, 3), dtype=np.float64)
+    r += lut[r0, g0, b0] * wR0 * wG0 * wB0
+    r += lut[r0, g0, b1] * wR0 * wG0 * wB1
+    r += lut[r0, g1, b0] * wR0 * wG1 * wB0
+    r += lut[r0, g1, b1] * wR0 * wG1 * wB1
+    r += lut[r1, g0, b0] * wR1 * wG0 * wB0
+    r += lut[r1, g0, b1] * wR1 * wG0 * wB1
+    r += lut[r1, g1, b0] * wR1 * wG1 * wB0
+    r += lut[r1, g1, b1] * wR1 * wG1 * wB1
+    return np.clip(r, 0.0, 255.0)
 
 
-# ---------------------------------------------------------------------------
-# 2.  Edge‑preserving smooth
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Stage 6 — Edge-Preserving Bilateral Smooth
+# ============================================================================
 
-
-def edge_preserving_smooth(
-    image: np.ndarray,
-    strength: float = 3.0,
-    spatial_sigma: float = 25.0,
-) -> np.ndarray:
-    """Smooth colour regions while keeping hard ink edges crisp.
-
-    Uses OpenCV's domain‑transform recursive filter when available;
-    otherwise falls back to a fast separable bilateral approximation.
-
-    Parameters
-    ----------
-    image : np.ndarray  (H,W,3)  uint8
-    strength : float
-        Range sigma – how different colours must be to count as an edge.
-    spatial_sigma : float
-        Spatial sigma – radius of the smoothing neighbourhood.
-
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    if _HAS_CV2:
-        # OpenCV path: fast recursive / domain-transform filter
-        dst = image.copy()
-        sigma_s = max(1.0, spatial_sigma)
-        sigma_r = max(0.01, strength / 255.0)
-        return cv2.edgePreservingFilter(
-            dst, flags=cv2.RECURS_FILTER, sigma_s=sigma_s, sigma_r=sigma_r
+def _bilateral_smooth(rgb: np.ndarray) -> np.ndarray:
+    """Domain-transform smooth + 40 % original blend to retain texture."""
+    u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    try:
+        smoothed = cv2.edgePreservingFilter(
+            u8, flags=cv2.RECURS_FILTER, sigma_s=25.0, sigma_r=20.0 / 255.0
         )
-
-    # --- Manual separable bilateral fallback ---------------------------------
-    H, W = image.shape[:2]  # noqa: N806
-    radius = min(int(np.ceil(3.0 * min(spatial_sigma, 10.0))), 10)
-    sigma_s_eff = max(radius / 3.0, 0.5)
-
-    # Precompute 1-D spatial Gaussian
-    xs = np.arange(-radius, radius + 1, dtype=np.float32)
-    spatial_weight = np.exp(-0.5 * (xs / sigma_s_eff) ** 2).astype(np.float32)
-
-    img_f = image.astype(np.float32)
-    result = np.empty_like(img_f)
-
-    # --- horizontal pass ---
-    tmp = np.empty_like(img_f)
-    for y in range(H):
-        row = img_f[y]  # (W, 3)
-        for x in range(W):
-            x0 = max(0, x - radius)
-            x1 = min(W, x + radius + 1)
-            win = row[x0:x1]
-            k = x1 - x0
-            sw = spatial_weight[radius - (x - x0) : radius - (x - x0) + k]
-            center = row[x]
-            diff_sq = np.sum((win - center) ** 2, axis=1)
-            rw = np.exp(-0.5 * diff_sq / max(strength * strength, 1e-6))
-            w = sw * rw
-            w_sum = w.sum()
-            if w_sum > 1e-8:
-                tmp[y, x] = np.sum(win * w[:, np.newaxis], axis=0) / w_sum
-            else:
-                tmp[y, x] = center
-
-    # --- vertical pass ---
-    for x in range(W):
-        col = tmp[:, x]  # (H, 3)
-        for y in range(H):
-            y0 = max(0, y - radius)
-            y1 = min(H, y + radius + 1)
-            win = col[y0:y1]
-            k = y1 - y0
-            sw = spatial_weight[radius - (y - y0) : radius - (y - y0) + k]
-            center = col[y]
-            diff_sq = np.sum((win - center) ** 2, axis=1)
-            rw = np.exp(-0.5 * diff_sq / max(strength * strength, 1e-6))
-            w = sw * rw
-            w_sum = w.sum()
-            if w_sum > 1e-8:
-                result[y, x] = np.sum(win * w[:, np.newaxis], axis=0) / w_sum
-            else:
-                result[y, x] = center
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+    except Exception:
+        smoothed = u8
+    return 0.6 * smoothed.astype(np.float64) + 0.4 * rgb
 
 
-# ---------------------------------------------------------------------------
-# 3.  Restore ink lines adaptively
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Stage 8 — Advanced Line Restoration
+# ============================================================================
+
+def _restore_lines(rgb: np.ndarray, gray: np.ndarray) -> np.ndarray:
+    """Adaptive-threshold line extraction with non-linear proximity darkening."""
+    gray_u8 = np.clip(gray, 0, 255).astype(np.uint8)
+    lines = cv2.adaptiveThreshold(
+        gray_u8, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    lines = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+
+    # Distance transform → proximity weight  (1.0 on line, 0.0 ≥ 2 px away)
+    dist = cv2.distanceTransform(255 - lines, cv2.DIST_L2, 5).astype(np.float64)
+    prox = np.clip(1.0 - dist / 2.0, 0.0, 1.0)
+
+    darkness = (255.0 - gray) / 255.0
+    strength = np.power(darkness, 1.6)
+    factor = 1.0 - 0.12 * strength * prox
+    return np.clip(rgb * factor[..., None], 0.0, 255.0)
 
 
-def restore_lines_adaptive(
-    image: np.ndarray,
-    line_mask: np.ndarray,
-    strength: float = 1.1,
-) -> np.ndarray:
-    """Darken ink pixels using a power‑law curve that keeps heavy ink
-    near black while leaving light strokes subtle.
+# ============================================================================
+# Stage 9 — Local Contrast Enhancement  (CLAHE)
+# ============================================================================
 
-    Parameters
-    ----------
-    image : np.ndarray  (H,W,3)  uint8
-        Colour image to modify in-place (a copy is returned).
-    line_mask : np.ndarray  (H,W)  float [0, 1]
-        Per‑pixel line confidence (1.0 = pure ink, 0.0 = no line).
-    strength : float
-        Multiplier for the darkening effect (> 1.0 = darker lines).
-
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    result = image.astype(np.float64)
-
-    # Convert to luminance to measure original "ink darkness"
-    lum = _rgb_to_gray(result) / 255.0  # [0, 1]
-
-    # Curve: darken proportionally to how dark the pixel already is.
-    # ink^1.8 means an ink value of 0.3 → 0.3^1.8 ≈ 0.115 (much darker)
-    #          an ink value of 0.8 → 0.8^1.8 ≈ 0.67  (moderate darkening)
-    darkened = np.power(np.clip(lum, 0.0, 1.0), 1.8)
-
-    # Blend: factor = line_mask * strength → how much to push toward the
-    # darkened version.  Clamp the blend factor so we never over-darken.
-    blend = np.clip(line_mask * strength, 0.0, 1.0)[..., np.newaxis]
-
-    # Apply darkening: multiply each channel by the ratio darkened/lum
-    safe_lum = np.maximum(lum, 0.003)  # avoid div-by-zero
-    factor = 1.0 - blend + blend * (darkened / safe_lum)[..., np.newaxis]
-    result = result * factor
-
-    return np.clip(result, 0, 255).astype(np.uint8)
+def _clahe_enhance(rgb: np.ndarray) -> np.ndarray:
+    """CLAHE on L* channel of LAB, blended 30 % back."""
+    u8 = np.clip(rgb, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(u8, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l_ch)
+    lab_eq = cv2.merge([l_eq, a_ch, b_ch])
+    rgb_clahe = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB).astype(np.float64)
+    return 0.3 * rgb_clahe + 0.7 * rgb
 
 
-# ---------------------------------------------------------------------------
-# 4.  Preserve screentones
-# ---------------------------------------------------------------------------
-
-
-def preserve_screentones(
-    coloured: np.ndarray,
-    original_gray: np.ndarray,
-    strength: float = 0.7,
-    variance_window: int = 9,
-    threshold_percentile: float = 85.0,
-) -> np.ndarray:
-    """Detect screentone regions via local variance and blend the original
-    greyscale back in so dot‑shading patterns remain visible.
-
-    Parameters
-    ----------
-    coloured : np.ndarray  (H,W,3)  uint8
-    original_gray : np.ndarray  (H,W)  uint8
-        The original greyscale (luminance of the colourised input or
-        true manga greyscale).
-    strength : float
-        Blend strength for screentone areas (0 = keep colours, 1 = full grey).
-    variance_window : int
-        Odd window size for local-variance computation (default 9).
-    threshold_percentile : float
-        Percentile of variance above which we consider the pixel a screentone.
-
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    gray_f = original_gray.astype(np.float64)
-    gray_sq = gray_f * gray_f
-
-    mean_gray = _box_blur_gray(gray_f, variance_window)
-    mean_sq = _box_blur_gray(gray_sq, variance_window)
-    local_var = mean_sq - mean_gray * mean_gray
-    local_var = np.maximum(local_var, 0.0)
-
-    # Screentones have high local variance → build a soft mask.
-    # Normalise variance by local mean so dark regions aren't penalised.
-    safe_mean = np.maximum(mean_gray, 1.0)
-    var_norm = local_var / safe_mean
-
-    # Adaptive threshold: everything above the percentile is likely screentone.
-    thresh = np.percentile(var_norm, threshold_percentile)
-    if thresh < 1e-6:
-        return coloured  # degenerate – image is completely flat
-
-    # Soft ramp: [0, thresh] → 0, [thresh, 2*thresh] → 0→1, >2*thresh → 1
-    screentone_mask = np.clip((var_norm - thresh) / max(thresh, 1e-6), 0.0, 1.0)
-
-    # Blend original grey into screentone regions
-    blend = (screentone_mask * strength)[..., np.newaxis]
-    gray_3ch = np.stack([gray_f] * 3, axis=-1)
-
-    result = coloured.astype(np.float64) * (1.0 - blend) + gray_3ch * blend
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# 5.  Smart sharpen
-# ---------------------------------------------------------------------------
-
-
-def smart_sharpen(image: np.ndarray, amount: float = 0.06) -> np.ndarray:
-    """Gentle unsharp mask – enough to restore micro‑contrast without
-    making manga look digital or over‑processed.
-
-    Parameters
-    ----------
-    image : np.ndarray  (H,W,3)  uint8
-    amount : float
-        Sharpening strength (0.0 = no change, 0.1 = noticeable).
-
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    if abs(amount) < 1e-6:
-        return image
-
-    img_f = image.astype(np.float32)
-
-    if _HAS_CV2:
-        blurred = cv2.GaussianBlur(img_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
-    else:
-        # Fallback: small box blur (close enough for radius-1 sharpening)
-        kernel_size = 3
-        blurred = np.empty_like(img_f)
-        for c in range(3):
-            blurred[..., c] = _box_blur_gray(img_f[..., c], kernel_size)
-
-    detail = img_f - blurred
-    result = img_f + amount * detail
-    return np.clip(result, 0, 255).astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# 6.  Auto white‑balance
-# ---------------------------------------------------------------------------
-
-
-def auto_white_balance(image: np.ndarray) -> np.ndarray:
-    """Simple grey‑world white balance.
-
-    Corrects mild colour casts by scaling each channel so its mean
-    equals the global mean.  Gains are clamped to [0.5, 2.0] to
-    prevent extreme correction.
-
-    Parameters
-    ----------
-    image : np.ndarray  (H,W,3)  uint8
-
-    Returns
-    -------
-    np.ndarray  (H,W,3)  uint8
-    """
-    gain = _gray_world_gain(image)
-    result = np.clip(image.astype(np.float64) * gain[np.newaxis, np.newaxis, :], 0, 255)
-    return result.astype(np.uint8)
-
-
-# ---------------------------------------------------------------------------
-# 7.  Main pipeline entry point
-# ---------------------------------------------------------------------------
-
-
-def extract_line_mask(grayscale: np.ndarray, window: int = 31, threshold: float = 0.82) -> np.ndarray:
-    """Adaptive line mask – keeps ink lines dark while ignoring shading.
-
-    Pixels significantly darker than their local mean are classified as lines.
-
-    Parameters
-    ----------
-    grayscale : np.ndarray  (H,W)  uint8
-    window : int
-        Box‑filter window size for local‑mean computation.
-    threshold : float
-        A pixel is a line if `value / local_mean < threshold`.
-
-    Returns
-    -------
-    line_mask : np.ndarray  (H,W)  float64  [0, 1]
-    """
-    gray_f = grayscale.astype(np.float64)
-    local_mean = _box_blur_gray(gray_f, window)
-    safe_mean = np.maximum(local_mean, 1.0)
-    ratio = gray_f / safe_mean
-
-    # Soft mask:  darker pixels → higher mask value
-    mask = 1.0 - np.clip(ratio / threshold, 0.0, 1.0)
-    # Square it to sharpen the falloff
-    return mask * mask
-
+# ============================================================================
+# Main entry point — Apply full 11-stage pipeline
+# ============================================================================
 
 def apply_manga_pipeline(
-    coloured_path: Union[str, os.PathLike],
-    output_path: Union[str, os.PathLike],
-    *,
-    saturation: float = 0.85,
-    contrast: float = 1.05,
-    brightness: float = 0.0,
-    line_strength: float = 1.1,
-    screentone_strength: float = 0.7,
-    sharpen_amount: float = 0.06,
-    smooth_strength: float = 3.0,
-    smooth_sigma: float = 25.0,
+    colored_path: str,
+    original_path: str,
+    output_path: str,
 ) -> None:
-    """Full post‑processing pipeline for a colourised manga page.
-
-    Loads the colour image, derives a greyscale version from it, then
-    applies (in order): white‑balance → LUT grading → screentone
-    preservation → edge‑preserving smooth → line restoration → sharpen.
+    """11-stage professional manga post-processing pipeline.
 
     Parameters
     ----------
-    coloured_path : path-like
-        Path to the colourised manga image (RGB).
-    output_path : path-like
-        Where to save the processed result.
-    saturation : float
-        LUT saturation parameter.
-    contrast : float
-        LUT contrast parameter.
-    brightness : float
-        LUT brightness parameter.
-    line_strength : float
-        Strength of ink‑line restoration.
-    screentone_strength : float
-        Blend factor for screentone regions.
-    sharpen_amount : float
-        Unsharp‑mask intensity.
-    smooth_strength : float
-        Edge‑preserving smooth range sigma.
-    smooth_sigma : float
-        Edge‑preserving smooth spatial sigma.
+    colored_path : str
+        Path to the colorized manga page (RGB).
+    original_path : str
+        Path to the original grayscale page (lineart / screentones).
+    output_path : str
+        Where to save the processed PNG.
     """
-    # ---- load ---------------------------------------------------------------
-    pil_img = Image.open(coloured_path).convert("RGB")
-    coloured = np.asarray(pil_img, dtype=np.uint8)
-    original_gray = np.asarray(pil_img.convert("L"), dtype=np.uint8)
+    # ---- Load ----------------------------------------------------------------
+    orig_gray = np.array(Image.open(original_path).convert("L"), dtype=np.float64)
+    rgb = np.array(Image.open(colored_path).convert("RGB"), dtype=np.float64)
 
-    # ---- extract masks from the luminance -----------------------------------
-    line_mask = extract_line_mask(original_gray)
-    # screentone mask is computed inside preserve_screentones()
+    # ---- Stage 1: Advanced White Balance ------------------------------------
+    rgb = _white_balance(rgb)
 
-    # ---- run pipeline -------------------------------------------------------
-    result = coloured
+    # ---- Stage 2: Perceptual Luminance Map ----------------------------------
+    lum = _cie_lum(rgb)
 
-    # 1. White balance
-    result = auto_white_balance(result)
+    # ---- Stage 3: Multi-Scale Screentone Detection (FFT) --------------------
+    tone_mask = _detect_screentones(orig_gray)
 
-    # 2. LUT colour grading
-    lut = generate_manga_lut(saturation, contrast, brightness)
-    result = _apply_lut_to_image(result, lut)
+    # ---- Stage 4: Content-Adaptive Desaturation -----------------------------
+    # Local variance in 11×11 window on original grey (content texture)
+    gray_f32 = orig_gray.astype(np.float32)
+    mean = cv2.blur(gray_f32, (11, 11)).astype(np.float64)
+    mean_sq = cv2.blur(gray_f32 * gray_f32, (11, 11)).astype(np.float64)
+    local_var = np.maximum(mean_sq - mean * mean, 0.0)
+    desat = 0.78 + 0.22 * np.clip(local_var / 800.0, 0.0, 1.0)
+    desat = np.maximum(desat, tone_mask * 0.92)  # preserve screentones
+    rgb = lum[..., None] + desat[..., None] * (rgb - lum[..., None])
 
-    # 3. Screentone preservation (blend original grey back into dot areas)
-    result = preserve_screentones(result, original_gray, strength=screentone_strength)
+    # ---- Stage 5: Perceptual Colour Grading (17³ LUT) -----------------------
+    rgb = _apply_lut(rgb, _build_grading_lut())
 
-    # 4. Edge‑preserving smooth (paint colours, keep ink)
-    result = edge_preserving_smooth(
-        result, strength=smooth_strength, spatial_sigma=smooth_sigma
-    )
+    # ---- Stage 6: Edge-Preserving Bilateral Smooth --------------------------
+    rgb = _bilateral_smooth(rgb)
 
-    # 5. Restore dark ink lines
-    result = restore_lines_adaptive(result, line_mask, strength=line_strength)
+    # ---- Stage 7: Screentone Preservation -----------------------------------
+    gray_3ch = np.stack([orig_gray] * 3, axis=-1)
+    alpha = tone_mask[..., None] * 0.4
+    rgb = rgb * (1.0 - alpha) + gray_3ch * alpha
 
-    # 6. Gentle sharpen
-    result = smart_sharpen(result, amount=sharpen_amount)
+    # ---- Stage 8: Advanced Line Restoration ---------------------------------
+    rgb = _restore_lines(rgb, orig_gray)
 
-    # ---- save ---------------------------------------------------------------
-    out = Image.fromarray(result, mode="RGB")
-    out.save(output_path)
+    # ---- Stage 9: Local Contrast Enhancement (CLAHE) ------------------------
+    rgb = _clahe_enhance(rgb)
 
+    # ---- Stage 10: Colour Harmonization -------------------------------------
+    means = rgb.mean(axis=(0, 1))
+    rb = means[0] / (means[2] + 1e-6)  # R/B warmth ratio
+    if rb < 0.95:       # too cool  → warm shift
+        rgb[..., 0] = np.clip(rgb[..., 0] * 1.01, 0, 255)
+        rgb[..., 2] = np.clip(rgb[..., 2] * 0.995, 0, 255)
+    elif rb > 1.05:     # too warm  → cool shift
+        rgb[..., 0] = np.clip(rgb[..., 0] * 0.99, 0, 255)
+        rgb[..., 2] = np.clip(rgb[..., 2] * 1.005, 0, 255)
 
-# ---------------------------------------------------------------------------
-# Convenience: process a folder of images
-# ---------------------------------------------------------------------------
+    # ---- Stage 11: Output Sharpening ----------------------------------------
+    blurred = cv2.GaussianBlur(rgb.astype(np.float32), (0, 0), 1.2)
+    rgb = rgb + 0.45 * (rgb - blurred.astype(np.float64))
+    rgb = np.clip(rgb, 0.0, 255.0)
 
-
-def process_folder(
-    input_dir: Union[str, os.PathLike],
-    output_dir: Union[str, os.PathLike],
-    extensions: Tuple[str, ...] = (".png", ".jpg", ".jpeg", ".webp"),
-    **pipeline_kwargs,
-) -> list[str]:
-    """Run :func:`apply_manga_pipeline` on every supported image in *input_dir*.
-
-    Parameters
-    ----------
-    input_dir : path-like
-    output_dir : path-like
-        Will be created if missing.
-    extensions : tuple[str]
-        File extensions to consider (case‑insensitive).
-    **pipeline_kwargs
-        Forwarded to :func:`apply_manga_pipeline`.
-
-    Returns
-    -------
-    list[str]
-        Paths of the saved files.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    saved: list[str] = []
-    exts = tuple(e.lower() for e in extensions)
-
-    for fname in sorted(os.listdir(input_dir)):
-        if not fname.lower().endswith(exts):
-            continue
-        in_path = os.path.join(input_dir, fname)
-        out_path = os.path.join(output_dir, fname)
-        apply_manga_pipeline(in_path, out_path, **pipeline_kwargs)
-        saved.append(out_path)
-
-    return saved
+    # ---- Save ----------------------------------------------------------------
+    Image.fromarray(rgb.astype(np.uint8), mode="RGB").save(output_path)
