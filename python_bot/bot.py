@@ -287,56 +287,180 @@ class MangaDownloader:
 
 # -- SmartHintGenerator -----------------------------------------------------
 class SmartHintGenerator:
-    COLORS = [
-        (248,210,182), (240,195,168), (235,185,158), (250,218,192), (228,178,150), (242,205,175),
-        (38,28,22), (52,40,32), (45,35,28), (155,120,88), (78,58,42), (170,132,98), (58,45,38), (120,90,65),
-        (155,48,42), (42,72,148), (52,42,75), (38,75,55), (185,168,148), (72,50,44),
-        (90,118,160), (148,128,118), (62,85,55), (140,110,95), (55,60,70), (165,145,130),
-        (28,38,105), (68,142,178), (42,88,160),
-        (248,246,240), (240,236,228), (235,230,220), (250,248,244),
-        (200,60,50), (45,115,175), (165,135,55), (145,105,125),
-    ]
-
+    SKIN = [(252,215,185), (245,200,170), (238,185,155), (255,222,195)]
+    HAIR = [(38,28,22), (55,40,32), (45,32,26), (160,125,90), (80,58,42), (175,135,100)]
+    CLOTHING = [(155,48,42), (42,72,148), (52,42,75), (38,75,55), (185,168,148),
+                (72,50,44), (90,118,160), (148,128,118), (62,85,55), (165,145,130)]
+    BG = [(248,246,240), (240,236,228), (235,230,220)]
+    EYE = [(28,38,105), (68,142,178), (42,88,160)]
+    
     @staticmethod
-    def generate(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def classify_pixel(gray_val: float, local_mean: float, local_var: float, y_norm: float, near_edge: bool) -> str:
+        """Classify what a pixel region likely represents."""
+        brightness = gray_val / 255.0
+        var_norm = min(local_var / 800.0, 1.0)
+        
+        # Very bright, uniform → background
+        if brightness > 0.85 and var_norm < 0.15:
+            return "bg"
+        # Bright but textured → screentone/sky — skip hints
+        if brightness > 0.80 and var_norm > 0.2:
+            return "skip"
+        # Dark, textured, upper portion → hair
+        if brightness < 0.3 and var_norm > 0.2 and y_norm < 0.4:
+            return "hair"
+        # Very dark → hair or solid ink
+        if brightness < 0.2:
+            return "hair" if y_norm < 0.5 else "clothing"
+        # Medium brightness, smooth, center area → skin
+        if 0.35 < brightness < 0.7 and var_norm < 0.25 and not near_edge:
+            if y_norm < 0.6:
+                return "skin"
+        # Medium-dark, detailed → clothing
+        if brightness < 0.5 and var_norm > 0.15:
+            return "clothing"
+        # Default: clothing for non-background areas
+        if brightness < 0.75:
+            return "clothing"
+        return "skip"
+    
+    @staticmethod
+    def generate(gray_img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         import cv2
-        h, w = gray.shape
+        h, w = gray_img.shape
         hm = np.zeros((h, w, 3), dtype=np.uint8)
         hk = np.zeros((h, w), dtype=np.uint8)
-
-        local_mean = cv2.blur(gray.astype(np.float32), (21, 21))
-        content_mask = gray < np.maximum(local_mean * 0.9, 220)
-        content_pct = content_mask.mean()
-        grid = max(10, min(20, int(10 + content_pct * 16)))
-        sy, sx = max(1, h // grid), max(1, w // grid)
-
-        cols = SmartHintGenerator.COLORS
-        for gy in range(grid):
-            for gx in range(grid):
-                cy = int(gy * sy + sy * 0.5)
-                cx = int(gx * sx + sx * 0.5)
-                if cy >= h or cx >= w or not content_mask[cy, cx]:
+        
+        gf = gray_img.astype(np.float32)
+        # Local mean and variance for region classification
+        local_mean = cv2.blur(gf, (31, 31))
+        local_sq = cv2.blur(gf * gf, (31, 31))
+        local_var = np.maximum(local_sq - local_mean * local_mean, 0)
+        
+        # --- Feature 6: Auto-brightness detection ---
+        global_brightness = gray_img.mean()
+        brightness_adj = 1.0
+        if global_brightness < 100:
+            brightness_adj = 1.10  # Dark page → brighter hints
+        elif global_brightness > 180:
+            brightness_adj = 0.90  # Light page → richer, more saturated hints
+        
+        palettes = {
+            "skin": [tuple(np.clip(np.array(c, dtype=np.float32) * brightness_adj, 0, 255).astype(int)) for c in SmartHintGenerator.SKIN],
+            "hair": [tuple(np.clip(np.array(c, dtype=np.float32) * brightness_adj, 0, 255).astype(int)) for c in SmartHintGenerator.HAIR],
+            "clothing": [tuple(np.clip(np.array(c, dtype=np.float32) * brightness_adj, 0, 255).astype(int)) for c in SmartHintGenerator.CLOTHING],
+            "bg": [tuple(np.clip(np.array(c, dtype=np.float32) * brightness_adj, 0, 255).astype(int)) for c in SmartHintGenerator.BG],
+        }
+        counters = {"skin": 0, "hair": 0, "clothing": 0, "bg": 0}
+        
+        # --- Feature 7: Background/margin detection via 5% edge sampling ---
+        left_sample_cols = max(1, int(w * 0.05))
+        right_sample_cols = max(1, int(w * 0.05))
+        top_sample_rows = max(1, int(h * 0.05))
+        bottom_sample_rows = max(1, int(h * 0.05))
+        left_margin = bool(np.mean(gray_img[:, :left_sample_cols] > 230) > 0.9)
+        right_margin = bool(np.mean(gray_img[:, -right_sample_cols:] > 230) > 0.9)
+        top_margin = bool(np.mean(gray_img[:top_sample_rows, :] > 230) > 0.9)
+        bottom_margin = bool(np.mean(gray_img[-bottom_sample_rows:, :] > 230) > 0.9)
+        
+        # Skip pure white margins (no content)
+        content = gray_img < np.maximum(local_mean * 0.88, 225)
+        
+        # Also mask out detected margin regions
+        if left_margin:
+            content[:, :int(w * 0.05)] = False
+        if right_margin:
+            content[:, int(w * 0.95):] = False
+        if top_margin:
+            content[:int(h * 0.05), :] = False
+        if bottom_margin:
+            content[int(h * 0.95):, :] = False
+        
+        # Adaptive grid based on content density
+        density = content.mean()
+        grid = max(8, min(24, int(8 + density * 28)))
+        step_y, step_x = max(1, h // grid), max(1, w // grid)
+        
+        # --- Feature 2: Color harmony tracking grid ---
+        grid_w = (w + step_x - 1) // step_x
+        grid_h = (h + step_y - 1) // step_y
+        assigned_colors = np.full((grid_h + 1, grid_w + 1, 3), -1, dtype=np.float32)
+        
+        for gy in range(0, h, step_y):
+            for gx in range(0, w, step_x):
+                cy = gy + step_y // 2
+                cx = gx + step_x // 2
+                if cy >= h or cx >= w:
                     continue
-                idx = (gy * 7 + gx * 13) % len(cols)
-                col = cols[idx]
-                r = max(2, min(sy, sx) // 8)
+                if not content[cy, cx]:
+                    continue
+                
+                # --- Feature 1: Adaptive hint density by position ---
+                # Denser hints in center 60% of page, sparser at edges
+                x_rel = cx / w
+                y_rel = cy / h
+                in_center_x = 0.2 < x_rel < 0.8
+                in_center_y = 0.2 < y_rel < 0.8
+                if not in_center_x or not in_center_y:
+                    # Skip every other cell in edge regions
+                    if ((gx // step_x) + (gy // step_y)) % 2 != 0:
+                        continue
+                
+                # Classify this region
+                y_norm = cy / h
+                near_edge = (cx < w * 0.06 or cx > w * 0.94 or cy < h * 0.04 or cy > h * 0.96)
+                label = SmartHintGenerator.classify_pixel(
+                    float(gray_img[cy, cx]),
+                    float(local_mean[cy, cx]),
+                    float(local_var[cy, cx]),
+                    y_norm, near_edge
+                )
+                if label == "skip":
+                    continue
+                
+                # --- Feature 2: Color harmony — maximize RGB distance from neighbors ---
+                pal = palettes[label]
+                grid_x = gx // step_x
+                grid_y = gy // step_y
+                
+                best_color = pal[0]
+                best_dist = -1.0
+                for col in pal:
+                    dist = 0.0
+                    if grid_x > 0 and assigned_colors[grid_y, grid_x - 1, 0] >= 0:
+                        dist += np.sum((np.array(col, dtype=np.float32) - assigned_colors[grid_y, grid_x - 1]) ** 2)
+                    if grid_y > 0 and assigned_colors[grid_y - 1, grid_x, 0] >= 0:
+                        dist += np.sum((np.array(col, dtype=np.float32) - assigned_colors[grid_y - 1, grid_x]) ** 2)
+                    if dist > best_dist:
+                        best_dist = dist
+                        best_color = col
+                
+                col = best_color
+                assigned_colors[grid_y, grid_x] = np.array(col, dtype=np.float32)
+                counters[label] += 1
+                r = max(2, min(step_y, step_x) // 10)
+                
                 y0, y1 = max(0, cy - r), min(h, cy + r + 1)
                 x0, x1 = max(0, cx - r), min(w, cx + r + 1)
                 if y1 <= y0 or x1 <= x0:
                     continue
+                
                 py, px = np.ogrid[y0:y1, x0:x1]
                 d2 = (px - cx) ** 2 + (py - cy) ** 2
                 m = d2 < r * r
                 if not np.any(m):
                     continue
-                alpha = (1.0 - d2[m] / (r * r)) * 0.28
+                
+                alpha = (1.0 - d2[m] / (r * r)) * 0.32
                 am = np.clip(alpha * 255, 0, 255).astype(np.uint8)
-                hk_view = hk[y0:y1, x0:x1]
-                np.maximum(hk_view[m], am, out=hk_view[m])
+                
+                hk_v = hk[y0:y1, x0:x1]
+                np.maximum(hk_v[m], am, out=hk_v[m])
                 for ch in range(3):
                     sl = hm[y0:y1, x0:x1, ch].astype(np.float32)
                     sl[m] = sl[m] * (1.0 - alpha) + col[ch] * alpha
                     hm[y0:y1, x0:x1, ch] = np.clip(sl, 0, 255).astype(np.uint8)
+        
         return hm, hk
 
 # -- Colorizer (ONNX + smart hints) -----------------------------------------
@@ -431,6 +555,37 @@ class Colorizer:
         out = sess.run([oname], {iname: t})[0]
         return out[0].transpose(1, 2, 0)[:h, :w]
 
+# -- Feature 4: Screentone detection via FFT --------------------------------
+def detect_screentones(gray: np.ndarray, block_size: int = 32) -> np.ndarray:
+    """Detect screentone regions using 2D FFT on overlapping 32x32 blocks.
+    
+    Screentones (regular dot patterns) produce strong frequency peaks.
+    Returns a binary mask where 1 = screentone detected.
+    """
+    h, w = gray.shape
+    mask = np.zeros((h, w), dtype=np.uint8)
+    step = block_size // 2  # 50% overlap
+    
+    for y in range(0, h - block_size + 1, step):
+        for x in range(0, w - block_size + 1, step):
+            block = gray[y:y + block_size, x:x + block_size].astype(np.float32)
+            fft = np.fft.fft2(block)
+            fft_mag = np.fft.fftshift(np.abs(fft))
+            
+            # Zero out DC component (center 5x5 region)
+            dc_c = block_size // 2
+            fft_mag[dc_c - 2:dc_c + 3, dc_c - 2:dc_c + 3] = 0
+            
+            max_val = np.max(fft_mag)
+            nonzero = fft_mag[fft_mag > 0]
+            mean_val = np.mean(nonzero) if len(nonzero) > 0 else 0.0
+            
+            # Strong isolated frequency peak → periodic pattern (screentone)
+            if max_val > 0 and mean_val > 0 and max_val / (mean_val + 1e-6) > 8.0:
+                mask[y:y + block_size, x:x + block_size] = 1
+    
+    return mask
+
 # -- Post-processing pipeline -----------------------------------------------
 def apply_manga_pipeline(colored_path: str, original_path: str, output_path: str):
     import cv2
@@ -438,44 +593,60 @@ def apply_manga_pipeline(colored_path: str, original_path: str, output_path: str
     im = np.array(Image.open(colored_path).convert("RGB"), dtype=np.float64)
     gray = np.array(orig, dtype=np.float64)
 
-    # 1. Gray-world white balance (more neutral than highlight-based)
-    means = im.mean(axis=(0, 1))
-    g = means.mean()
-    if g > 1e-6:
-        gain = np.clip(g / np.maximum(means, 1e-6), 0.7, 1.4)
+    # 1. Highlight-based white balance (top 5% brightest → white)
+    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
+    mask = lum >= np.percentile(lum, 95)
+    if mask.sum() > 0:
+        hm = im[mask].mean(axis=0)
+        gain = np.clip(255.0 / np.maximum(hm, 1e-6), 0.5, 2.0)
         im = np.clip(im * gain[None, None, :], 0, 255)
 
-    # 2. Ink mask for protection
-    ink = cv2.dilate((gray < 55).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(np.float64)
+    # 2. Manga toning: subtle warm shift in midtones
+    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
+    m = np.clip(1.0 - np.abs(lum / 127.5 - 1.0), 0, 1)
+    im[:, :, 0] = np.clip(im[:, :, 0] + m * 5.0, 0, 255)
+    im[:, :, 2] = np.clip(im[:, :, 2] - m * 3.5, 0, 255)
 
-    # 3. Edge-aware smooth (preserve ink, smooth colors)
+    # 3. Local-variance mask (high var = screentone, low var = flat color)
+    gf = gray.astype(np.float32)
+    g2 = cv2.blur(gf, (5, 5))
+    var = np.maximum(cv2.blur(gf * gf, (5, 5)) - g2 * g2, 0)
+    vmask = np.clip(var / max(var.max(), 1.0), 0, 1)
+
+    # 4. Feature 4: Screentone-aware desaturation — FFT-detected screentones preserved
+    st_mask = detect_screentones(np.array(orig)).astype(np.float64)
+    # Merge FFT screentone mask with local-variance mask
+    combined_vmask = np.maximum(vmask, st_mask * 0.6)
+    desat = 0.78 + 0.22 * combined_vmask
+    lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
+    im = np.clip(lum[:, :, None] + desat[:, :, None] * (im - lum[:, :, None]), 0, 255)
+
+    # 5. Feature 3: Ink-aware line extraction — nonlinear strength mapping
+    ink_dark = np.clip(1.0 - gray / 60.0, 0, 1)
+    ink_strength = 0.05 + np.power(ink_dark, 1.5) * 0.10
+    ink = cv2.dilate((ink_strength * 255).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(np.float64) / 255.0
+
+    # 6. Edge-aware smooth
     try:
-        smooth = cv2.edgePreservingFilter(im.astype(np.uint8), flags=1, sigma_s=25, sigma_r=20)
+        smooth = cv2.edgePreservingFilter(im.astype(np.uint8), flags=1, sigma_s=30, sigma_r=25)
         smooth_f = smooth.astype(np.float64)
     except Exception:
         smooth_f = np.array(Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.MedianFilter(3)), dtype=np.float64)
-    blend = np.clip(1.0 - ink[:, :, None] * 0.7, 0.35, 1.0)
-    im = smooth_f * (1.0 - blend) + im * blend
+    ew = np.clip(1.0 - ink[:, :, None] * 0.6, 0.4, 1.0)
+    im = smooth_f * (1.0 - ew) + im * ew
 
-    # 4. Gentle desaturation (manga should be slightly muted)
+    # 7. Feature 3: Ink-aware line restoration (proportional, nonlinear)
+    im = np.clip(im * (1.0 - ink[:, :, None]), 0, 255)
+
+    # 8. Color boost in flat areas (screentone areas get less boost)
     lum = 0.299 * im[:, :, 0] + 0.587 * im[:, :, 1] + 0.114 * im[:, :, 2]
-    im = np.clip(lum[:, :, None] + 0.90 * (im - lum[:, :, None]), 0, 255)
+    boost = 1.0 + 0.15 * (1.0 - combined_vmask)
+    chroma = im - lum[:, :, None]
+    im = np.clip(lum[:, :, None] + boost[:, :, None] * chroma, 0, 255)
 
-    # 5. Screentone-aware desaturation (high variance areas stay natural)
-    gf = gray.astype(np.float32)
-    g2 = cv2.blur(gf, (7, 7))
-    var = np.maximum(cv2.blur(gf * gf, (7, 7)) - g2 * g2, 0)
-    vmask = np.clip(var / max(var.max(), 1.0), 0, 1)
-    desat = 0.85 + 0.15 * vmask
-    im = np.clip(lum[:, :, None] + desat[:, :, None] * (im - lum[:, :, None]), 0, 255)
-
-    # 6. Adaptive line restoration (darker ink = stronger darkening)
-    line_strength = np.clip(ink * 1.2, 0, 1)
-    im = np.clip(im * (1.0 - 0.12 * line_strength[:, :, None]), 0, 255)
-
-    # 7. Gentle sharpen
-    blurred = np.array(Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=1.2)), dtype=np.float64)
-    im = np.clip(im + 0.4 * (im - blurred), 0, 255)
+    # 9. Gentle unsharp mask
+    blurred = np.array(Image.fromarray(im.astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=1.5)), dtype=np.float64)
+    im = np.clip(im + 0.5 * (im - blurred), 0, 255)
 
     Image.fromarray(im.astype(np.uint8)).save(output_path)
 
@@ -490,7 +661,12 @@ def _eta(times: list[float], done: int, total: int) -> Optional[str]:
     if not times or done >= total or done <= 0:
         return None
     s = sum(times) / len(times) * (total - done)
-    return f"~{s:.0f}s" if s < 60 else f"~{s / 60:.1f}m"
+    if s < 60:
+        return f"~{s:.0f}s remaining"
+    elif s < 3600:
+        return f"~{s / 60:.0f}m remaining"
+    else:
+        return f"~{s / 3600:.1f}h remaining"
 
 def _extract_url(text: str) -> Optional[str]:
     for t in re.split(r"\s+", text):
