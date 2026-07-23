@@ -9,9 +9,9 @@ Output: (hint_map (H,W,3) uint8 RGB, hint_mask (H,W) uint8)
 
 Algorithm (4 phases):
   1. Page structure analysis   -- multi-scale line detection, content rect,
-     brightness histogram, local variance map.
+      brightness histogram, local variance map.
   2. Semantic region detection -- adaptive grid with weighted scoring
-     classifier (skin/hair/clothing/bg/eyes/skip).
+      classifier (skin/hair/clothing/bg/eyes/skip).
   3. Colour assignment         -- curated manga palettes + CIEDE2000 harmony.
   4. Professional rendering    -- region-centroid hints, Gaussian falloff & blur.
 """
@@ -46,6 +46,16 @@ _CLOTH_NEUT  = np.float32([
 _BACKGROUND  = np.float32([[248,246,240],[240,236,228],[235,230,220],[250,248,244]])
 _EYES        = np.float32([[28,38,105],[68,142,178],[42,88,160],[35,50,120]])
 _CLOTH_SUB   = [_CLOTH_WARM,_CLOTH_COOL,_CLOTH_EARTH,_CLOTH_GREEN,_CLOTH_NEUT]
+
+_HAIR_FAMILIES: dict[str, np.ndarray] = {
+    "black": np.float32([[30,25,20],[40,32,28],[50,40,35],[35,28,24]]),
+    "brown": np.float32([[90,65,45],[110,80,55],[140,105,75],[165,130,95]]),
+    "blond": np.float32([[210,180,140],[225,195,160],[195,165,125],[215,188,148]]),
+    "red":   np.float32([[170,75,55],[185,90,65],[155,65,45]]),
+    "blue":  np.float32([[40,50,130],[55,65,150],[45,55,140]]),
+    "white": np.float32([[220,215,210],[230,225,220],[210,205,200]]),
+}
+_HAIR_FAMILY_NAMES = sorted(_HAIR_FAMILIES.keys())
 
 # ===========================================================================
 # CIEDE2000 colour-difference (compact, correct)
@@ -108,10 +118,12 @@ class AdvancedHintGenerator:
         hint_map, hint_mask = gen.generate(grayscale_uint8)
     """
 
+    HAIR_FAMILIES: dict[str, np.ndarray] = _HAIR_FAMILIES
+    HAIR_FAMILY_NAMES: list[str] = _HAIR_FAMILY_NAMES
+
     def __init__(self) -> None:
         self._skin_i = self._hair_i = self._cloth_i = self._bg_i = self._eyes_i = 0
-        self._hair_pal: np.ndarray = _HAIR_BLACK
-        self._hair_fam = "black"
+        self._rng = np.random.default_rng()
 
     # ------------------------------------------------------------------
     # Public API
@@ -286,30 +298,117 @@ class AdvancedHintGenerator:
         return labels, confs
 
     # ==================================================================
-    # Phase 3 — colour assignment
+    # Phase 3 — colour assignment (multi-character)
     # ==================================================================
+
+    @staticmethod
+    def _cluster_spatial(cell_indices: list,
+                         cells: List[Tuple[int, int, int, int]]) -> dict:
+        """Greedy spatial clustering of cell indices by Chebyshev distance.
+
+        Groups cells within ~2.5 cell widths of each other into clusters
+        representing separate characters / outfits.
+
+        Returns ``{cell_idx: cluster_id}`` mapping.
+        """
+        if not cell_indices:
+            return {}
+
+        cell_w = cells[cell_indices[0]][2] - cells[cell_indices[0]][0]
+        max_dist = cell_w * 2.5
+
+        centers = {}
+        for ci in cell_indices:
+            cx1, cy1, cx2, cy2 = cells[ci]
+            centers[ci] = ((cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5)
+
+        unassigned = set(cell_indices)
+        result: dict[int, int] = {}
+        cluster_id = 0
+
+        while unassigned:
+            seed = unassigned.pop()
+            cluster = [seed]
+            queue = [seed]
+            while queue:
+                cur = queue.pop()
+                cx, cy = centers[cur]
+                for ci in list(unassigned):
+                    ux, uy = centers[ci]
+                    if abs(cx - ux) <= max_dist and abs(cy - uy) <= max_dist:
+                        cluster.append(ci)
+                        queue.append(ci)
+                        unassigned.discard(ci)
+
+            for ci in cluster:
+                result[ci] = cluster_id
+            cluster_id += 1
+
+        return result
 
     def _phase3_assign(self, labels: np.ndarray, gray: np.ndarray,
                        is_dark: bool, is_light: bool,
                        cells: List[Tuple[int, int, int, int]], img_h: int,
                        ) -> List[np.ndarray]:
-        """Assign palette-derived colours to every cell with CIEDE2000 harmony."""
+        """Assign palette-derived colours with multi-character cluster support."""
         NC = len(labels)
         colours: List[np.ndarray] = [np.float32([128, 128, 128]) for _ in range(NC)]
-        cell_sz = cells[0][2] - cells[0][0] if cells else 32
+        if not cells:
+            return colours
+        cell_sz = cells[0][2] - cells[0][0]
 
-        # choose hair palette
-        if is_dark:
-            self._hair_pal, self._hair_fam = _HAIR_LIGHT, "light"
-        else:
-            if np.random.default_rng(42).random() < 0.70:
-                self._hair_pal, self._hair_fam = _HAIR_BLACK, "black"
-            else:
-                self._hair_pal, self._hair_fam = _HAIR_BROWN, "brown"
-
+        # -- collect cell indices by type --
+        hair_ids  = [i for i in range(NC) if labels[i] == "hair"]
+        skin_ids  = [i for i in range(NC) if labels[i] == "skin"]
         cloth_ids = [i for i in range(NC) if labels[i] == "clothing"]
-        cloth_asgn: dict = {}
 
+        # ------------------------------------------------------------------
+        # Cluster hair → each character gets a unique family
+        # ------------------------------------------------------------------
+        hair_clusters = self._cluster_spatial(hair_ids, cells)
+        hair_cluster_ids = sorted(set(hair_clusters.values()))
+        hair_fam_map: dict[int, str] = {}
+
+        # Dark-scene family pool (light colours visible on dark bg)
+        if is_dark:
+            dark_families = [f for f in _HAIR_FAMILY_NAMES if f in ("blond", "white", "blue")]
+        else:
+            dark_families = _HAIR_FAMILY_NAMES
+
+        available_fams = list(dark_families)
+        self._rng.shuffle(available_fams)
+        for ci_d in hair_cluster_ids:
+            fam = available_fams.pop() if available_fams else self._rng.choice(dark_families)
+            for ci in hair_ids:
+                if hair_clusters.get(ci) == ci_d:
+                    hair_fam_map[ci] = fam
+
+        # ------------------------------------------------------------------
+        # Cluster skin → each character gets tone variation ±8
+        # ------------------------------------------------------------------
+        skin_clusters = self._cluster_spatial(skin_ids, cells)
+        skin_cluster_base: dict[int, tuple[int, np.ndarray]] = {}
+        for ci_d in sorted(set(skin_clusters.values())):
+            base_idx = self._rng.integers(0, len(_SKIN))
+            offset = self._rng.integers(-8, 9, size=3).astype(np.float32)
+            skin_cluster_base[ci_d] = (base_idx, offset)
+
+        # ------------------------------------------------------------------
+        # Cluster clothing → each outfit gets a unique sub-palette
+        # ------------------------------------------------------------------
+        cloth_clusters = self._cluster_spatial(cloth_ids, cells)
+        cloth_cluster_ids = sorted(set(cloth_clusters.values()))
+        cloth_cluster_sub: dict[int, int] = {}
+
+        available_subs = list(range(len(_CLOTH_SUB)))
+        self._rng.shuffle(available_subs)
+        for ci_d in cloth_cluster_ids:
+            sub = available_subs.pop() if available_subs else self._rng.integers(0, len(_CLOTH_SUB))
+            cloth_cluster_sub[ci_d] = sub
+
+        # ------------------------------------------------------------------
+        # Assign colours per cell
+        # ------------------------------------------------------------------
         for i, (cx1, cy1, cx2, cy2) in enumerate(cells):
             lb = labels[i]
             cx, cy = (cx1 + cx2) * 0.5, (cy1 + cy2) * 0.5
@@ -319,41 +418,32 @@ class AdvancedHintGenerator:
                 continue
 
             if lb == "skin":
-                colours[i] = _SKIN[self._skin_i % len(_SKIN)].copy()
+                hc = skin_clusters.get(i, 0)
+                base_idx, offset = skin_cluster_base.get(hc, (0, np.float32([0, 0, 0])))
+                base = _SKIN[self._skin_i % len(_SKIN)].copy()
+                colours[i] = np.clip(base + offset, 0, 255)
                 self._skin_i += 1
                 if cy > 0.65 * img_h:
                     colours[i] *= 0.92
 
             elif lb == "hair":
-                colours[i] = self._hair_pal[self._hair_i % len(self._hair_pal)].copy()
+                fam = hair_fam_map.get(i, "black")
+                pal = _HAIR_FAMILIES.get(fam, _HAIR_FAMILIES["black"])
+                colours[i] = pal[self._hair_i % len(pal)].copy()
                 self._hair_i += 1
 
             elif lb == "clothing":
-                used = set()
-                for j in cloth_ids:
-                    if j == i or j not in cloth_asgn:
-                        continue
-                    jx = (cells[j][0] + cells[j][2]) * 0.5
-                    jy = (cells[j][1] + cells[j][3]) * 0.5
-                    if max(abs(cx - jx), abs(cy - jy)) < 2.0 * cell_sz:
-                        used.add(cloth_asgn[j])
-
-                avail = [s for s in range(len(_CLOTH_SUB)) if s not in used]
-                if not avail:
-                    avail = list(range(len(_CLOTH_SUB)))
-                sub = avail[self._cloth_i % len(avail)]
-                self._cloth_i += 1
-                cloth_asgn[i] = sub
-
+                hc = cloth_clusters.get(i, 0)
+                sub = cloth_cluster_sub.get(hc, 0)
                 c = _CLOTH_SUB[sub][self._cloth_i % len(_CLOTH_SUB[sub])].copy()
                 if is_light:
                     gm = c.mean()
                     c = np.clip(gm + (c - gm) * 1.15, 0, 255)
                 colours[i] = c
+                self._cloth_i += 1
 
             elif lb == "background":
-                rng = np.random.default_rng(i + 7)
-                jitter = rng.integers(-2, 3, size=3).astype(np.float32)
+                jitter = self._rng.integers(-2, 3, size=3).astype(np.float32)
                 colours[i] = np.clip(_BACKGROUND[0].copy() + jitter, 0.0, 255.0)
                 self._bg_i += 1
 
@@ -510,8 +600,7 @@ class AdvancedHintGenerator:
 
     def _reset(self) -> None:
         self._skin_i = self._hair_i = self._cloth_i = self._bg_i = self._eyes_i = 0
-        self._hair_pal = _HAIR_BLACK
-        self._hair_fam = "black"
+        self._rng = np.random.default_rng()
 
 # ===========================================================================
 # Backward compatibility

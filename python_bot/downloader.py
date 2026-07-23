@@ -8,7 +8,7 @@ import time
 from enum import Enum, auto
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -40,6 +40,10 @@ class Site(Enum):
     MANGADEX = auto()
     DIRECT = auto()
     GENERIC = auto()
+    EHENTAI = auto()
+    MANGAPLUS = auto()
+    WEBTOONS = auto()
+    BATOTO = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +60,14 @@ def detect_site(url: str) -> Site:
         return Site.MANGADEX
     if is_direct_image(url):
         return Site.DIRECT
+    if ("e-hentai.org" in host or "exhentai.org" in host) and "/g/" in url:
+        return Site.EHENTAI
+    if "mangaplus.shueisha.co.jp" in host and "/viewer/" in url:
+        return Site.MANGAPLUS
+    if "webtoons.com" in host and "/viewer" in url:
+        return Site.WEBTOONS
+    if any(d in host for d in ("bato.to", "batotoo.com", "mto.to", "wto.to", "dto.to")):
+        return Site.BATOTO
     return Site.GENERIC
 
 
@@ -276,6 +288,316 @@ async def _extract_generic(url: str, session: aiohttp.ClientSession, max_pages: 
     return result[:max_pages]
 
 
+async def _extract_ehentai(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
+    headers = {"User-Agent": USER_AGENT}
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    scheme = parsed.scheme
+    base_url = url.rstrip("/")
+
+    pages_map: dict[int, str] = {}
+    seen_pages: set[int] = set()
+    pending_gallery: list[str] = [base_url]
+
+    while pending_gallery and len(pages_map) < max_pages:
+        gallery_url = pending_gallery.pop(0)
+
+        p_match = re.search(r"[?&]p=(\d+)", gallery_url)
+        p_val = int(p_match.group(1)) if p_match else 0
+        if p_val in seen_pages:
+            continue
+        seen_pages.add(p_val)
+
+        try:
+            async with session.get(gallery_url, timeout=HTML_TIMEOUT, headers=headers) as resp:
+                html = await resp.text()
+        except Exception as exc:
+            logger.warning("e-hentai gallery page failed: %s: %s", gallery_url, exc)
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # collet pagination links from the first page visited
+        if gallery_url == base_url:
+            for link in soup.select("table.ptt a"):
+                href = link.get("href")
+                if not href or not isinstance(href, str):
+                    continue
+                full_href = urljoin(gallery_url, href)
+                pp_match = re.search(r"[?&]p=(\d+)", full_href)
+                pp_val = int(pp_match.group(1)) if pp_match else 0
+                if pp_val not in seen_pages and full_href not in pending_gallery:
+                    pending_gallery.append(full_href)
+
+        gdtm_links = soup.select(".gdtm a")
+        if gdtm_links:
+            for link in gdtm_links:
+                if len(pages_map) >= max_pages:
+                    break
+                href = link.get("href")
+                if not href or not isinstance(href, str):
+                    continue
+                page_url = urljoin(gallery_url, href)
+
+                page_num_match = re.search(r"/(\d+)-(\d+)$", page_url)
+                page_num = int(page_num_match.group(2)) if page_num_match else len(pages_map) + 1
+
+                try:
+                    async with session.get(
+                        page_url, timeout=HTML_TIMEOUT,
+                        headers={**headers, "Referer": gallery_url}
+                    ) as page_resp:
+                        page_html = await page_resp.text()
+                except Exception as exc:
+                    logger.warning("e-hentai individual page failed: %s: %s", page_url, exc)
+                    continue
+
+                page_soup = BeautifulSoup(page_html, "html.parser")
+                img_tag = page_soup.select_one("#img")
+                if img_tag:
+                    src = img_tag.get("src")
+                    if src and isinstance(src, str):
+                        pages_map[page_num] = src
+        else:
+            for img in soup.find_all("img"):
+                if len(pages_map) >= max_pages:
+                    break
+                src = img.get("src")
+                if not src or not isinstance(src, str):
+                    continue
+                if not src.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                    continue
+                if not _is_valid_page_url(src) or not is_high_res(src):
+                    continue
+                num_match = re.search(r"/(\d+)[^/]*\.\w+$", src)
+                if num_match:
+                    pages_map.setdefault(int(num_match.group(1)), src)
+                else:
+                    pages_map.setdefault(len(pages_map) + 1, src)
+
+    return [pages_map[p] for p in sorted(pages_map)][:max_pages]
+
+
+async def _extract_mangaplus(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
+    match = re.search(r"/viewer/(\d+)", url)
+    if not match:
+        raise ValueError(f"Could not parse MangaPlus chapter ID from: {url}")
+    chapter_id = match.group(1)
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": url,
+        "Origin": "https://mangaplus.shueisha.co.jp",
+    }
+
+    result: list[str] = []
+
+    for quality in ("super_high", "high"):
+        api_url = (
+            f"https://mangaplus.shueisha.co.jp/api/manga_viewer"
+            f"?chapter_id={chapter_id}&split=yes&img_quality={quality}"
+        )
+        try:
+            async with session.get(api_url, timeout=HTML_TIMEOUT, headers=headers) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+        except Exception as exc:
+            logger.warning("MangaPlus API %s failed: %s", quality, exc)
+            continue
+
+        try:
+            pages = data["success"]["mangaViewer"]["pages"]
+            for page in pages[:max_pages]:
+                manga_page = page.get("mangaPage", page)
+                image_url = manga_page.get("imageUrl")
+                if image_url and isinstance(image_url, str):
+                    result.append(image_url)
+            if result:
+                break
+        except (KeyError, TypeError) as exc:
+            logger.warning("MangaPlus JSON parse error for %s: %s", url, exc)
+            continue
+
+    return result[:max_pages]
+
+
+async def _extract_webtoons(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
+    try:
+        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+            html = await resp.text()
+    except Exception as exc:
+        logger.warning("Webtoons fetch failed for %s: %s", url, exc)
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    result: list[str] = []
+
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        if "imageList" not in text:
+            continue
+
+        match = re.search(r'imageList\s*=\s*(\[.+?\])\s*;', text, re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            image_list = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(image_list, list):
+            for item in image_list[:max_pages]:
+                if isinstance(item, str):
+                    url_item = item
+                elif isinstance(item, dict):
+                    url_item = (
+                        item.get("url")
+                        or item.get("imageUrl")
+                        or item.get("src")
+                        or ""
+                    )
+                else:
+                    continue
+                if url_item and isinstance(url_item, str):
+                    url_item = re.sub(r"\?type=q\d+$", "", url_item)
+                    url_item = re.sub(r"[?&]w=\d+", "", url_item)
+                    url_item = re.sub(r"[?&]h=\d+", "", url_item)
+                    result.append(url_item)
+
+        break
+
+    return result[:max_pages]
+
+
+async def _extract_batoto(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": url,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with session.get(url, timeout=HTML_TIMEOUT, headers=headers) as resp:
+            html = await resp.text()
+    except Exception as exc:
+        logger.warning("Batoto fetch failed for %s: %s", url, exc)
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    result: list[str] = []
+
+    for img in soup.select("img.page-img"):
+        src = img.get("data-src") or img.get("src") or img.get("data-original")
+        if src and isinstance(src, str):
+            result.append(src)
+
+    if not result:
+        for container in soup.select(".page-break"):
+            for img in container.find_all("img"):
+                src = img.get("data-src") or img.get("src") or img.get("data-original")
+                if src and isinstance(src, str) and _is_valid_page_url(src):
+                    result.append(src)
+
+    if not result:
+        for img in soup.find_all("img"):
+            src = img.get("data-src") or img.get("src") or img.get("data-original")
+            if not src or not isinstance(src, str):
+                continue
+            if not _is_valid_page_url(src) or not is_high_res(src):
+                continue
+            lowered = src.lower()
+            if any(kw in lowered for kw in ("chapter", "page", "scan", "manga", "bato")):
+                result.append(src)
+
+    return result[:max_pages]
+
+
+async def _extract_generic_enhanced(url: str, session: aiohttp.ClientSession, max_pages: int) -> list[str]:
+    try:
+        async with session.get(url, timeout=HTML_TIMEOUT, headers={"User-Agent": USER_AGENT}) as resp:
+            html = await resp.text()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch {url}: {exc}") from exc
+
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: set[str] = set()
+
+    SELECTOR_PRIORITY = [
+        "img.chapter-img",
+        "img.page-img",
+        "img.reader-img",
+        "#chapter-image",
+        "img.manga-page",
+        "img[src*='chapter']",
+        "img[src*='pages']",
+    ]
+
+    for selector in SELECTOR_PRIORITY:
+        for img in soup.select(selector):
+            src = (
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy-src")
+            )
+            if not src or not isinstance(src, str):
+                continue
+            if not _is_valid_page_url(src):
+                continue
+
+            w = img.get("width")
+            h = img.get("height")
+            if w and h:
+                try:
+                    wi, hi = int(w), int(h)
+                    if wi < 200 or hi < 200:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            candidates.add(src)
+
+        if candidates:
+            break
+
+    if not candidates:
+        for meta in soup.find_all("meta", attrs={"property": "og:image"}):
+            content = meta.get("content")
+            if content and isinstance(content, str):
+                candidates.add(content)
+
+        for img in soup.find_all("img"):
+            src = (
+                img.get("src")
+                or img.get("data-src")
+                or img.get("data-original")
+                or img.get("data-lazy-src")
+            )
+            if not src or not isinstance(src, str):
+                continue
+            if not src.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                continue
+
+            w = img.get("width")
+            h = img.get("height")
+            if w and h:
+                try:
+                    wi, hi = int(w), int(h)
+                    if wi < 200 or hi < 200:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            if _is_valid_page_url(src) and is_high_res(src):
+                candidates.add(src)
+
+    result = sorted(c for c in candidates if _is_valid_page_url(c) and is_high_res(c))
+    return result[:max_pages]
+
+
 # ---------------------------------------------------------------------------
 # main downloader class
 # ---------------------------------------------------------------------------
@@ -341,8 +663,16 @@ class MangaDownloader:
             result = await _extract_mangadex(url, session, max_pages)
         elif site == Site.DIRECT:
             result = [url]
+        elif site == Site.EHENTAI:
+            result = await _extract_ehentai(url, session, max_pages)
+        elif site == Site.MANGAPLUS:
+            result = await _extract_mangaplus(url, session, max_pages)
+        elif site == Site.WEBTOONS:
+            result = await _extract_webtoons(url, session, max_pages)
+        elif site == Site.BATOTO:
+            result = await _extract_batoto(url, session, max_pages)
         elif site == Site.GENERIC:
-            result = await _extract_generic(url, session, max_pages)
+            result = await _extract_generic_enhanced(url, session, max_pages)
         else:
             raise ValueError(f"Unknown site type for URL: {url}")
 
