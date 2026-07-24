@@ -100,7 +100,7 @@ services:
       - "--pyramid"
       - "--hint-propagate"
       - "--daily-limit"
-      - "${DAILY_PAGE_LIMIT:-100}"
+      - "${DAILY_PAGE_LIMIT:-0}"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
@@ -156,7 +156,7 @@ services:
       - "--style"
       - "/app/configs/styles/studio_anime.yaml"
       - "--daily-limit"
-      - "${DAILY_PAGE_LIMIT:-100}"
+      - "${DAILY_PAGE_LIMIT:-0}"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}

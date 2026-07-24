@@ -37,7 +37,7 @@ Download the manga colorization ONNX model and place it at the path set in
 | `TELEGRAM_BOT_TOKEN`  | *(required)*                   | Telegram bot token        |
 | `MANGAHUE_MODEL_PATH` | `../models/manga-onnx/...onnx` | Path to ONNX model        |
 | `MANGAHUE_WORK_DIR`   | `.mangahue/telegram`           | Temp / usage files        |
-| `DAILY_PAGE_LIMIT`    | `100`                          | Max pages per user/day    |
+| `DAILY_PAGE_LIMIT`    | `0`                            | Max pages/user/day; `0` is unlimited |
 | `DEFAULT_BATCH_SIZE`  | `5`                            | Pages per batch           |
 | `MAX_CONCURRENT_JOBS` | `2`                            | Concurrent colorize jobs  |
 | `MIN_SEND_INTERVAL`   | `3.1`                          | Seconds between sends     |

@@ -132,7 +132,7 @@ MANGAHUE_PYTHON=python
 MANGAHUE_MODEL_THREADS=2
 MANGAHUE_MODEL_TIMEOUT_SECONDS=180
 RUST_LOG=mangahue=info,tower_http=info
-DAILY_PAGE_LIMIT=100
+DAILY_PAGE_LIMIT=0
 TELEGRAM_MAX_PAGES=32
 ADMIN_CHAT_ID=
 CLEANUP_AFTER_HOURS=24
@@ -232,7 +232,7 @@ services:
       - "--style"
       - "/app/configs/styles/studio_anime.yaml"
       - "--daily-limit"
-      - "${DAILY_PAGE_LIMIT:-100}"
+      - "${DAILY_PAGE_LIMIT:-0}"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?required}
       RUST_LOG: ${RUST_LOG:-mangahue=info}

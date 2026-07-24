@@ -35,7 +35,18 @@ def test_daily_limit_resets_on_new_day(tmp_path):
         state = BotState()
 
         assert state.used(12345) == 0
-        assert state.remaining(12345) == 100
+        assert state.remaining(12345) == sys.maxsize
+
+
+def test_positive_custom_daily_limit_is_still_enforced(tmp_path):
+    with patch("bot.WDIR", tmp_path), \
+         patch("bot.asyncio.Lock", MagicMock()):
+        from bot import BotState
+        state = BotState()
+        state.custom_limits[12345] = 3
+        state.usage[12345] = 2
+
+        assert state.remaining(12345) == 1
 
 
 # ===========================================================================

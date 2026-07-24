@@ -110,7 +110,7 @@ docker compose up -d
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | **Yes** | - | Bot token from @BotFather |
 | `ADMIN_CHAT_ID` | No | - | Telegram ID for alerts |
-| `DAILY_PAGE_LIMIT` | No | `100` | Max pages/user/day |
+| `DAILY_PAGE_LIMIT` | No | `0` | Max pages/user/day; `0` disables the daily quota |
 | `MANGAHUE_MODEL_THREADS` | No | `2` | Python thread count |
 | `MANGAHUE_MODEL_TIMEOUT_SECONDS` | No | `180` | Kill and restart a stalled model worker |
 | `CLEANUP_AFTER_HOURS` | No | `24` | Auto-delete old job data |

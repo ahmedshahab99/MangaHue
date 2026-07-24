@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: usize = 10;
-const DAILY_PAGE_LIMIT: usize = 100;
+const DEFAULT_DAILY_PAGE_LIMIT: usize = 0;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
 
 const BUILTIN_STYLES: &[(&str, &str)] = &[
@@ -70,7 +70,11 @@ struct Args {
     poll_timeout_seconds: u64,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE, help = "Pages per media-group batch")]
     batch_size: usize,
-    #[arg(long, default_value_t = DAILY_PAGE_LIMIT, help = "Max pages per user per day")]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_DAILY_PAGE_LIMIT,
+        help = "Max pages per user per day; 0 disables the daily quota"
+    )]
     daily_limit: usize,
 }
 
@@ -240,6 +244,9 @@ impl BotState {
     }
 
     fn remaining_pages_today(&self, chat_id: i64) -> usize {
+        if self.daily_limit == 0 {
+            return usize::MAX;
+        }
         let usage = self.load_usage();
         let used = usage.pages.get(&chat_id).copied().unwrap_or(0);
         self.daily_limit.saturating_sub(used)
@@ -525,7 +532,7 @@ fn handle_command(
 
     match cmd.as_str() {
         "/start" => cmd_start(client, token, chat_id),
-        "/help" => cmd_help(client, token, chat_id),
+        "/help" => cmd_help(client, token, state, chat_id),
         "/status" => cmd_status(client, token, state, chat_id),
         "/cancel" => cmd_cancel(client, token, state, chat_id),
         "/style" => cmd_style(client, token, state, chat_id, &arg),
@@ -552,8 +559,18 @@ fn cmd_start(client: &Client, token: &str, chat_id: i64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_help(client: &Client, token: &str, chat_id: i64) -> Result<()> {
-    let text = "*MangaHue Commands:*\n\n\
+fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -> Result<()> {
+    let access = if state.daily_limit == 0 {
+        "Free access: no daily page quota\\. Server queue and chapter safety limits still apply\\."
+            .to_string()
+    } else {
+        format!(
+            "Daily quota: up to {} pages per user\\. Batch size is configurable via /batch\\.",
+            state.daily_limit
+        )
+    };
+    let text = format!(
+        "*MangaHue Commands:*\n\n\
                 /start \\- Start the bot and see instructions\n\
                 /help \\- Show this help message\n\
                 /status \\- Check if a job is running for this chat\n\
@@ -569,9 +586,10 @@ fn cmd_help(client: &Client, token: &str, chat_id: i64) -> Result<()> {
                 *Supported URL types:*\n\
                 \\- Manga reader chapter URLs \\(any site with page images\\)\n\
                 \\- Direct image URLs \\(\\.png, \\.jpg, \\.webp, etc\\.\\)\n\n\
-                *Rate limits:*\n\
-                Up to 100 pages per day\\. Batch size is configurable via /batch\\.";
-    send_message(client, token, chat_id, text, Some("MarkdownV2"))?;
+                *Access:*\n\
+                {access}"
+    );
+    send_message(client, token, chat_id, &text, Some("MarkdownV2"))?;
     Ok(())
 }
 
@@ -742,8 +760,21 @@ fn cmd_batch(
 
 fn cmd_stats(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -> Result<()> {
     let used = state.pages_used_today(chat_id);
-    let remaining = state.remaining_pages_today(chat_id);
     let limit = state.daily_limit;
+    if limit == 0 {
+        send_message(
+            client,
+            token,
+            chat_id,
+            &format!(
+                "Today's usage:\n\n*{used}* pages processed\nFree access is active with no daily page quota\\."
+            ),
+            Some("MarkdownV2"),
+        )?;
+        return Ok(());
+    }
+
+    let remaining = state.remaining_pages_today(chat_id);
     let bar = progress_bar(used, limit, 20);
 
     send_message(
@@ -1654,6 +1685,23 @@ mod tests {
         state.finish(10);
         assert!(!state.is_active(10));
         assert!(state.try_start(11, 1).is_some());
+    }
+
+    #[test]
+    fn zero_daily_limit_means_unlimited_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            usage_path: dir.path().join("usage.json"),
+            daily_limit: 0,
+            styles_dir: None,
+        };
+
+        state.record_pages(42, 250);
+        assert_eq!(state.pages_used_today(42), 250);
+        assert_eq!(state.remaining_pages_today(42), usize::MAX);
     }
 
     #[test]

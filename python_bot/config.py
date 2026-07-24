@@ -5,7 +5,8 @@ TILE_OVERLAP = 48
 ONNX_THREADS = 2
 
 # Limits
-DAILY_PAGE_LIMIT = 100
+# 0 means free access with no daily page quota.
+DAILY_PAGE_LIMIT = 0
 DEFAULT_BATCH_SIZE = 5
 MAX_CONCURRENT_JOBS = 2
 MAX_IMAGE_BYTES = 50 * 1024 * 1024

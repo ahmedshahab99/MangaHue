@@ -109,6 +109,8 @@ class BotState:
     def remaining(self, cid: int) -> int:
         self._check_date_reset()
         limit = self.custom_limits.get(cid, LIMIT)
+        if limit <= 0:
+            return sys.maxsize
         return max(0, limit - self.usage.get(cid, 0))
 
     def used(self, cid: int) -> int:
@@ -411,7 +413,8 @@ async def _start(u, _):
     await safe_send(u.message.reply_text, "*MangaHue* — send a manga chapter URL.\n/help for commands.", parse_mode=ParseMode.MARKDOWN)
 
 async def _help(u, _):
-    await safe_send(u.message.reply_text, f"*Commands:*\n/start /help /status /cancel\n/batch N /stats /clean\n\nLimit: *{LIMIT}* pages/day.", parse_mode=ParseMode.MARKDOWN)
+    access = "Free access: no daily page quota." if LIMIT <= 0 else f"Limit: *{LIMIT}* pages/day."
+    await safe_send(u.message.reply_text, f"*Commands:*\n/start /help /status /cancel\n/batch N /stats /clean\n\n{access}", parse_mode=ParseMode.MARKDOWN)
 
 async def _status(u, c):
     s: BotState = c.bot_data["state"]
@@ -437,7 +440,11 @@ async def _stats(u, c):
     s: BotState = c.bot_data["state"]
     cid = u.effective_chat.id
     limit = s.limit_for(cid)
-    await safe_send(u.message.reply_text, f"`{_bar(s.used(cid), limit, 16)}` *{s.used(cid)}* / {limit}", parse_mode=ParseMode.MARKDOWN)
+    if limit <= 0:
+        text = f"*{s.used(cid)}* pages processed today. Free access has no daily page quota."
+    else:
+        text = f"`{_bar(s.used(cid), limit, 16)}` *{s.used(cid)}* / {limit}"
+    await safe_send(u.message.reply_text, text, parse_mode=ParseMode.MARKDOWN)
 
 async def _clean(u, c):
     s: BotState = c.bot_data["state"]
