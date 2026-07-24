@@ -1,0 +1,31 @@
+[Unit]
+Description=MangaHue Pro Compact ONNX Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/MangaHue-release
+EnvironmentFile=/opt/MangaHue-release/runtime/telegram.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/MangaHue-release/python
+Environment=MANGAHUE_PYTHON=/opt/MangaHue/.venv/bin/python
+Environment=MANGAHUE_MODEL_THREADS=1
+Environment=MANGAHUE_MODEL_TIMEOUT_SECONDS=180
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=MALLOC_ARENA_MAX=2
+ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --max-pages 64 --max-concurrent-jobs 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.onnx-small.yaml --hint-propagate --daily-limit 100
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/mangahue-pro /tmp
+
+[Install]
+WantedBy=multi-user.target

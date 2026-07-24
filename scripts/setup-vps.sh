@@ -230,7 +230,7 @@ services:
       - "--preset"
       - "/app/configs/engine.onnx-small.yaml"
       - "--hint-propagate"
-      - "--daily-page-limit"
+      - "--daily-limit"
       - "${DAILY_PAGE_LIMIT:-100}"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?required}
