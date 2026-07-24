@@ -1,0 +1,25 @@
+id: studio_anime
+name: Studio Anime
+saturation: 1.08
+contrast: 1.06
+brightness: 0.012
+shadow_strength: 0.52
+highlight_strength: 0.38
+line_strength: 1.0
+palette:
+  - "#efc7ae"
+  - "#d8aa8e"
+  - "#c48e7c"
+  - "#3a3038"
+  - "#514249"
+  - "#76605a"
+  - "#eee7dd"
+  - "#fdfcf9"
+  - "#abc8d7"
+  - "#667985"
+  - "#b99878"
+  - "#76505a"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Reference-derived studio anime color: warm skin, charcoal hair, neutral whites, grounded interiors, and restrained cool accents."

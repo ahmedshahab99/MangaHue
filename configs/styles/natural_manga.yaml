@@ -1,8 +1,8 @@
 id: natural_manga
 name: Natural Manga
-saturation: 0.85
-contrast: 1.05
-brightness: -0.005
+saturation: 1.0
+contrast: 1.04
+brightness: 0.005
 shadow_strength: 0.65
 highlight_strength: 0.25
 line_strength: 1.06
@@ -16,4 +16,4 @@ palette:
 protected_colors:
   - "#ffffff"
   - "#000000"
-notes: "Natural manga tones. Subtle desaturation, gentle contrast, neutral color balance."
+notes: "Natural manga tones with richer midtone color, protected highlights, and neutral ink."

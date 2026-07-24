@@ -48,6 +48,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     if input.config.palette_correction {
         let lut = MangaColorLUT::new(input.style);
         apply_lut_grading(&mut output, &lut, input.line_mask, input.original_grayscale);
+        apply_palette_harmony(&mut output, input.style, input.line_mask);
     }
 
     if let Some(tone_mask) = input.tone_mask {
@@ -116,8 +117,19 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
         let edge = ((gradient - 18.0) / 90.0).clamp(0.0, 1.0);
         let predicted_luma =
             0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        let target_luma = original * 0.68 + predicted_luma * 0.32;
-        let chroma_scale = 0.90 * (1.0 - edge * 0.76);
+        let target_luma = original * 0.58 + predicted_luma * 0.42;
+        let tonal_distance = ((target_luma / 255.0 - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+        let desired_chroma_scale = (1.08 - tonal_distance * 0.16) * (1.0 - edge * 0.76);
+        let mut gamut_scale = desired_chroma_scale;
+        for channel in 0..3 {
+            let chroma = pixel[channel] as f32 - predicted_luma;
+            if chroma > 0.0 {
+                gamut_scale = gamut_scale.min((255.0 - target_luma) / chroma);
+            } else if chroma < 0.0 {
+                gamut_scale = gamut_scale.min(target_luma / -chroma);
+            }
+        }
+        let chroma_scale = gamut_scale.clamp(0.0, desired_chroma_scale);
 
         for channel in 0..3 {
             let chroma = pixel[channel] as f32 - predicted_luma;
@@ -290,7 +302,7 @@ struct MangaColorLUT {
 impl MangaColorLUT {
     fn new(style: &StyleProfile) -> Self {
         let contrast = style.contrast.clamp(0.9, 1.15);
-        let sat = style.saturation.clamp(0.7, 1.0);
+        let sat = style.saturation.clamp(0.7, 1.15);
         let bright = style.brightness * 15.0;
         let mut table = vec![[[Rgb([0; 3]); LUT_SIZE]; LUT_SIZE]; LUT_SIZE];
 
@@ -318,6 +330,74 @@ impl MangaColorLUT {
         }
 
         MangaColorLUT { table }
+    }
+}
+
+fn apply_palette_harmony(image: &mut RgbImage, style: &StyleProfile, line_mask: &GrayImage) {
+    if style.palette.is_empty() {
+        return;
+    }
+    let palette = style
+        .palette
+        .iter()
+        .map(|color| {
+            let r = color.r as f32;
+            let g = color.g as f32;
+            let b = color.b as f32;
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            (luma, b - luma, r - luma, r.max(g).max(b) - r.min(g).min(b))
+        })
+        .collect::<Vec<_>>();
+
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
+        if ink > 0.72 {
+            continue;
+        }
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let cb = b - luma;
+        let cr = r - luma;
+        let saturation = r.max(g).max(b) - r.min(g).min(b);
+        let source_is_neutral = saturation < 8.0;
+
+        let target = palette
+            .iter()
+            .filter(|entry| (entry.3 < 10.0) == source_is_neutral)
+            .min_by(|left, right| {
+                let distance = |entry: &&(f32, f32, f32, f32)| {
+                    let dl = (luma - entry.0) * 0.22;
+                    let dcb = cb - entry.1;
+                    let dcr = cr - entry.2;
+                    dl * dl + dcb * dcb + dcr * dcr
+                };
+                distance(left).total_cmp(&distance(right))
+            })
+            .or_else(|| {
+                palette.iter().min_by(|left, right| {
+                    let distance = |entry: &&(f32, f32, f32, f32)| {
+                        let dl = (luma - entry.0) * 0.22;
+                        let dcb = cb - entry.1;
+                        let dcr = cr - entry.2;
+                        dl * dl + dcb * dcb + dcr * dcr
+                    };
+                    distance(left).total_cmp(&distance(right))
+                })
+            });
+        let Some((_, target_cb, target_cr, _)) = target else {
+            continue;
+        };
+
+        let strength = 0.16 * (1.0 - ink).powi(2);
+        let harmonized_cb = cb + (target_cb - cb) * strength;
+        let harmonized_cr = cr + (target_cr - cr) * strength;
+        pixel[0] = (luma + harmonized_cr).round().clamp(0.0, 255.0) as u8;
+        pixel[2] = (luma + harmonized_cb).round().clamp(0.0, 255.0) as u8;
+        pixel[1] = ((luma - 0.2126 * pixel[0] as f32 - 0.0722 * pixel[2] as f32) / 0.7152)
+            .round()
+            .clamp(0.0, 255.0) as u8;
     }
 }
 
@@ -637,5 +717,26 @@ mod tests {
         for channel in 0..3 {
             assert!((high[channel] as i16 - low[channel] as i16).abs() <= 2);
         }
+    }
+
+    #[test]
+    fn palette_harmony_preserves_neutral_pixels_and_guides_colored_pixels() {
+        let style = StyleProfile {
+            palette: vec![
+                mangahue_core::ColorRgb::new(238, 199, 174),
+                mangahue_core::ColorRgb::new(245, 245, 242),
+            ],
+            ..StyleProfile::default()
+        };
+        let mut image = RgbImage::from_pixel(2, 1, Rgb([210, 120, 150]));
+        image.put_pixel(1, 0, Rgb([240, 240, 240]));
+        let lines = GrayImage::from_pixel(2, 1, Luma([0]));
+
+        apply_palette_harmony(&mut image, &style, &lines);
+
+        let colored = image.get_pixel(0, 0);
+        assert!(colored[1] > 120);
+        assert!(colored[0] - colored[1] < 90);
+        assert_eq!(image.get_pixel(1, 0).0, [240, 240, 240]);
     }
 }

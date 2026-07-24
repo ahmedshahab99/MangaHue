@@ -16,7 +16,7 @@ Environment=MANGAHUE_MODEL_TIMEOUT_SECONDS=180
 Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=MALLOC_ARENA_MAX=2
-ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --max-pages 64 --max-concurrent-jobs 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/natural_manga.yaml --daily-limit 100
+ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --max-pages 64 --max-concurrent-jobs 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/studio_anime.yaml --daily-limit 100
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30

@@ -230,7 +230,7 @@ services:
       - "--preset"
       - "/app/configs/engine.telegram-cpu.yaml"
       - "--style"
-      - "/app/configs/styles/natural_manga.yaml"
+      - "/app/configs/styles/studio_anime.yaml"
       - "--daily-limit"
       - "${DAILY_PAGE_LIMIT:-100}"
     environment:
