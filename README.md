@@ -50,6 +50,13 @@ mangahue character create --project projects/my_manga --name Hero --hair "#11111
 
 The model creates color candidates. The Rust engine decides how manga pages are prepared, protected, guided, corrected, and remembered.
 
+## CPU Reference-Grade Roadmap
+
+The implementation plan for a 6 GB RAM CPU server, including pretrained-model
+admission gates, reference guidance, semantic region graphs, material rendering,
+quality targets, and the July 29 execution order, is documented in
+[`docs/15_cpu_reference_grade_plan.md`](docs/15_cpu_reference_grade_plan.md).
+
 ## Studio
 
 Run the local API and open the Studio:

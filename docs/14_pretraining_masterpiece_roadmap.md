@@ -31,3 +31,6 @@ MangaHue can become much more powerful before the final trained model exists. Th
 ## Next Recommended Build Step
 
 Build the region lock editor. MangaHue now creates editable palette memories; the next brain step is spatial locks for hair, eyes, clothing, bubbles, and backgrounds before inference.
+
+For the no-rental, 6 GB CPU production path and its full quality checklist, see
+`docs/15_cpu_reference_grade_plan.md`.
