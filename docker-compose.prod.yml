@@ -135,7 +135,7 @@ services:
         window: 120s
 
   telegram-small:
-    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-small}
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${SMALL_TAG:-small}
     pull_policy: always
     restart: unless-stopped
     profiles: ["telegram-small"]

@@ -53,10 +53,11 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
 ENTRYPOINT ["mangahue-api"]
 CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles"]
 
-# ── Small runtime (no PyTorch — models mounted at runtime) ────────────────
+# ── Compact CPU runtime (inference only; models mounted at runtime) ───────
 FROM python:3.12-slim-bookworm AS runtime-small
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/python \
     MANGAHUE_PYTHON=python \
     RUST_LOG=mangahue=info,tower_http=info
 
@@ -74,7 +75,8 @@ COPY --from=rust-builder /src/target/release/mangahue-telegram /usr/local/bin/ma
 COPY --from=rust-builder /src/target/release/mangahue /usr/local/bin/mangahue
 
 COPY python /app/python
-RUN pip install --no-cache-dir numpy pillow onnx onnxruntime tqdm
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
+    && pip install --no-cache-dir numpy pillow opencv-python-headless
 
 COPY configs /app/configs
 COPY web /app/web

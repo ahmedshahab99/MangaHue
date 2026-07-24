@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::Parser;
 use mangahue_ingest::extract_manga_urls;
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
-use reqwest::blocking::multipart::{Form, Part};
+use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
 use reqwest::header::USER_AGENT;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,6 @@ use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: usize = 10;
 const DAILY_PAGE_LIMIT: usize = 100;
-const MIN_SEND_INTERVAL_MS: u64 = 3100;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
 
 const BUILTIN_STYLES: &[(&str, &str)] = &[
@@ -188,13 +187,10 @@ impl BotState {
             .per_chat_settings
             .lock()
             .expect("settings lock poisoned");
-        settings
-            .get(&chat_id)
-            .cloned()
-            .unwrap_or_else(|| PerChatSettings {
-                style_path: None,
-                batch_size: default_batch,
-            })
+        settings.get(&chat_id).cloned().unwrap_or(PerChatSettings {
+            style_path: None,
+            batch_size: default_batch,
+        })
     }
 
     fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
@@ -425,7 +421,15 @@ fn poll_once(
         let text = text.trim();
 
         if text.starts_with('/') {
-            handle_command(client, token, args, state, chat_id, text, message.message_id)?;
+            handle_command(
+                client,
+                token,
+                args,
+                state,
+                chat_id,
+                text,
+                message.message_id,
+            )?;
             continue;
         }
 
@@ -509,7 +513,11 @@ fn handle_command(
     text: &str,
     _message_id: i64,
 ) -> Result<()> {
-    let cmd = text.split_whitespace().next().unwrap_or(text).to_lowercase();
+    let cmd = text
+        .split_whitespace()
+        .next()
+        .unwrap_or(text)
+        .to_lowercase();
     let arg = text.split_whitespace().nth(1).unwrap_or("").to_string();
 
     match cmd.as_str() {
@@ -621,9 +629,7 @@ fn cmd_style(
             client,
             token,
             chat_id,
-            &format!(
-                "Style '{arg}' not found. Use /style to see available styles."
-            ),
+            &format!("Style '{arg}' not found. Use /style to see available styles."),
             None,
         )?;
         return Ok(());
@@ -634,8 +640,7 @@ fn cmd_style(
         let row: Vec<InlineKeyboardButton> = chunk
             .iter()
             .map(|(id, name)| {
-                InlineKeyboardButton::new(name)
-                    .callback_data(format!("style:{}", id))
+                InlineKeyboardButton::new(name).callback_data(format!("style:{}", id))
             })
             .collect();
         rows.push(row);
@@ -653,15 +658,14 @@ fn cmd_style(
         client,
         token,
         chat_id,
-        &format!(
-            "Choose a color style (current: *{}*):",
-            current
-        ),
+        &format!("Choose a color style (current: *{}*):", current),
         Some("MarkdownV2"),
     )
     .map(|_| ())?;
 
-    let reply_markup = InlineKeyboardMarkup { inline_keyboard: rows };
+    let reply_markup = InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    };
     send_message(
         client,
         token,
@@ -776,7 +780,13 @@ fn cmd_clean(
                     .lock()
                     .expect("settings lock poisoned")
                     .remove(&chat_id);
-                send_message(client, token, chat_id, "All your job data has been cleaned up.", None)?;
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    "All your job data has been cleaned up.",
+                    None,
+                )?;
             }
             Err(e) => {
                 send_message(
@@ -812,13 +822,7 @@ fn handle_callback(
     if data == "cancel_job" {
         state.cancel(chat_id);
         if let Some(ref msg) = cb.message {
-            let _ = edit_message(
-                client,
-                token,
-                chat_id,
-                msg.message_id,
-                "Cancelled by user.",
-            );
+            let _ = edit_message(client, token, chat_id, msg.message_id, "Cancelled by user.");
         }
         return Ok(());
     }
@@ -915,8 +919,10 @@ fn validate_user_url(url: &str) -> UrlValidation {
     let host = parsed.host_str().unwrap_or("");
     let host_lower = host.to_ascii_lowercase();
 
-    if matches!(host_lower.as_str(), "localhost" | "localhost.localdomain" | "127.0.0.1")
-        || host_lower.starts_with("192.168.")
+    if matches!(
+        host_lower.as_str(),
+        "localhost" | "localhost.localdomain" | "127.0.0.1"
+    ) || host_lower.starts_with("192.168.")
         || host_lower.starts_with("10.")
         || host_lower == "0.0.0.0"
     {
@@ -966,16 +972,9 @@ fn handle_link(
     let style_path = state.resolve_style_path(chat_id, &args.style);
 
     send_chat_action(client, token, chat_id, "typing")?;
-    send_message(
-        client,
-        token,
-        chat_id,
-        "Downloading pages...",
-        None,
-    )?;
+    send_message(client, token, chat_id, "Downloading pages...", None)?;
 
-    let source_url = url::Url::parse(url)
-        .with_context(|| format!("invalid URL: {url}"))?;
+    let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
     let page_resp = client
         .get(url)
         .header(USER_AGENT, "MangaHueBot/1.0")
@@ -996,13 +995,7 @@ fn handle_link(
         let html = page_resp
             .text()
             .with_context(|| format!("failed to read HTML from {url}"))?;
-        extract_manga_urls(
-            &client,
-            &source_url,
-            &html,
-            &source_url,
-            args.max_pages,
-        )?
+        extract_manga_urls(client, &source_url, &html, &source_url, args.max_pages)?
     };
 
     if all_image_urls.is_empty() {
@@ -1037,8 +1030,9 @@ fn handle_link(
     )?;
 
     let cancel_kb = InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![InlineKeyboardButton::new("Cancel")
-            .callback_data("cancel_job")]],
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton::new("Cancel").callback_data("cancel_job")
+        ]],
     };
     let progress_msg_id = send_message(
         client,
@@ -1087,12 +1081,8 @@ fn handle_link(
                 .and_then(|e| e.to_str())
                 .unwrap_or("jpg");
             let local_path = downloads_dir.join(format!("page_{:03}.{}", pos + 1, ext));
-            match download_image_url_telegram(
-                client,
-                img_url,
-                &local_path,
-                args.max_bytes_per_page,
-            ) {
+            match download_image_url_telegram(client, img_url, &local_path, args.max_bytes_per_page)
+            {
                 Ok(()) => batch_pages.push((*pos, local_path)),
                 Err(e) => {
                     tracing::warn!(url = %img_url, error = %e, "download failed, skipping");
@@ -1128,7 +1118,8 @@ fn handle_link(
                 let mut last_percent = -10i32;
                 while let Some(update) = progress_receiver.blocking_recv() {
                     let percent = update.percent.round() as i32;
-                    if update.stage != last_stage || percent >= last_percent + 10 || percent >= 100 {
+                    if update.stage != last_stage || percent >= last_percent + 10 || percent >= 100
+                    {
                         let text = format!(
                             "Coloring page {}/{}: {} ({}%)",
                             progress_position + 1,
@@ -1178,9 +1169,7 @@ fn handle_link(
                             token,
                             chat_id,
                             progress_msg_id,
-                            &format!(
-                                "Cancelled after {sent} page(s)."
-                            ),
+                            &format!("Cancelled after {sent} page(s)."),
                         );
                         cleanup_dir(&job_dir);
                         return Ok(());
@@ -1194,8 +1183,7 @@ fn handle_link(
                             .unwrap_or_else(|| "colored".to_string())
                     );
                     send_chat_action(client, token, chat_id, "upload_document")?;
-                    if let Err(e) = send_document(client, token, chat_id, &output_path, &caption)
-                    {
+                    if let Err(e) = send_document(client, token, chat_id, &output_path, &caption) {
                         tracing::error!(error = %e, "send failed");
                         failed += 1;
                     } else {
@@ -1207,13 +1195,7 @@ fn handle_link(
                 }
                 Err(error) => {
                     if cancel_token.load(Ordering::Acquire) {
-                        let _ = edit_message(
-                            client,
-                            token,
-                            chat_id,
-                            progress_msg_id,
-                            "Cancelled.",
-                        );
+                        let _ = edit_message(client, token, chat_id, progress_msg_id, "Cancelled.");
                         cleanup_dir(&job_dir);
                         return Ok(());
                     }
@@ -1231,21 +1213,15 @@ fn handle_link(
                 }
             }
 
-            let done = start + sent.min((*position + 1) - start) + failed.min((*position + 1) - start);
+            let done =
+                start + sent.min((*position + 1) - start) + failed.min((*position + 1) - start);
             let eta = estimate_eta(&page_times, done, effective_total);
             let _ = edit_message(
                 client,
                 token,
                 chat_id,
                 progress_msg_id,
-                &format_progress(
-                    done,
-                    effective_total,
-                    batch_idx,
-                    total_batches,
-                    eta,
-                    failed,
-                ),
+                &format_progress(done, effective_total, batch_idx, total_batches, eta, failed),
             );
         }
 
@@ -1258,10 +1234,9 @@ fn handle_link(
 
     let elapsed = total_start.elapsed().as_secs_f32();
     let completion_kb = InlineKeyboardMarkup {
-        inline_keyboard: vec![
-            vec![InlineKeyboardButton::new("Colorize Another")
-                .callback_data("colorize_another")],
-        ],
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton::new("Colorize Another").callback_data("colorize_another")
+        ]],
     };
 
     let mut final_text = format!(
@@ -1311,7 +1286,9 @@ fn format_progress(
     let bar = progress_bar(done, total, 16);
     let mut text = format!(
         "`{bar}` {:.0}%\nPages: {}/{} | Batch: {}/{}",
-        pct, done, total,
+        pct,
+        done,
+        total,
         (batch_idx + 1).min(total_batches),
         total_batches
     );
@@ -1379,10 +1356,6 @@ fn download_image_url_telegram(
     std::fs::write(output, &data)
         .with_context(|| format!("failed to write {}", output.display()))?;
     Ok(())
-}
-
-fn rate_limit_wait(_chat_id: i64) {
-    std::thread::sleep(Duration::from_millis(MIN_SEND_INTERVAL_MS));
 }
 
 fn resolve_region_locks(root: Option<&Path>, page_stem: &str) -> Option<PathBuf> {
@@ -1579,60 +1552,6 @@ fn send_document(
     Ok(())
 }
 
-fn send_media_group(
-    client: &Client,
-    token: &str,
-    chat_id: i64,
-    files: &[(Vec<u8>, String, String)],
-) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    rate_limit_wait(chat_id);
-
-    let mut form = Form::new().text("chat_id", chat_id.to_string());
-
-    let media_array: Vec<serde_json::Value> = files
-        .iter()
-        .enumerate()
-        .map(|(i, (_, _filename, caption))| {
-            let attach_name = format!("file{}", i);
-            json!({
-                "type": "document",
-                "media": format!("attach://{}", attach_name),
-                "caption": caption,
-                "parse_mode": "MarkdownV2"
-            })
-        })
-        .collect();
-
-    form = form.text("media", serde_json::to_string(&media_array)?);
-
-    for (i, (data, filename, _)) in files.iter().enumerate() {
-        let attach_name = format!("file{}", i);
-        let mime = guess_mime(filename);
-        let part = Part::bytes(data.clone())
-            .file_name(filename.clone())
-            .mime_str(mime)
-            .with_context(|| format!("invalid mime type for {}", filename))?;
-        form = form.part(attach_name, part);
-    }
-
-    let envelope: TelegramEnvelope<serde_json::Value> = client
-        .post(telegram_url(token, "sendMediaGroup"))
-        .multipart(form)
-        .send()
-        .context("failed to call sendMediaGroup")?
-        .error_for_status()
-        .context("Telegram sendMediaGroup failed")?
-        .json()
-        .context("failed to parse sendMediaGroup response")?;
-
-    let _ = telegram_result(envelope)?;
-    Ok(())
-}
-
 fn answer_callback_query(
     client: &Client,
     token: &str,
@@ -1679,19 +1598,6 @@ fn telegram_result<T>(envelope: TelegramEnvelope<T>) -> Result<T> {
 
 fn telegram_url(token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{token}/{method}")
-}
-
-fn guess_mime(filename: &str) -> &'static str {
-    let lower = filename.to_ascii_lowercase();
-    if lower.ends_with(".png") {
-        "image/png"
-    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if lower.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "application/octet-stream"
-    }
 }
 
 fn first_url(text: &str) -> Option<String> {
@@ -1777,13 +1683,5 @@ mod tests {
         assert_eq!(progress_bar(0, 10, 10), "░░░░░░░░░░");
         assert_eq!(progress_bar(5, 10, 10), "▓▓▓▓▓░░░░░");
         assert_eq!(progress_bar(10, 10, 10), "▓▓▓▓▓▓▓▓▓▓");
-    }
-
-    #[test]
-    fn guess_mime_detects_image_types() {
-        assert_eq!(guess_mime("page.png"), "image/png");
-        assert_eq!(guess_mime("page.jpg"), "image/jpeg");
-        assert_eq!(guess_mime("page.webp"), "image/webp");
-        assert_eq!(guess_mime("page.bin"), "application/octet-stream");
     }
 }

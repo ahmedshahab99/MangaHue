@@ -700,23 +700,19 @@ fn select_backend(
         .as_ref()
         .unwrap_or(&config.inference.model_path);
     if mangahue_inference::is_ddcolor_model_dir(model_path) {
-        return Ok(Box::new(
-            mangahue_inference::DdColorBackend::shared(
-                model_path,
-                &config.inference.device,
-                512,
-                "large",
-            )?,
-        ));
+        return Ok(Box::new(mangahue_inference::DdColorBackend::shared(
+            model_path,
+            &config.inference.device,
+            512,
+            "large",
+        )?));
     }
     if mangahue_inference::is_manga_ninja_model_dir(model_path) {
-        return Ok(Box::new(
-            mangahue_inference::MangaNinjaBackend::shared(
-                model_path,
-                &config.inference.device,
-                50,
-            )?,
-        ));
+        return Ok(Box::new(mangahue_inference::MangaNinjaBackend::shared(
+            model_path,
+            &config.inference.device,
+            50,
+        )?));
     }
     if mangahue_inference::is_pretrained_model_dir(model_path) {
         return Ok(Box::new(

@@ -250,9 +250,9 @@ impl MangaColorLUT {
         let bright = style.brightness * 15.0;
         let mut table = vec![[[Rgb([0; 3]); LUT_SIZE]; LUT_SIZE]; LUT_SIZE];
 
-        for ri in 0..LUT_SIZE {
-            for gi in 0..LUT_SIZE {
-                for bi in 0..LUT_SIZE {
+        for (ri, red_slice) in table.iter_mut().enumerate() {
+            for (gi, green_slice) in red_slice.iter_mut().enumerate() {
+                for (bi, entry) in green_slice.iter_mut().enumerate() {
                     let r = ri as f32 * 16.0;
                     let g = gi as f32 * 16.0;
                     let b = bi as f32 * 16.0;
@@ -268,7 +268,7 @@ impl MangaColorLUT {
                     let cg = ((sg - 128.0) * contrast + 128.0 + bright).clamp(0.0, 255.0) as u8;
                     let cb = ((sb - 128.0) * contrast + 128.0 + bright).clamp(0.0, 255.0) as u8;
 
-                    table[ri][gi][bi] = Rgb([cr, cg, cb]);
+                    *entry = Rgb([cr, cg, cb]);
                 }
             }
         }
@@ -324,11 +324,14 @@ fn apply_lut_grading(
 ) {
     for (x, y, pixel) in image.enumerate_pixels_mut() {
         let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
-        if ink > 0.85 { continue; }
+        if ink > 0.85 {
+            continue;
+        }
 
         let mapped = lut_lookup(lut, pixel[0], pixel[1], pixel[2]);
         let orig_luma = original.get_pixel(x, y)[0] as f32;
-        let new_luma = 0.2126 * mapped[0] as f32 + 0.7152 * mapped[1] as f32 + 0.0722 * mapped[2] as f32;
+        let new_luma =
+            0.2126 * mapped[0] as f32 + 0.7152 * mapped[1] as f32 + 0.0722 * mapped[2] as f32;
         let anchor = 0.10;
         let diff = orig_luma - new_luma;
 
@@ -360,7 +363,8 @@ fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
             }
 
             let center = src[idx];
-            let center_luma = 0.2126 * center[0] as f32 + 0.7152 * center[1] as f32 + 0.0722 * center[2] as f32;
+            let center_luma =
+                0.2126 * center[0] as f32 + 0.7152 * center[1] as f32 + 0.0722 * center[2] as f32;
             let mut sum = [0.0f32; 3];
             let mut total_w = 0.0f32;
 
@@ -371,7 +375,9 @@ fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
                     let n_id = (ny * w + nx) as usize;
 
                     let n_ink = line_mask.get_pixel(nx, ny)[0] as f32 / 255.0;
-                    if n_ink > 0.85 { continue; }
+                    if n_ink > 0.85 {
+                        continue;
+                    }
                     let ink_w = (1.0 - n_ink).powi(3);
 
                     let n = src[n_id];
@@ -392,11 +398,15 @@ fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
             }
 
             if total_w > 0.0 {
-                image.put_pixel(x, y, Rgb([
-                    (sum[0] / total_w).clamp(0.0, 255.0) as u8,
-                    (sum[1] / total_w).clamp(0.0, 255.0) as u8,
-                    (sum[2] / total_w).clamp(0.0, 255.0) as u8,
-                ]));
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        (sum[0] / total_w).clamp(0.0, 255.0) as u8,
+                        (sum[1] / total_w).clamp(0.0, 255.0) as u8,
+                        (sum[2] / total_w).clamp(0.0, 255.0) as u8,
+                    ]),
+                );
             }
         }
     }

@@ -201,7 +201,7 @@ services:
           memory: 4096M
 
   telegram-small:
-    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${TAG:-small}
+    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${SMALL_TAG:-small}
     pull_policy: always
     restart: unless-stopped
     entrypoint: ["mangahue-telegram"]

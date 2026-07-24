@@ -146,13 +146,7 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
         let html = response
             .text()
             .with_context(|| format!("failed to read HTML from {source_url}"))?;
-        let image_urls = extract_manga_urls(
-            &client,
-            &source_url,
-            &html,
-            &source_url,
-            max_pages,
-        )?;
+        let image_urls = extract_manga_urls(&client, &source_url, &html, &source_url, max_pages)?;
         for image_url in image_urls.into_iter().take(max_pages) {
             let parsed = Url::parse(&image_url)?;
             if let Err(error) = validate_public_url(&parsed) {

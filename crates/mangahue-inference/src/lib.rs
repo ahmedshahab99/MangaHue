@@ -138,8 +138,7 @@ impl<T: ColorizationBackend + ?Sized> ColorizationBackend for Arc<T> {
 
 pub fn is_ddcolor_model_dir(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    path.join("pytorch_model.pt").is_file()
-        || path.join("models").is_dir()
+    path.join("pytorch_model.pt").is_file() || path.join("models").is_dir()
 }
 
 #[derive(Debug, Clone)]
@@ -175,18 +174,24 @@ impl DdColorWorkerLaunch {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| {
-                format!("failed to launch ddcolor worker with '{}'", self.python)
-            })?;
-        let stdin = child.stdin.take().context("ddcolor worker stdin unavailable")?;
-        let stdout = child.stdout.take().context("ddcolor worker stdout unavailable")?;
+            .with_context(|| format!("failed to launch ddcolor worker with '{}'", self.python))?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("ddcolor worker stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ddcolor worker stdout unavailable")?;
         let mut process = PretrainedWorkerProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
         };
         let mut ready = String::new();
-        process.stdout.read_line(&mut ready)
+        process
+            .stdout
+            .read_line(&mut ready)
             .context("ddcolor worker exited before readiness handshake")?;
         let handshake: serde_json::Value = serde_json::from_str(ready.trim())
             .with_context(|| format!("invalid ddcolor handshake: {}", ready.trim()))?;
@@ -204,7 +209,12 @@ pub struct DdColorBackend {
 }
 
 impl DdColorBackend {
-    pub fn new(model_dir: impl AsRef<Path>, device: &str, input_size: u32, model_size: &str) -> Result<Self> {
+    pub fn new(
+        model_dir: impl AsRef<Path>,
+        device: &str,
+        input_size: u32,
+        model_size: &str,
+    ) -> Result<Self> {
         let model_dir = model_dir.as_ref();
         let model_path = if model_dir.join("pytorch_model.pt").is_file() {
             model_dir.join("pytorch_model.pt")
@@ -212,9 +222,15 @@ impl DdColorBackend {
             let snapshots = model_dir.join("models");
             let mut found = None;
             if snapshots.is_dir() {
-                for entry in std::fs::read_dir(&snapshots).with_context(|| format!("cannot read {}", snapshots.display()))? {
+                for entry in std::fs::read_dir(&snapshots)
+                    .with_context(|| format!("cannot read {}", snapshots.display()))?
+                {
                     let entry = entry?;
-                    let candidate = entry.path().join("snapshots").join("master").join("pytorch_model.pt");
+                    let candidate = entry
+                        .path()
+                        .join("snapshots")
+                        .join("master")
+                        .join("pytorch_model.pt");
                     if candidate.is_file() {
                         found = Some(candidate);
                         break;
@@ -226,26 +242,53 @@ impl DdColorBackend {
 
         let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
         let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
-            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2).clamp(1, 8);
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
         let launch = DdColorWorkerLaunch {
             python,
             model_path,
-            device: if device.eq_ignore_ascii_case("cuda") { "cuda".to_string() } else { "cpu".to_string() },
+            device: if device.eq_ignore_ascii_case("cuda") {
+                "cuda".to_string()
+            } else {
+                "cpu".to_string()
+            },
             input_size,
             model_size: model_size.to_string(),
             worker_threads,
         };
         let process = launch.spawn()?;
-        Ok(Self { launch, process: Mutex::new(process) })
+        Ok(Self {
+            launch,
+            process: Mutex::new(process),
+        })
     }
 
-    pub fn shared(model_dir: impl AsRef<Path>, device: &str, input_size: u32, model_size: &str) -> Result<Arc<Self>> {
+    pub fn shared(
+        model_dir: impl AsRef<Path>,
+        device: &str,
+        input_size: u32,
+        model_size: &str,
+    ) -> Result<Arc<Self>> {
         static WORKERS: OnceLock<Mutex<HashMap<String, Arc<DdColorBackend>>>> = OnceLock::new();
-        let canonical = model_dir.as_ref().canonicalize()
-            .with_context(|| format!("cannot resolve ddcolor dir {}", model_dir.as_ref().display()))?;
-        let key = format!("{}|{}|{}|{}", canonical.display(), device.to_ascii_lowercase(), input_size, model_size);
+        let canonical = model_dir.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve ddcolor dir {}",
+                model_dir.as_ref().display()
+            )
+        })?;
+        let key = format!(
+            "{}|{}|{}|{}",
+            canonical.display(),
+            device.to_ascii_lowercase(),
+            input_size,
+            model_size
+        );
         let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut w = workers.lock().map_err(|e| anyhow!("ddcolor registry poisoned: {e}"))?;
+        let mut w = workers
+            .lock()
+            .map_err(|e| anyhow!("ddcolor registry poisoned: {e}"))?;
         if let Some(worker) = w.get(&key) {
             return Ok(Arc::clone(worker));
         }
@@ -256,30 +299,52 @@ impl DdColorBackend {
 }
 
 impl ColorizationBackend for DdColorBackend {
-    fn name(&self) -> &str { "ddcolor" }
+    fn name(&self) -> &str {
+        "ddcolor"
+    }
 
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
-        let temp = tempfile::tempdir().map_err(|e| EngineError::Inference(format!("ddcolor temp dir: {e}")))?;
+        let temp = tempfile::tempdir()
+            .map_err(|e| EngineError::Inference(format!("ddcolor temp dir: {e}")))?;
         let lineart_path = temp.path().join("lineart.png");
         let output_path = temp.path().join("output.png");
-        input.lineart.save(&lineart_path).map_err(|e| EngineError::Inference(format!("ddcolor save: {e}")))?;
+        input
+            .lineart
+            .save(&lineart_path)
+            .map_err(|e| EngineError::Inference(format!("ddcolor save: {e}")))?;
         let request = serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
             "lineart": lineart_path,
             "output": output_path,
         });
-        let mut process = self.process.lock().map_err(|e| EngineError::Inference(format!("ddcolor lock: {e}")))?;
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|e| EngineError::Inference(format!("ddcolor lock: {e}")))?;
         let response = match exchange_worker_request(&mut process, &request) {
             Ok(r) => r,
             Err(first) => {
-                *process = self.launch.spawn().map_err(|restart| EngineError::Inference(format!("ddcolor worker failed ({first}) and restart failed: {restart}")))?;
-                exchange_worker_request(&mut process, &request).map_err(|second| EngineError::Inference(format!("ddcolor failed after restart: {second}")))?
+                *process = self.launch.spawn().map_err(|restart| {
+                    EngineError::Inference(format!(
+                        "ddcolor worker failed ({first}) and restart failed: {restart}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second| {
+                    EngineError::Inference(format!("ddcolor failed after restart: {second}"))
+                })?
             }
         };
         if response.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Err(EngineError::Inference(format!("ddcolor failed: {}", response.get("error").and_then(|v| v.as_str()).unwrap_or("unknown"))));
+            return Err(EngineError::Inference(format!(
+                "ddcolor failed: {}",
+                response
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            )));
         }
-        image::open(&output_path).map(|i| i.to_rgb8())
+        image::open(&output_path)
+            .map(|i| i.to_rgb8())
             .map_err(|e| EngineError::Inference(format!("ddcolor output: {e}")))
     }
 }
@@ -666,8 +731,7 @@ impl MangaNinjaBackend {
         device: &str,
         denoise_steps: u32,
     ) -> Result<Arc<Self>> {
-        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<MangaNinjaBackend>>>> =
-            OnceLock::new();
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<MangaNinjaBackend>>>> = OnceLock::new();
         let model_root = model_root.as_ref();
         let canonical = model_root.canonicalize().with_context(|| {
             format!(
@@ -988,10 +1052,14 @@ impl RustOnnxBackend {
             .map_err(|e| anyhow!("failed to create ONNX session: {e}"))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("failed to load ONNX model {}: {e}", model_path.display()))?;
-        let input_name = metadata.contract.as_ref()
+        let input_name = metadata
+            .contract
+            .as_ref()
             .map(|c| c.input_name.clone())
             .unwrap_or_else(|| "image_input".to_string());
-        let output_name = metadata.contract.as_ref()
+        let output_name = metadata
+            .contract
+            .as_ref()
             .map(|c| c.output_name.clone())
             .unwrap_or_else(|| "color_output".to_string());
         Ok(Self {
@@ -1013,7 +1081,7 @@ impl ColorizationBackend for RustOnnxBackend {
         let w = input.lineart.width() as usize;
         let channels = self.metadata.input_channels as usize;
 
-        let mut tensor_data = Vec::with_capacity(1 * channels * h * w);
+        let mut tensor_data = Vec::with_capacity(channels * h * w);
         for y in 0..h {
             for x in 0..w {
                 tensor_data.push(input.lineart.get_pixel(x as u32, y as u32)[0] as f32 / 255.0);

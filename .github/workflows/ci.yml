@@ -31,7 +31,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: python -m compileall python/mangahue_train
+      - run: python -m pip install -r python_bot/requirements.txt pytest pytest-asyncio
+      - run: python -m compileall python/mangahue_train python_bot
+      - run: python -m pytest -q python_bot/tests
       - run: node --check web/studio/studio.js
 
   container:
@@ -39,4 +41,4 @@ jobs:
     needs: [rust, python-and-studio]
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t mangahue:${{ github.sha }} .
+      - run: docker build --target runtime-small -t mangahue:${{ github.sha }} .

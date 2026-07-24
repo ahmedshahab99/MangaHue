@@ -25,7 +25,11 @@ impl MangaSite {
             Self::Nhentai
         } else if host.contains("mangadex.org") {
             Self::Mangadex
-        } else if host.contains("manganato.com") || host.contains("mangakakalot.com") || host.contains("chapmanganato.") || host.contains("readmanganato.") {
+        } else if host.contains("manganato.com")
+            || host.contains("mangakakalot.com")
+            || host.contains("chapmanganato.")
+            || host.contains("readmanganato.")
+        {
             Self::Manganato
         } else if host.contains("e-hentai.org") || host.contains("exhentai.org") {
             Self::Ehentai
@@ -101,7 +105,7 @@ fn extract_nhentai(
 
     // Method 3: Build URLs from gallery data in JSON/script
     if urls.is_empty() {
-        if let Some(script_sel) = Selector::parse("script").ok() {
+        if let Ok(script_sel) = Selector::parse("script") {
             for script in document.select(&script_sel) {
                 let text = script.inner_html();
                 if text.contains("media_id") && text.contains("num_pages") {
@@ -204,8 +208,7 @@ fn nhentai_thumb_to_full(src: &str) -> String {
     if let Some(ext_dot) = s.rfind('.') {
         let base = &s[..ext_dot];
         let ext = &s[ext_dot..];
-        if base.ends_with('t') {
-            let without_t = &base[..base.len() - 1];
+        if let Some(without_t) = base.strip_suffix('t') {
             if !without_t.is_empty() && without_t.ends_with(|c: char| c.is_ascii_digit()) {
                 return format!("{}{}", without_t, ext);
             }
@@ -229,7 +232,7 @@ fn extract_nhentai_gallery_id(url: &Url) -> Option<String> {
 fn extract_mangadex(client: &Client, url: &Url, max_pages: usize) -> Result<Vec<String>> {
     let chapter_id = url
         .path_segments()
-        .and_then(|s| s.filter(|p| !p.is_empty()).last())
+        .and_then(|mut segments| segments.rfind(|part| !part.is_empty()))
         .unwrap_or("")
         .to_string();
 
@@ -309,15 +312,19 @@ fn extract_manganato(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Str
                 for attr in &["src", "data-src", "data-lazy-src", "data-original"] {
                     if let Some(src) = img.value().attr(attr) {
                         let src = src.trim();
-                        if src.is_empty() || src.contains("avatar") || src.contains("logo") || src.contains("loading") {
+                        if src.is_empty()
+                            || src.contains("avatar")
+                            || src.contains("logo")
+                            || src.contains("loading")
+                        {
                             continue;
                         }
                         if let Ok(abs) = base.join(src) {
                             let s = abs.to_string();
-                            if s.ends_with(".jpg") || s.ends_with(".png") || s.ends_with(".webp") {
-                                if seen.insert(s.clone()) {
-                                    urls.push(s);
-                                }
+                            if (s.ends_with(".jpg") || s.ends_with(".png") || s.ends_with(".webp"))
+                                && seen.insert(s.clone())
+                            {
+                                urls.push(s);
                             }
                         }
                     }
@@ -360,7 +367,11 @@ fn extract_ehentai(
         // Method 2: Try .gdtm img data-src directly for thumbnail expansion
         let thumb_sel = Selector::parse(".gdtm img, .gdtl img").unwrap();
         for img in document.select(&thumb_sel) {
-            if let Some(src) = img.value().attr("data-src").or_else(|| img.value().attr("src")) {
+            if let Some(src) = img
+                .value()
+                .attr("data-src")
+                .or_else(|| img.value().attr("src"))
+            {
                 if seen.insert(src.to_string()) {
                     if let Ok(abs) = base.join(src) {
                         urls.push(abs.to_string());
@@ -446,9 +457,18 @@ fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Strin
     let selectors: &[(&str, &[&str])] = &[
         ("meta[property='og:image']", &["content"]),
         ("meta[name='twitter:image']", &["content"]),
-        ("img.chapter-img, img.page-img, img.reader-img, img.manga-page", &["src", "data-src", "data-original", "data-lazy-src"]),
-        ("img[src*='chapter'], img[src*='page'], img[src*='galleries']", &["src", "data-src", "data-original"]),
-        ("img", &["src", "data-src", "data-original", "data-lazy-src"]),
+        (
+            "img.chapter-img, img.page-img, img.reader-img, img.manga-page",
+            &["src", "data-src", "data-original", "data-lazy-src"],
+        ),
+        (
+            "img[src*='chapter'], img[src*='page'], img[src*='galleries']",
+            &["src", "data-src", "data-original"],
+        ),
+        (
+            "img",
+            &["src", "data-src", "data-original", "data-lazy-src"],
+        ),
         ("source", &["srcset"]),
     ];
 
@@ -498,9 +518,15 @@ fn is_likely_content_image(url: &str) -> bool {
         return false;
     }
     let lower = url.to_ascii_lowercase();
-    if lower.contains("avatar") || lower.contains("logo") || lower.contains("icon")
-        || lower.contains("banner") || lower.contains("pixel") || lower.contains("loading")
-        || lower.contains("spinner") || lower.contains("1x1") || lower.contains("blank")
+    if lower.contains("avatar")
+        || lower.contains("logo")
+        || lower.contains("icon")
+        || lower.contains("banner")
+        || lower.contains("pixel")
+        || lower.contains("loading")
+        || lower.contains("spinner")
+        || lower.contains("1x1")
+        || lower.contains("blank")
     {
         return false;
     }
