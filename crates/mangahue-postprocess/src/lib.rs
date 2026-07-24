@@ -545,15 +545,30 @@ pub fn preserve_screentones(
         if tone_mask.get_pixel(x, y)[0] == 0 {
             continue;
         }
-        let orig = original_gray.get_pixel(x, y)[0] as f32 / 255.0;
-
-        // In screentone areas, blend 60-80% original value with colorized
-        let t = blend * (0.6 + 0.2 * orig);
-        let orig_val = (orig * 255.0) as u8;
-
-        for c in 0..3 {
-            let colored = pixel[c] as f32;
-            pixel[c] = (colored * (1.0 - t) + orig_val as f32 * t).round() as u8;
+        let original_luma = original_gray.get_pixel(x, y)[0] as f32;
+        let colored_luma =
+            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        let tone_strength = blend * (0.52 + 0.16 * (1.0 - original_luma / 255.0));
+        let target_luma =
+            colored_luma + (original_luma - colored_luma) * tone_strength.clamp(0.0, 0.72);
+        let chroma = [
+            pixel[0] as f32 - colored_luma,
+            pixel[1] as f32 - colored_luma,
+            pixel[2] as f32 - colored_luma,
+        ];
+        let mut gamut_scale = 1.0f32;
+        for value in chroma {
+            if value > 0.0 {
+                gamut_scale = gamut_scale.min((255.0 - target_luma) / value);
+            } else if value < 0.0 {
+                gamut_scale = gamut_scale.min(target_luma / -value);
+            }
+        }
+        let gamut_scale = gamut_scale.clamp(0.0, 1.0);
+        for channel in 0..3 {
+            pixel[channel] = (target_luma + chroma[channel] * gamut_scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
         }
         *count += 1;
     }
@@ -738,5 +753,24 @@ mod tests {
         assert!(colored[1] > 120);
         assert!(colored[0] - colored[1] < 90);
         assert_eq!(image.get_pixel(1, 0).0, [240, 240, 240]);
+    }
+
+    #[test]
+    fn screentone_restoration_preserves_chroma_while_recovering_luma() {
+        let mut image = RgbImage::from_pixel(1, 1, Rgb([180, 80, 60]));
+        let original = GrayImage::from_pixel(1, 1, Luma([180]));
+        let tone_mask = GrayImage::from_pixel(1, 1, Luma([255]));
+        let before_luma: f32 = 0.2126 * 180.0 + 0.7152 * 80.0 + 0.0722 * 60.0;
+        let mut restored = 0;
+
+        preserve_screentones(&mut image, &original, &tone_mask, 1.0, &mut restored);
+
+        let pixel = image.get_pixel(0, 0);
+        let after_luma =
+            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
+        assert_eq!(restored, 1);
+        assert!((180.0f32 - after_luma).abs() < (180.0f32 - before_luma).abs());
+        assert!(chroma >= 100);
     }
 }
