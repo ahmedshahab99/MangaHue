@@ -68,11 +68,11 @@ cargo run -p mangahue-telegram -- --mock --work-dir .mangahue\telegram
 
 ### With real model
 ```powershell
-cargo run -p mangahue-telegram -- `
-  --model .\models\manga-onnx\manga-colorize-fp16.onnx `
-  --preset .\configs\engine.onnx-small.yaml `
-  --hint-propagate --max-concurrent-jobs 1
+.\scripts\run-telegram-local.ps1
 ```
+
+The launcher asks for a newly rotated Telegram token using a secure prompt. It
+does not write the token to disk and clears the process environment afterward.
 
 ## Telegram Bot Commands
 
