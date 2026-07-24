@@ -303,7 +303,10 @@ impl BotState {
 
 fn load_style_name(path: &Path) -> Option<String> {
     let data = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let v: serde_json::Value = match path.extension().and_then(|value| value.to_str()) {
+        Some("yaml" | "yml") => serde_yaml::from_str(&data).ok()?,
+        _ => serde_json::from_str(&data).ok()?,
+    };
     v.get("name")
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
@@ -679,9 +682,11 @@ fn cmd_style(
 
 fn resolve_style_file(state: &Arc<BotState>, style_id: &str) -> Option<PathBuf> {
     if let Some(ref dir) = state.styles_dir {
-        let candidate = dir.join(format!("{}.json", style_id));
-        if candidate.exists() {
-            return Some(candidate);
+        for extension in ["yaml", "yml", "json"] {
+            let candidate = dir.join(format!("{style_id}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -1089,7 +1094,6 @@ fn handle_link(
                     failed += 1;
                 }
             }
-            std::thread::sleep(Duration::from_millis(400));
         }
 
         for (position, page) in &batch_pages {
@@ -1662,6 +1666,27 @@ mod tests {
             Some(lock.as_path())
         );
         assert!(resolve_region_locks(Some(dir.path()), "page_999").is_none());
+    }
+
+    #[test]
+    fn loads_yaml_style_names_and_resolves_style_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let style = dir.path().join("natural_manga.yaml");
+        std::fs::write(&style, "id: natural_manga\nname: Natural Manga\n").unwrap();
+        let state = Arc::new(BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            usage_path: dir.path().join("usage.json"),
+            daily_limit: 100,
+            styles_dir: Some(dir.path().to_path_buf()),
+        });
+
+        assert_eq!(load_style_name(&style).as_deref(), Some("Natural Manga"));
+        assert_eq!(
+            resolve_style_file(&state, "natural_manga").as_deref(),
+            Some(style.as_path())
+        );
     }
 
     #[test]

@@ -152,8 +152,9 @@ services:
       - "--model"
       - "/app/models/manga-onnx/manga-colorize-fp16.onnx"
       - "--preset"
-      - "/app/configs/engine.onnx-small.yaml"
-      - "--hint-propagate"
+      - "/app/configs/engine.telegram-cpu.yaml"
+      - "--style"
+      - "/app/configs/styles/natural_manga.yaml"
       - "--daily-limit"
       - "${DAILY_PAGE_LIMIT:-100}"
     environment:

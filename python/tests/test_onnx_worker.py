@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from mangahue_train.onnx_worker import _load_input
+from mangahue_train.onnx_worker import _load_input, _pad_input
 
 
 def test_five_channel_input_normalizes_and_masks_hints(tmp_path: Path) -> None:
@@ -36,3 +36,17 @@ def test_five_channel_input_normalizes_and_masks_hints(tmp_path: Path) -> None:
     np.testing.assert_allclose(tensor[0, 1:4, 0, 0], [0.0, 0.0, 0.0])
     assert tensor[0, 4, 12, 12] == 1.0
     assert tensor[0, 4, 0, 0] == 0.0
+
+
+def test_input_padding_uses_white_lineart_and_empty_hints() -> None:
+    tensor = np.zeros((1, 5, 33, 47), dtype=np.float32)
+    tensor[:, 0, :, :] = 0.4
+
+    padded, original = _pad_input(tensor, 32)
+
+    assert original == (33, 47)
+    assert padded.shape == (1, 5, 64, 64)
+    assert np.all(padded[:, 0, 33:, :] == 1.0)
+    assert np.all(padded[:, 0, :, 47:] == 1.0)
+    assert np.all(padded[:, 1:, 33:, :] == 0.0)
+    assert np.all(padded[:, 1:, :, 47:] == 0.0)

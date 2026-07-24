@@ -48,19 +48,40 @@ def _load_input(request: dict[str, object], channels: int) -> np.ndarray:
     )[None, :, :, :]
 
 
+def _pad_input(tensor: np.ndarray, multiple: int) -> tuple[np.ndarray, tuple[int, int]]:
+    height, width = tensor.shape[-2:]
+    if multiple <= 1:
+        return tensor, (height, width)
+    padded_height = ((height + multiple - 1) // multiple) * multiple
+    padded_width = ((width + multiple - 1) // multiple) * multiple
+    if (padded_height, padded_width) == (height, width):
+        return tensor, (height, width)
+
+    padded = np.zeros(
+        (tensor.shape[0], tensor.shape[1], padded_height, padded_width),
+        dtype=tensor.dtype,
+    )
+    padded[:, :, :height, :width] = tensor
+    padded[:, 0, height:, :] = 1.0
+    padded[:, 0, :, width:] = 1.0
+    return padded, (height, width)
+
+
 def _run_request(
     session: ort.InferenceSession,
     request: dict[str, object],
     channels: int,
     input_name: str,
     output_name: str,
+    spatial_multiple: int,
 ) -> dict[str, object]:
     tensor = _load_input(request, channels).astype(np.float32, copy=False)
+    tensor, (height, width) = _pad_input(tensor, spatial_multiple)
     result = session.run([output_name], {input_name: tensor})[0]
     if result.ndim != 4 or result.shape[0] != 1 or result.shape[1] != 3:
         raise ValueError(f"unexpected ONNX output shape: {result.shape}")
 
-    rgb = np.clip(result[0].transpose(1, 2, 0), 0.0, 1.0)
+    rgb = np.clip(result[0, :, :height, :width].transpose(1, 2, 0), 0.0, 1.0)
     image = Image.fromarray(np.rint(rgb * 255.0).astype(np.uint8), mode="RGB")
     output = Path(str(request["output"]))
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +100,7 @@ def main() -> None:
         raise FileNotFoundError(f"ONNX model not found: {args.model}")
     metadata = json.loads(args.metadata.read_text(encoding="utf-8"))
     channels = int(metadata["input_channels"])
+    spatial_multiple = int(metadata.get("contract", {}).get("spatial_multiple", 1))
 
     threads = max(1, min(args.threads, 8))
     os.environ.setdefault("OMP_NUM_THREADS", str(threads))
@@ -117,6 +139,7 @@ def main() -> None:
                 channels,
                 input_name,
                 output_name,
+                spatial_multiple,
             )
         except Exception as error:
             response = {

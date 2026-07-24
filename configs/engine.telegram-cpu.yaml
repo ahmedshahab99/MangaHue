@@ -1,0 +1,52 @@
+engine:
+  mode: fast
+  parallel_jobs: 1
+  pyramid_enabled: false
+  hint_propagation_enabled: false
+
+preprocess:
+  denoise_enabled: false
+  denoise_strength: 0
+  max_input_dimension: 640
+  line_sharpening: 0.35
+
+layout:
+  tiling_enabled: false
+  tile_size: 640
+  tile_overlap: 0
+
+inference:
+  model_path: models/manga-onnx/manga-colorize-fp16.onnx
+  model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
+  device: cpu
+  batch_size: 1
+  input_size: 640
+  fp16_enabled: false
+  resize_policy: fit
+
+hints:
+  user_hints_enabled: true
+  character_memory_enabled: true
+  style_hints_enabled: false
+  hint_blur_radius: 4.0
+  hint_strength: 1.0
+
+postprocess:
+  restore_lines: false
+  line_strength: 1.12
+  bubble_cleanup: false
+  bleeding_correction: false
+  palette_correction: true
+  final_sharpening: 0.02
+
+output:
+  format: png
+  quality: 95
+  write_report: true
+  write_intermediates: false
+
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.18

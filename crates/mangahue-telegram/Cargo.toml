@@ -17,6 +17,7 @@ mangahue-orchestrator = { path = "../mangahue-orchestrator" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 chrono.workspace = true

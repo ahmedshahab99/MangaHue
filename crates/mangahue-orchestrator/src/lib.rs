@@ -16,7 +16,7 @@ use mangahue_inference::{
 };
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
-use mangahue_postprocess::{finalize, PostprocessInput};
+use mangahue_postprocess::{finalize, reconstruct_full_resolution, PostprocessInput};
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
 use rayon::prelude::*;
@@ -507,6 +507,15 @@ impl MangaHueEngine {
             report.warn(format!(
                 "region lock enforcement completed: {} color pixel(s), {} preserved pixel(s)",
                 lock_report.colorized_pixels, lock_report.preserved_pixels
+            ));
+        }
+        if final_image.dimensions() != manga_image.image.dimensions() {
+            let original_gray = manga_image.image.to_luma8();
+            final_image = reconstruct_full_resolution(&final_image, &original_gray);
+            report.warn(format!(
+                "full-resolution color reconstructed at {}x{}",
+                final_image.width(),
+                final_image.height()
             ));
         }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();

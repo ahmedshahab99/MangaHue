@@ -93,6 +93,44 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     Ok((output, report))
 }
 
+pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayImage) -> RgbImage {
+    if colorized.dimensions() == original_gray.dimensions() {
+        return colorized.clone();
+    }
+
+    let (width, height) = original_gray.dimensions();
+    let mut output = image::imageops::resize(
+        colorized,
+        width,
+        height,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        let original = original_gray.get_pixel(x, y)[0] as f32;
+        let predicted_luma =
+            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        let target_luma = original * 0.68 + predicted_luma * 0.32;
+        let chroma_scale = 0.90;
+
+        for channel in 0..3 {
+            let chroma = pixel[channel] as f32 - predicted_luma;
+            pixel[channel] = (target_luma + chroma * chroma_scale)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+
+        let ink = ((112.0 - original) / 112.0).clamp(0.0, 1.0).powf(1.7);
+        let ink_anchor = ink * 0.94;
+        for channel in 0..3 {
+            pixel[channel] = (pixel[channel] as f32 * (1.0 - ink_anchor) + original * ink_anchor)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    output
+}
+
 pub fn restore_lines(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {
     let strength = strength.clamp(0.0, 2.0);
     for (x, y, pixel) in image.enumerate_pixels_mut() {
@@ -297,23 +335,18 @@ fn lut_lookup(lut: &MangaColorLUT, r: u8, g: u8, b: u8) -> Rgb<u8> {
     let c110 = lut.table[r0 + 1][g0 + 1][b0];
     let c111 = lut.table[r0 + 1][g0 + 1][b0 + 1];
 
-    let i = |a: u8, b: u8, c: u8, d: u8| -> u8 {
-        let ab = a as f32 * (1.0 - rd) + c as f32 * rd;
-        let cd = b as f32 * (1.0 - rd) + d as f32 * rd;
-        (ab * (1.0 - gd) + cd * gd) as u8
+    let lerp = |left: f32, right: f32, amount: f32| left + (right - left) * amount;
+    let channel = |index: usize| {
+        let r0g0 = lerp(c000[index] as f32, c001[index] as f32, bd);
+        let r0g1 = lerp(c010[index] as f32, c011[index] as f32, bd);
+        let r1g0 = lerp(c100[index] as f32, c101[index] as f32, bd);
+        let r1g1 = lerp(c110[index] as f32, c111[index] as f32, bd);
+        let r0 = lerp(r0g0, r0g1, gd);
+        let r1 = lerp(r1g0, r1g1, gd);
+        lerp(r0, r1, rd).round().clamp(0.0, 255.0) as u8
     };
 
-    Rgb([
-        (i(c000[0], c001[0], c100[0], c101[0]) as f32 * (1.0 - bd)
-            + i(c010[0], c011[0], c110[0], c111[0]) as f32 * bd)
-            .clamp(0.0, 255.0) as u8,
-        (i(c000[1], c001[1], c100[1], c101[1]) as f32 * (1.0 - bd)
-            + i(c010[1], c011[1], c110[1], c111[1]) as f32 * bd)
-            .clamp(0.0, 255.0) as u8,
-        (i(c000[2], c001[2], c100[2], c101[2]) as f32 * (1.0 - bd)
-            + i(c010[2], c011[2], c110[2], c111[2]) as f32 * bd)
-            .clamp(0.0, 255.0) as u8,
-    ])
+    Rgb([channel(0), channel(1), channel(2)])
 }
 
 fn apply_lut_grading(
@@ -546,5 +579,39 @@ mod tests {
         assert_eq!(restored, 2);
         assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255]);
         assert_eq!(image.get_pixel(1, 0).0, [120, 80, 60]);
+    }
+
+    #[test]
+    fn full_resolution_reconstruction_restores_dimensions_and_dark_ink() {
+        let colorized = RgbImage::from_pixel(2, 2, Rgb([220, 150, 130]));
+        let mut original = GrayImage::from_pixel(4, 4, Luma([230]));
+        original.put_pixel(1, 1, Luma([0]));
+
+        let restored = reconstruct_full_resolution(&colorized, &original);
+
+        assert_eq!(restored.dimensions(), (4, 4));
+        let ink = restored.get_pixel(1, 1);
+        assert!(ink[0] < 20 && ink[1] < 20 && ink[2] < 20);
+        let color = restored.get_pixel(3, 3);
+        assert!(color[0] > color[1] && color[1] > color[2]);
+    }
+
+    #[test]
+    fn neutral_lut_is_continuous_and_preserves_channel_order() {
+        let style = StyleProfile {
+            saturation: 1.0,
+            contrast: 1.0,
+            brightness: 0.0,
+            ..StyleProfile::default()
+        };
+        let lut = MangaColorLUT::new(&style);
+
+        let low = lut_lookup(&lut, 100, 140, 180);
+        let high = lut_lookup(&lut, 101, 141, 181);
+
+        assert!(low[0] < low[1] && low[1] < low[2]);
+        for channel in 0..3 {
+            assert!((high[channel] as i16 - low[channel] as i16).abs() <= 2);
+        }
     }
 }
