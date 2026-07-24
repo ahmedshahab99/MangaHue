@@ -58,6 +58,7 @@ services:
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
     volumes:
       - mangahue-data:/data
       - ${MANGAHUE_MODEL_DIR:-./models}:/app/models:ro

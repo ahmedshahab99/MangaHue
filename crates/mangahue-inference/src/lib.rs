@@ -7,9 +7,14 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 const SUPPORTED_CONTRACT_ID: &str = "mangahue.colorizer.v1";
+const DEFAULT_WORKER_TIMEOUT_SECONDS: u64 = 180;
+const MIN_WORKER_TIMEOUT_SECONDS: u64 = 5;
+const MAX_WORKER_TIMEOUT_SECONDS: u64 = 1_800;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelContractMetadata {
@@ -151,7 +156,7 @@ struct DdColorWorkerLaunch {
 
 impl DdColorWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let mut child = Command::new(&self.python)
+        let child = Command::new(&self.python)
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.ddcolor_worker")
@@ -173,29 +178,9 @@ impl DdColorWorkerLaunch {
             .stderr(Stdio::inherit())
             .spawn()
             .with_context(|| format!("failed to launch ddcolor worker with '{}'", self.python))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("ddcolor worker stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("ddcolor worker stdout unavailable")?;
-        let mut process = PretrainedWorkerProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        let mut ready = String::new();
-        process
-            .stdout
-            .read_line(&mut ready)
-            .context("ddcolor worker exited before readiness handshake")?;
-        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
-            .with_context(|| format!("invalid ddcolor handshake: {}", ready.trim()))?;
-        if handshake.get("status").and_then(|v| v.as_str()) != Some("ready") {
-            return Err(anyhow!("ddcolor worker did not become ready: {handshake}"));
-        }
+        let mut process =
+            attach_worker_process(child, "ddcolor-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "ddcolor worker")?;
         Ok(process)
     }
 }
@@ -359,7 +344,8 @@ pub fn is_pretrained_model_dir(path: impl AsRef<Path>) -> bool {
 struct PretrainedWorkerProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: mpsc::Receiver<std::result::Result<String, String>>,
+    timeout: Duration,
 }
 
 impl Drop for PretrainedWorkerProcess {
@@ -367,6 +353,112 @@ impl Drop for PretrainedWorkerProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn worker_timeout_from(value: Option<&str>) -> Duration {
+    let seconds = value
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_WORKER_TIMEOUT_SECONDS)
+        .clamp(MIN_WORKER_TIMEOUT_SECONDS, MAX_WORKER_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn configured_worker_timeout() -> Duration {
+    worker_timeout_from(
+        std::env::var("MANGAHUE_MODEL_TIMEOUT_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn attach_worker_process(
+    mut child: Child,
+    worker_name: &'static str,
+    timeout: Duration,
+) -> Result<PretrainedWorkerProcess> {
+    let stdin = child
+        .stdin
+        .take()
+        .with_context(|| format!("{worker_name} stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("{worker_name} stdout unavailable"))?;
+    let (sender, responses) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name(format!("mangahue-{worker_name}-stdout"))
+        .spawn(move || read_worker_stdout(stdout, sender))
+        .with_context(|| format!("failed to start {worker_name} response reader"))?;
+    Ok(PretrainedWorkerProcess {
+        child,
+        stdin,
+        responses,
+        timeout,
+    })
+}
+
+fn read_worker_stdout(
+    stdout: ChildStdout,
+    sender: mpsc::SyncSender<std::result::Result<String, String>>,
+) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = sender.send(Err("worker stdout closed".to_string()));
+                break;
+            }
+            Ok(_) => {
+                if sender.send(Ok(line)).is_err() {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(format!("failed to read worker response: {error}")));
+                break;
+            }
+        }
+    }
+}
+
+fn read_worker_response(
+    process: &mut PretrainedWorkerProcess,
+    phase: &str,
+) -> std::result::Result<String, String> {
+    match process.responses.recv_timeout(process.timeout) {
+        Ok(response) => response,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = process.child.kill();
+            Err(format!(
+                "{phase} timed out after {} seconds; worker terminated",
+                process.timeout.as_secs()
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let status = process
+                .child
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Err(format!(
+                "{phase} failed because worker response channel closed (status: {status})"
+            ))
+        }
+    }
+}
+
+fn wait_for_worker_ready(process: &mut PretrainedWorkerProcess, worker_name: &str) -> Result<()> {
+    let ready = read_worker_response(process, &format!("{worker_name} readiness handshake"))
+        .map_err(anyhow::Error::msg)?;
+    let handshake: serde_json::Value = serde_json::from_str(ready.trim())
+        .with_context(|| format!("invalid {worker_name} handshake: {}", ready.trim()))?;
+    if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
+        anyhow::bail!("{worker_name} did not become ready: {handshake}");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -386,7 +478,7 @@ struct PretrainedWorkerLaunch {
 
 impl PretrainedWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let mut child = Command::new(&self.python)
+        let child = Command::new(&self.python)
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.pretrained_worker")
@@ -411,31 +503,9 @@ impl PretrainedWorkerLaunch {
                     self.python
                 )
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("pretrained worker stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("pretrained worker stdout unavailable")?;
-        let mut process = PretrainedWorkerProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        let mut ready = String::new();
-        process
-            .stdout
-            .read_line(&mut ready)
-            .context("pretrained worker exited before readiness handshake")?;
-        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
-            .with_context(|| format!("invalid pretrained worker handshake: {}", ready.trim()))?;
-        if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
-            return Err(anyhow!(
-                "pretrained worker did not become ready: {handshake}"
-            ));
-        }
+        let mut process =
+            attach_worker_process(child, "pretrained-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "pretrained worker")?;
         Ok(process)
     }
 }
@@ -454,11 +524,7 @@ fn exchange_worker_request(
         .stdin
         .flush()
         .map_err(|error| format!("failed to flush pretrained request: {error}"))?;
-    let mut response_line = String::new();
-    process
-        .stdout
-        .read_line(&mut response_line)
-        .map_err(|error| format!("failed to read pretrained response: {error}"))?;
+    let response_line = read_worker_response(process, "model inference")?;
     if response_line.is_empty() {
         return Err("pretrained worker exited without a response".to_string());
     }
@@ -631,7 +697,7 @@ struct MangaNinjaWorkerLaunch {
 
 impl MangaNinjaWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let mut child = Command::new(&self.python)
+        let child = Command::new(&self.python)
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.manga_ninja_worker")
@@ -656,31 +722,9 @@ impl MangaNinjaWorkerLaunch {
                     self.python
                 )
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("manga-ninja worker stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("manga-ninja worker stdout unavailable")?;
-        let mut process = PretrainedWorkerProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        let mut ready = String::new();
-        process
-            .stdout
-            .read_line(&mut ready)
-            .context("manga-ninja worker exited before readiness handshake")?;
-        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
-            .with_context(|| format!("invalid manga-ninja worker handshake: {}", ready.trim()))?;
-        if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
-            return Err(anyhow!(
-                "manga-ninja worker did not become ready: {handshake}"
-            ));
-        }
+        let mut process =
+            attach_worker_process(child, "manga-ninja-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "manga-ninja worker")?;
         Ok(process)
     }
 }
@@ -922,7 +966,7 @@ struct OnnxWorkerLaunch {
 
 impl OnnxWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let mut child = Command::new(&self.python)
+        let child = Command::new(&self.python)
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.onnx_worker")
@@ -945,29 +989,8 @@ impl OnnxWorkerLaunch {
                     self.python
                 )
             })?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("ONNX worker stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("ONNX worker stdout unavailable")?;
-        let mut process = PretrainedWorkerProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
-        let mut ready = String::new();
-        process
-            .stdout
-            .read_line(&mut ready)
-            .context("ONNX worker exited before readiness handshake")?;
-        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
-            .with_context(|| format!("invalid ONNX worker handshake: {}", ready.trim()))?;
-        if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
-            anyhow::bail!("ONNX worker did not become ready: {handshake}");
-        }
+        let mut process = attach_worker_process(child, "onnx-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "ONNX worker")?;
         Ok(process)
     }
 }
@@ -1296,5 +1319,52 @@ mod tests {
         fs::create_dir_all(dir.path().join("denoising/models")).unwrap();
         fs::write(dir.path().join("denoising/models/net_rgb.pth"), "weights").unwrap();
         assert!(is_pretrained_model_dir(dir.path()));
+    }
+
+    #[test]
+    fn worker_timeout_is_bounded_and_has_a_safe_default() {
+        assert_eq!(
+            worker_timeout_from(None),
+            Duration::from_secs(DEFAULT_WORKER_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            worker_timeout_from(Some("1")),
+            Duration::from_secs(MIN_WORKER_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            worker_timeout_from(Some("99999")),
+            Duration::from_secs(MAX_WORKER_TIMEOUT_SECONDS)
+        );
+        assert_eq!(worker_timeout_from(Some("45")), Duration::from_secs(45));
+        assert_eq!(
+            worker_timeout_from(Some("not-a-number")),
+            Duration::from_secs(DEFAULT_WORKER_TIMEOUT_SECONDS)
+        );
+    }
+
+    #[test]
+    fn stalled_worker_is_terminated_at_deadline() {
+        #[cfg(windows)]
+        let child = Command::new("cmd")
+            .args(["/C", "ping 127.0.0.1 -n 30 >NUL"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        #[cfg(unix)]
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut process =
+            attach_worker_process(child, "deadline-test", Duration::from_millis(25)).unwrap();
+        let error = read_worker_response(&mut process, "test inference").unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(process.child.wait().unwrap().code().unwrap_or(-1) != 0);
     }
 }

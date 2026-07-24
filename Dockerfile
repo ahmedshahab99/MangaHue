@@ -56,7 +56,7 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles", "--public-api"]
 
 # ── Compact ONNX CPU runtime (models mounted at runtime) ─────────────────
 FROM python:3.12-slim-bookworm AS runtime-small
@@ -97,4 +97,4 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles", "--public-api"]

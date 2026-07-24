@@ -591,6 +591,11 @@ struct ServeArgs {
     studio_dir: PathBuf,
     #[arg(long, default_value = ".mangahue/production.db")]
     production_db: PathBuf,
+    #[arg(
+        long,
+        help = "Expose only authenticated v1 routes; disable local operator APIs"
+    )]
+    public_api: bool,
 }
 
 fn main() -> Result<()> {
@@ -1750,6 +1755,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         styles_dir: args.styles_dir,
         studio_dir: args.studio_dir,
         production_db: args.production_db,
+        public_api: args.public_api,
     }))
 }
 

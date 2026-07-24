@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -192,6 +192,7 @@ pub struct ApiServerConfig {
     pub styles_dir: PathBuf,
     pub studio_dir: PathBuf,
     pub production_db: PathBuf,
+    pub public_api: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,20 +446,31 @@ struct JobUpdate {
 }
 
 #[derive(Debug)]
-pub struct ApiError(anyhow::Error);
+pub struct ApiError(StatusCode, anyhow::Error);
 
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        Self(error)
+        Self(StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
+}
+
+impl ApiError {
+    fn with_status(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
+        Self(status, error.into())
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(ApiErrorBody {
-            error: self.0.to_string(),
-        });
-        (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+        let ApiError(status, error) = self;
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            tracing::error!(error = %error, "API request failed");
+            "internal server error".to_string()
+        } else {
+            error.to_string()
+        };
+        let body = Json(ApiErrorBody { error: message });
+        (status, body).into_response()
     }
 }
 
@@ -475,7 +487,7 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         event_channels: Arc::new(RwLock::new(HashMap::new())),
         production,
     };
-    let app = router(state);
+    let app = router_with_mode(state, config.public_api);
     let listener = TcpListener::bind(config.addr).await?;
     info!("MangaHue API listening on http://{}", config.addr);
     axum::serve(listener, app)
@@ -485,73 +497,81 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
 }
 
 pub fn router(state: ApiState) -> Router {
+    router_with_mode(state, false)
+}
+
+pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
     let studio_dir = state.studio_dir.clone();
-    Router::new()
+    let public_routes = Router::new()
         .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route(
-            "/api/doctor",
-            get(run_doctor_default).post(run_doctor_custom),
-        )
-        .route("/api/styles", get(list_styles))
-        .route("/api/file", get(get_local_file))
-        .route("/api/inspect", post(inspect_page))
-        .route("/api/colorize", post(create_colorize_job))
-        .route("/api/batch", post(create_batch_job))
-        .route("/api/link/ingest", post(ingest_link))
-        .route("/api/link/colorize", post(create_link_colorize_job))
-        .route("/api/chapter/import", post(import_chapter))
-        .route("/api/chapter/export", post(export_chapter))
-        .route("/api/chapter/colorize", post(create_chapter_colorize_job))
-        .route(
-            "/api/brain/palette-memory",
-            post(create_palette_memory_from_report),
-        )
-        .route("/api/brain/palette-memory/edit", post(edit_palette_memory))
-        .route(
-            "/api/brain/region-locks/preview",
-            post(preview_region_locks),
-        )
-        .route("/api/brain/region-locks/save", post(save_region_locks))
-        .route("/api/brain/semantics", post(analyze_page_semantics))
-        .route("/api/brain/characters/track", post(track_page_characters))
-        .route("/api/brain/dataset/curate", post(curate_training_dataset))
-        .route("/api/jobs", get(list_jobs))
-        .route("/api/jobs/:id", get(get_job))
-        .route("/api/jobs/:id/events", get(job_events_sse))
-        .route("/api/jobs/:id/cancel", post(cancel_job))
-        .route("/api/jobs/:id/result", get(get_job_result))
         .route(
             "/api/v1/jobs",
             get(list_durable_jobs).post(create_durable_job),
         )
         .route("/api/v1/jobs/:id", get(get_durable_job))
         .route("/api/v1/jobs/:id/cancel", post(cancel_durable_job))
-        .route("/api/v1/quota", get(get_quota))
-        .route("/api/projects", post(create_project))
-        .route("/api/projects/status", post(project_status))
-        .route("/api/projects/export-corrections", post(export_corrections))
-        .route(
-            "/api/projects/export-hints",
-            post(export_correction_hints_file),
-        )
-        .route(
-            "/api/projects/export-training-manifest",
-            post(export_training_manifest),
-        )
-        .route("/api/projects/characters", post(create_character_profile))
-        .route(
-            "/api/projects/:project_id/characters",
-            post(create_character_profile_for_project),
-        )
-        .route("/api/corrections", post(add_project_correction))
-        .fallback_service(
-            ServeDir::new(&studio_dir)
-                .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
-        )
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .route("/api/v1/quota", get(get_quota));
+    let app = if public_api {
+        public_routes
+    } else {
+        public_routes
+            .route("/metrics", get(metrics))
+            .route(
+                "/api/doctor",
+                get(run_doctor_default).post(run_doctor_custom),
+            )
+            .route("/api/styles", get(list_styles))
+            .route("/api/file", get(get_local_file))
+            .route("/api/inspect", post(inspect_page))
+            .route("/api/colorize", post(create_colorize_job))
+            .route("/api/batch", post(create_batch_job))
+            .route("/api/link/ingest", post(ingest_link))
+            .route("/api/link/colorize", post(create_link_colorize_job))
+            .route("/api/chapter/import", post(import_chapter))
+            .route("/api/chapter/export", post(export_chapter))
+            .route("/api/chapter/colorize", post(create_chapter_colorize_job))
+            .route(
+                "/api/brain/palette-memory",
+                post(create_palette_memory_from_report),
+            )
+            .route("/api/brain/palette-memory/edit", post(edit_palette_memory))
+            .route(
+                "/api/brain/region-locks/preview",
+                post(preview_region_locks),
+            )
+            .route("/api/brain/region-locks/save", post(save_region_locks))
+            .route("/api/brain/semantics", post(analyze_page_semantics))
+            .route("/api/brain/characters/track", post(track_page_characters))
+            .route("/api/brain/dataset/curate", post(curate_training_dataset))
+            .route("/api/jobs", get(list_jobs))
+            .route("/api/jobs/:id", get(get_job))
+            .route("/api/jobs/:id/events", get(job_events_sse))
+            .route("/api/jobs/:id/cancel", post(cancel_job))
+            .route("/api/jobs/:id/result", get(get_job_result))
+            .route("/api/projects", post(create_project))
+            .route("/api/projects/status", post(project_status))
+            .route("/api/projects/export-corrections", post(export_corrections))
+            .route(
+                "/api/projects/export-hints",
+                post(export_correction_hints_file),
+            )
+            .route(
+                "/api/projects/export-training-manifest",
+                post(export_training_manifest),
+            )
+            .route("/api/projects/characters", post(create_character_profile))
+            .route(
+                "/api/projects/:project_id/characters",
+                post(create_character_profile_for_project),
+            )
+            .route("/api/corrections", post(add_project_correction))
+            .fallback_service(
+                ServeDir::new(&studio_dir)
+                    .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
+            )
+            .layer(CorsLayer::permissive())
+    };
+    app.layer(TraceLayer::new_for_http()).with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -624,7 +644,7 @@ async fn get_durable_job(
         .production
         .job(&id)?
         .filter(|job| job.user_id == user.id || user.tier == mangahue_production::UserTier::Admin)
-        .context("job not found")?;
+        .ok_or_else(|| ApiError::with_status(StatusCode::NOT_FOUND, anyhow!("job not found")))?;
     Ok(Json(job))
 }
 
@@ -646,19 +666,38 @@ async fn get_quota(
     Ok(Json(state.production.quota_snapshot(&user.id)?))
 }
 
-fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<UserAccount> {
+fn authenticated_user(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> std::result::Result<UserAccount, ApiError> {
     let value = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .context("missing Authorization header")?;
+        .ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("missing Authorization header"),
+            )
+        })?;
     let token = value
         .strip_prefix("Bearer ")
         .or_else(|| value.strip_prefix("bearer "))
-        .context("Authorization must use Bearer token")?;
+        .ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Authorization must use Bearer token"),
+            )
+        })?;
     let user = state
         .production
-        .authenticate(token)?
-        .context("invalid or expired API token")?;
+        .authenticate(token)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("invalid or expired API token"),
+            )
+        })?;
     let requests_per_minute = match user.tier {
         mangahue_production::UserTier::Free => 30,
         mangahue_production::UserTier::Creator => 120,
@@ -667,7 +706,8 @@ fn authenticated_user(state: &ApiState, headers: &HeaderMap) -> Result<UserAccou
     };
     state
         .production
-        .enforce_rate_limit(&user.id, requests_per_minute, 60)?;
+        .enforce_rate_limit(&user.id, requests_per_minute, 60)
+        .map_err(|error| ApiError::with_status(StatusCode::TOO_MANY_REQUESTS, error))?;
     Ok(user)
 }
 
@@ -1253,9 +1293,10 @@ async fn edit_palette_memory(
     let mut memory = load_palette_memory(&payload.memory_path)?;
     for edit in payload.edits {
         if !mangahue_brain::apply_palette_memory_edit(&mut memory, edit) {
-            return Err(ApiError(anyhow::anyhow!(
-                "palette memory entry was not found"
-            )));
+            return Err(ApiError::with_status(
+                StatusCode::NOT_FOUND,
+                anyhow!("palette memory entry was not found"),
+            ));
         }
     }
     let output_path = payload
@@ -2146,6 +2187,9 @@ async fn cancel_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[test]
     fn job_manifest_round_trips() {
@@ -2180,5 +2224,57 @@ mod tests {
         assert!(routes.contains(&"POST /api/brain/palette-memory"));
         assert!(routes.contains(&"POST /api/brain/palette-memory/edit"));
         assert!(routes.contains(&"POST /api/brain/region-locks/preview"));
+    }
+
+    #[tokio::test]
+    async fn public_router_exposes_health_but_hides_local_operator_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ApiState {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            jobs_dir: dir.path().join("jobs"),
+            styles_dir: dir.path().join("styles"),
+            studio_dir: dir.path().join("studio"),
+            cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
+        };
+        let app = router_with_mode(state, true);
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        for path in ["/api/file?path=Cargo.toml", "/api/doctor", "/metrics", "/"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must not be exposed in public mode"
+            );
+        }
     }
 }

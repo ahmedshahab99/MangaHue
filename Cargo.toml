@@ -59,6 +59,7 @@ tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower = { version = "0.5", features = ["util"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
 scraper = "0.23"
 url = "2.5"

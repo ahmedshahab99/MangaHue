@@ -54,6 +54,7 @@ services:
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
       MANGAHUE_PYTHON: ${MANGAHUE_PYTHON:-python}
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
     volumes:
       - mangahue-data:/data
       - mangahue-models:/app/models:ro
@@ -104,6 +105,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
       CLEANUP_AFTER_HOURS: ${CLEANUP_AFTER_HOURS:-24}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
     volumes:
@@ -158,6 +160,7 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
       CLEANUP_AFTER_HOURS: ${CLEANUP_AFTER_HOURS:-24}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
     volumes:

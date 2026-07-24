@@ -112,8 +112,14 @@ docker compose up -d
 | `ADMIN_CHAT_ID` | No | - | Telegram ID for alerts |
 | `DAILY_PAGE_LIMIT` | No | `100` | Max pages/user/day |
 | `MANGAHUE_MODEL_THREADS` | No | `2` | Python thread count |
+| `MANGAHUE_MODEL_TIMEOUT_SECONDS` | No | `180` | Kill and restart a stalled model worker |
 | `CLEANUP_AFTER_HOURS` | No | `24` | Auto-delete old job data |
 | `RUST_LOG` | No | `mangahue=info` | Log level |
+
+The Docker API starts with `--public-api`. This exposes only `/health` and the
+authenticated `/api/v1/*` job routes. Local file access, metrics, Studio, and
+operator APIs remain available for trusted local development by running
+`mangahue-api` without `--public-api`.
 
 ## Monitoring
 
@@ -177,7 +183,7 @@ checkpoints/
 | Problem | Solution |
 |---------|----------|
 | Bot not responding | Check `TELEGRAM_BOT_TOKEN` in `.env` |
-| "No model found" | Verify model in `/opt/mangahue/models/pretrained/` |
+| "No model found" | Verify `models/manga-onnx/manga-colorize-fp16.onnx` |
 | OOM errors | Increase swap: `fallocate -l 4G /swapfile` |
 | Slow colorization | Reduce `MANGAHUE_MODEL_THREADS` to 1 |
 | Disk full | Run `/clean` in bot or wait for cron cleanup |
