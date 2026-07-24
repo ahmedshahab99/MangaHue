@@ -108,10 +108,16 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
 
     for (x, y, pixel) in output.enumerate_pixels_mut() {
         let original = original_gray.get_pixel(x, y)[0] as f32;
+        let left = original_gray.get_pixel(x.saturating_sub(1), y)[0] as f32;
+        let right = original_gray.get_pixel((x + 1).min(width - 1), y)[0] as f32;
+        let top = original_gray.get_pixel(x, y.saturating_sub(1))[0] as f32;
+        let bottom = original_gray.get_pixel(x, (y + 1).min(height - 1))[0] as f32;
+        let gradient = (right - left).abs() + (bottom - top).abs();
+        let edge = ((gradient - 18.0) / 90.0).clamp(0.0, 1.0);
         let predicted_luma =
             0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
         let target_luma = original * 0.68 + predicted_luma * 0.32;
-        let chroma_scale = 0.90;
+        let chroma_scale = 0.90 * (1.0 - edge * 0.76);
 
         for channel in 0..3 {
             let chroma = pixel[channel] as f32 - predicted_luma;
@@ -594,6 +600,24 @@ mod tests {
         assert!(ink[0] < 20 && ink[1] < 20 && ink[2] < 20);
         let color = restored.get_pixel(3, 3);
         assert!(color[0] > color[1] && color[1] > color[2]);
+    }
+
+    #[test]
+    fn full_resolution_reconstruction_suppresses_edge_chroma() {
+        let colorized = RgbImage::from_pixel(2, 2, Rgb([230, 70, 40]));
+        let mut original = GrayImage::from_pixel(4, 4, Luma([230]));
+        for y in 0..4 {
+            original.put_pixel(0, y, Luma([40]));
+            original.put_pixel(1, y, Luma([40]));
+        }
+
+        let restored = reconstruct_full_resolution(&colorized, &original);
+        let edge = restored.get_pixel(2, 2);
+        let interior = restored.get_pixel(3, 2);
+        let edge_chroma = edge.0.iter().max().unwrap() - edge.0.iter().min().unwrap();
+        let interior_chroma = interior.0.iter().max().unwrap() - interior.0.iter().min().unwrap();
+
+        assert!(edge_chroma < interior_chroma);
     }
 
     #[test]
