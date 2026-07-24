@@ -25,6 +25,7 @@ mangahue-validate-onnx = "mangahue_train.validate_onnx:main"
 mangahue-prepare-dataset = "mangahue_train.prepare_dataset:main"
 mangahue-audit-dataset = "mangahue_train.audit_dataset:main"
 mangahue-evaluate = "mangahue_train.evaluate:main"
+mangahue-benchmark-quality = "mangahue_train.benchmark_quality:main"
 
 [build-system]
 requires = ["setuptools>=68"]
