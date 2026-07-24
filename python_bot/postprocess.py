@@ -140,7 +140,7 @@ def _build_grading_lut() -> np.ndarray:
 
     # (d) Midtone warmth — subtle +2 red in 40–60 % luminance
     mt = np.maximum(0.0, 1.0 - np.abs(lp - 0.50) / 0.10)
-    rgb[..., 0] += mt * 2.0
+    rgb[..., 0] += mt * 0.0  # neutral — no color shift
 
     _GRADING_LUT = np.clip(rgb, 0.0, 255.0).astype(np.float32)
     return _GRADING_LUT
@@ -276,28 +276,6 @@ def apply_manga_pipeline(
 
     # ---- Stage 9: Local Contrast Enhancement (CLAHE) ------------------------
     rgb = _clahe_enhance(rgb)
-
-    # ---- Stage 10: LAB-based Colour Harmonization ---------------------------
-    u8_clipped = np.clip(rgb, 0, 255).astype(np.uint8)
-    lab = cv2.cvtColor(u8_clipped, cv2.COLOR_RGB2LAB).astype(np.float64)
-    l_ch = lab[..., 0]
-    a_ch = lab[..., 1]
-    b_ch = lab[..., 2]
-
-    a_mean = a_ch.mean()
-    b_mean = b_ch.mean()
-    a_dist = a_mean - 128.0
-    b_dist = b_mean - 128.0
-
-    a_ch = a_ch - a_dist * 0.35
-    b_ch = b_ch - b_dist * 0.35
-
-    lab_harm = cv2.merge([
-        np.clip(l_ch, 0, 255).astype(np.uint8),
-        np.clip(a_ch, 0, 255).astype(np.uint8),
-        np.clip(b_ch, 0, 255).astype(np.uint8),
-    ])
-    rgb = cv2.cvtColor(lab_harm, cv2.COLOR_LAB2RGB).astype(np.float64)
 
     # ---- Stage 11: Output Sharpening ----------------------------------------
     blurred = cv2.GaussianBlur(rgb.astype(np.float32), (0, 0), 1.2)

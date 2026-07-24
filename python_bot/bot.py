@@ -214,8 +214,8 @@ class Colorizer:
         hm, hk = gen.generate(np.array(img))
         hm_pil = PILImage.fromarray(hm)
         hk_pil = PILImage.fromarray(hk)
-        hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=6))
-        hk_pil = hk_pil.filter(ImageFilter.GaussianBlur(radius=6))
+        hm_pil = hm_pil.filter(ImageFilter.GaussianBlur(radius=12))
+        hk_pil = hk_pil.filter(ImageFilter.GaussianBlur(radius=12))
         hm = np.array(hm_pil)
         hk = np.array(hk_pil)
 
@@ -504,7 +504,7 @@ async def _handle_retry_page(u, c, q, data: str):
 
     try:
         async with MangaDownloader() as dl:
-            saved = await dl.download_batch([url], str(dl_dir), start=1)
+            saved = await dl.download_batch([url], str(dl_dir), start_index=1)
             if not saved:
                 await safe_send(q.edit_message_text, f"Download failed for page {page_idx + 1}.")
                 _mark_page_retried(failed_fp, page_idx, False)
@@ -600,7 +600,7 @@ async def _handle_retry_all(u, c, q, data: str):
             for page_idx, url in sorted(pending):
                 if evt.is_set():
                     break
-                saved = await dl.download_batch([url], str(dl_dir), start=1)
+                saved = await dl.download_batch([url], str(dl_dir), start_index=1)
                 if not saved:
                     failed += 1
                     _mark_page_retried(failed_fp, page_idx, False)
@@ -881,7 +881,7 @@ async def _process(u, c, url: str, cid: int, cancel: asyncio.Event):
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
-                        saved = await dl.download_batch(urls[b0:b1], str(dl_dir), start=b0 + 1)
+                        saved = await dl.download_batch(urls[b0:b1], str(dl_dir), start_index=b0 + 1)
                         break
                     except Exception:
                         if attempt < max_retries - 1:

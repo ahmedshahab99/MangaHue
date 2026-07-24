@@ -43,7 +43,7 @@ _CLOTH_NEUT  = np.float32([
     [185,168,148],[165,148,130],[200,185,165],
     [148,128,118],[72,50,44],[90,118,160],
 ])
-_BACKGROUND  = np.float32([[248,246,240],[240,236,228],[235,230,220],[250,248,244]])
+_BACKGROUND  = np.float32([[210,205,198],[200,195,188],[215,210,203]])
 _EYES        = np.float32([[28,38,105],[68,142,178],[42,88,160],[35,50,120]])
 _CLOTH_SUB   = [_CLOTH_WARM,_CLOTH_COOL,_CLOTH_EARTH,_CLOTH_GREEN,_CLOTH_NEUT]
 
@@ -251,10 +251,10 @@ class AdvancedHintGenerator:
             if 0 <= mx2 < mx1 <= w:
                 mp = gf[cy1:cy2, mx2:mx1]
                 if mp.size > 0 and mp.shape == pg.shape:
-                    a, b = mp.ravel(), pg.ravel()
-                    d = np.std(a) * np.std(b)
+                    mp_flat, pg_flat = mp.ravel(), pg.ravel()
+                    d = np.std(mp_flat) * np.std(pg_flat)
                     if d > 1e-6:
-                        sym = np.corrcoef(a, b)[0, 1]
+                        sym = np.corrcoef(mp_flat, pg_flat)[0, 1]
 
             sc = {k: 0.0 for k in ORD}
 

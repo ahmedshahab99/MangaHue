@@ -11,6 +11,7 @@ from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -169,9 +170,10 @@ async def _extract_nhentai(url: str, session: aiohttp.ClientSession, max_pages: 
 
     pages_map: dict[int, str] = {}
 
-    # Strategy 1: scrape CDN images from HTML (fastest)
+    # Strategy 1: scrape CDN images from HTML (use mirror to bypass Cloudflare)
+    mirror = url.replace("nhentai.net", "nhentai.to")
     try:
-        async with session.get(url, timeout=HTML_TIMEOUT) as resp:
+        async with session.get(mirror, timeout=HTML_TIMEOUT) as resp:
             html = await resp.text()
     except Exception as exc:
         logger.warning("nhentai HTML fetch failed for %s: %s", url, exc)
