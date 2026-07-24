@@ -258,6 +258,7 @@ class Colorizer:
         h, w = arr.shape
         hf = hm.astype(np.float32) / 255.0
         hkf = hk.astype(np.float32) / 255.0
+        hf = ((hf - 0.5) / 0.5) * hkf[:, :, None]
         ph, pw = ((h + 31) // 32) * 32, ((w + 31) // 32) * 32
         t = np.zeros((1, 5, ph, pw), dtype=np.float32)
         t[0, 0, :h, :w] = arr

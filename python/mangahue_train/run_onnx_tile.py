@@ -34,10 +34,11 @@ def main() -> None:
         hint_mask = np.asarray(Image.open(args.hint_mask).convert("L"), dtype=np.float32) / 255.0
         if hint_map.shape[:2] != (h, w) or hint_mask.shape != (h, w):
             raise SystemExit("hint map/mask dimensions do not match lineart")
+        normalized_hints = ((hint_map - 0.5) / 0.5) * hint_mask[:, :, None]
         x = np.concatenate(
             [
                 lineart[None, :, :],
-                hint_map.transpose(2, 0, 1),
+                normalized_hints.transpose(2, 0, 1),
                 hint_mask[None, :, :],
             ],
             axis=0,

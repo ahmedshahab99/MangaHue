@@ -108,7 +108,18 @@ mkdir -p /var/log/mangahue
 # ── 7. App directory ─────────────────────────────────────────────────────
 APP_DIR="/opt/mangahue"
 log "Creating app directory: $APP_DIR"
-mkdir -p "$APP_DIR/models/pretrained/manga-colorization-v2"
+MODEL_DIR="$APP_DIR/models/manga-onnx"
+MODEL_PATH="$MODEL_DIR/manga-colorize-fp16.onnx"
+MODEL_URL="https://huggingface.co/Faridzar/manga-colorization-v2-onnx/resolve/main/manga-colorize-fp16.onnx"
+MODEL_SHA256="39660d0047ea6f1a0ddee6aa89054997f95ea566f4d56ff762f66dbcf1a1a7ef"
+mkdir -p "$MODEL_DIR"
+if [ ! -f "$MODEL_PATH" ] || ! echo "$MODEL_SHA256  $MODEL_PATH" | sha256sum --check --status; then
+  log "Downloading compact MangaHue ONNX model..."
+  curl -fL --retry 3 "$MODEL_URL" -o "$MODEL_PATH.partial"
+  echo "$MODEL_SHA256  $MODEL_PATH.partial" | sha256sum --check --status \
+    || { rm -f "$MODEL_PATH.partial"; err "ONNX model checksum mismatch"; }
+  mv "$MODEL_PATH.partial" "$MODEL_PATH"
+fi
 
 # Write .env from env var (optional) or create a placeholder
 if [ ! -f "$APP_DIR/.env" ]; then
@@ -213,9 +224,9 @@ services:
       - "--max-concurrent-jobs"
       - "1"
       - "--model"
-      - "/app/models/pretrained/manga-colorization-v2"
+      - "/app/models/manga-onnx/manga-colorize-fp16.onnx"
       - "--preset"
-      - "/app/configs/engine.pretrained-small.yaml"
+      - "/app/configs/engine.onnx-small.yaml"
       - "--hint-propagate"
       - "--daily-page-limit"
       - "${DAILY_PAGE_LIMIT:-100}"
@@ -353,7 +364,12 @@ log "Cron jobs installed."
 # ── 12. Start services ───────────────────────────────────────────────────
 log "Starting MangaHue services..."
 cd "$APP_DIR"
-docker compose up -d 2>/dev/null || docker compose up -d
+if grep -Eq '^TELEGRAM_BOT_TOKEN=.+$' "$APP_DIR/.env" \
+  && ! grep -q '^TELEGRAM_BOT_TOKEN=__FILL_ME_IN__$' "$APP_DIR/.env"; then
+  docker compose --profile telegram-small up -d telegram-small
+else
+  warn "Telegram token is not configured; services were installed but not started."
+fi
 
 sleep 5
 log "Container status:"
@@ -370,11 +386,10 @@ echo "  1. Edit $APP_DIR/.env and set:"
 echo "     - TELEGRAM_BOT_TOKEN  (from @BotFather)"
 echo "     - ADMIN_CHAT_ID       (your Telegram chat ID)"
 echo ""
-echo "  2. Copy your pretrained model:"
-echo "     scp -r models/pretrained/ user@host:$APP_DIR/models/pretrained/"
+echo "  2. The compact ONNX model was downloaded and checksum-verified automatically."
 echo ""
 echo "  3. Restart services after .env changes:"
-echo "     cd $APP_DIR && docker compose down && docker compose up -d"
+echo "     cd $APP_DIR && docker compose --profile telegram-small up -d telegram-small"
 echo ""
 echo "  4. View logs:"
 echo "     cd $APP_DIR && docker compose logs -f --tail=50"

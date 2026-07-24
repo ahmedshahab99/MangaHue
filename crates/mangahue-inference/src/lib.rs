@@ -77,10 +77,8 @@ impl ModelMetadata {
                     contract.contract_id
                 ));
             }
-            if contract.input_name != "image_input" || contract.output_name != "color_output" {
-                return Err(anyhow!(
-                    "model tensor names do not match the runtime contract"
-                ));
+            if contract.input_name.trim().is_empty() || contract.output_name.trim().is_empty() {
+                return Err(anyhow!("model tensor names cannot be empty"));
             }
             if contract
                 .input_channels
@@ -915,17 +913,81 @@ impl ColorizationBackend for MockColorizationBackend {
 }
 
 #[derive(Debug, Clone)]
-pub struct OnnxColorizationBackend {
+struct OnnxWorkerLaunch {
     model_path: PathBuf,
-    metadata: ModelMetadata,
     metadata_path: PathBuf,
     python: String,
+    worker_threads: usize,
+}
+
+impl OnnxWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let mut child = Command::new(&self.python)
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.onnx_worker")
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--metadata")
+            .arg(&self.metadata_path)
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to launch persistent ONNX worker with '{}'",
+                    self.python
+                )
+            })?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("ONNX worker stdin unavailable")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("ONNX worker stdout unavailable")?;
+        let mut process = PretrainedWorkerProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        let mut ready = String::new();
+        process
+            .stdout
+            .read_line(&mut ready)
+            .context("ONNX worker exited before readiness handshake")?;
+        let handshake: serde_json::Value = serde_json::from_str(ready.trim())
+            .with_context(|| format!("invalid ONNX worker handshake: {}", ready.trim()))?;
+        if handshake.get("status").and_then(|value| value.as_str()) != Some("ready") {
+            anyhow::bail!("ONNX worker did not become ready: {handshake}");
+        }
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+struct OnnxWorkerState {
+    launch: OnnxWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnnxColorizationBackend {
+    metadata: ModelMetadata,
+    worker: Arc<OnnxWorkerState>,
 }
 
 impl OnnxColorizationBackend {
     pub fn new(model_path: impl AsRef<Path>, metadata_path: impl AsRef<Path>) -> Result<Self> {
         let model_path = model_path.as_ref();
-        if !model_path.exists() {
+        if !model_path.is_file() {
             return Err(anyhow!(
                 "model path does not exist: {}",
                 model_path.display()
@@ -934,28 +996,56 @@ impl OnnxColorizationBackend {
         let metadata_path = metadata_path.as_ref();
         let metadata = ModelMetadata::load(metadata_path)?;
         let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
-        let status = std::process::Command::new(&python)
-            .arg("--version")
-            .output()
-            .map_err(|e| {
-                anyhow!(
-                    "Python executable '{}' not found or not runnable: {}. Set MANGAHUE_PYTHON.",
-                    python,
-                    e
-                )
-            })?;
-        if !status.status.success() {
-            return Err(anyhow!(
-                "Python executable '{}' failed version check",
-                python
-            ));
-        }
-        Ok(Self {
-            model_path: model_path.to_path_buf(),
-            metadata_path: metadata_path.to_path_buf(),
-            metadata,
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let model_path = model_path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve ONNX model {}", model_path.display()))?;
+        let metadata_path = metadata_path.canonicalize().with_context(|| {
+            format!(
+                "failed to resolve ONNX metadata {}",
+                metadata_path.display()
+            )
+        })?;
+        let key = format!(
+            "{}|{}|{}|{}",
+            model_path.display(),
+            metadata_path.display(),
             python,
-        })
+            worker_threads
+        );
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<OnnxWorkerState>>>> = OnceLock::new();
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|error| anyhow!("ONNX worker registry poisoned: {error}"))?;
+        let worker = if let Some(worker) = workers.get(&key) {
+            Arc::clone(worker)
+        } else {
+            let launch = OnnxWorkerLaunch {
+                model_path,
+                metadata_path,
+                python,
+                worker_threads,
+            };
+            let process = launch.spawn()?;
+            let worker = Arc::new(OnnxWorkerState {
+                launch,
+                process: Mutex::new(process),
+            });
+            workers.insert(key, Arc::clone(&worker));
+            worker
+        };
+        if metadata.input_channels != 1 && metadata.input_channels != 5 {
+            anyhow::bail!(
+                "persistent ONNX backend supports 1 or 5 input channels, got {}",
+                metadata.input_channels
+            );
+        }
+        Ok(Self { metadata, worker })
     }
 }
 
@@ -989,39 +1079,40 @@ impl ColorizationBackend for OnnxColorizationBackend {
             EngineError::Inference(format!("failed to save hint mask tile: {error}"))
         })?;
 
-        let status = Command::new(&self.python)
-            .arg("-m")
-            .arg("mangahue_train.run_onnx_tile")
-            .arg("--model")
-            .arg(&self.model_path)
-            .arg("--metadata")
-            .arg(&self.metadata_path)
-            .arg("--lineart")
-            .arg(&lineart_path)
-            .arg("--hint-map")
-            .arg(&hint_map_path)
-            .arg("--hint-mask")
-            .arg(&hint_mask_path)
-            .arg("--output")
-            .arg(&output_path)
-            .output()
-            .map_err(|error| {
-                EngineError::Inference(format!(
-                    "failed to start Python ONNX backend with '{}': {error}. Install python package from ./python or set MANGAHUE_PYTHON.",
-                    self.python
-                ))
-            })?;
-
-        if !status.status.success() {
-            let stderr = String::from_utf8_lossy(&status.stderr);
-            let stdout = String::from_utf8_lossy(&status.stdout);
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "hint_map": hint_map_path,
+            "hint_mask": hint_mask_path,
+            "output": output_path,
+        });
+        let mut process = self.worker.process.lock().map_err(|error| {
+            EngineError::Inference(format!("ONNX worker lock poisoned: {error}"))
+        })?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.worker.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "ONNX worker failed ({first_error}) and restart failed: {restart_error:#}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "ONNX worker failed after one restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
             return Err(EngineError::Inference(format!(
-                "Python ONNX backend failed for {} ({} v{}): {}\n{}",
-                self.model_path.display(),
+                "persistent ONNX backend failed ({} v{}): {}",
                 self.metadata.model_name,
                 self.metadata.version,
-                stderr.trim(),
-                stdout.trim()
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown ONNX worker error")
             )));
         }
 

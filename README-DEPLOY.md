@@ -22,13 +22,13 @@ Telegram User → Bot API → mangahue-telegram (Rust)
 
 | Backend | Quality | Hardware | Speed | Model Size |
 |---------|---------|----------|-------|------------|
-| **manga-colorization-v2** (pretrained-small) | Good | CPU, 2GB+ RAM | ~10-15s/tile | ~140MB |
+| **manga-colorization-v2 FP16 ONNX** | Good | CPU, 2GB+ RAM | ~4-15s/tile | ~62MB |
 | **MangaNinja** (CVPR 2025) | Stunning | GPU, 12GB+ VRAM | ~5s/tile | ~12GB |
 
 ## Quick Start (VPS)
 
 ### 1. Prerequisites
-- Ubuntu 22.04/24.04 VPS with **4GB+ RAM** (8GB recommended)
+- Ubuntu 22.04/24.04 VPS with **2GB+ RAM** for one compact worker
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - Your private GitHub repo access token (for GHCR)
 
@@ -40,19 +40,16 @@ ssh user@vps
 sudo bash /tmp/setup-vps.sh
 ```
 
-### 3. Upload Model
-```bash
-# From your local machine:
-scp -r models/pretrained/manga-colorization-v2 user@vps:/opt/mangahue/models/pretrained/
-```
+### 3. Model
+The setup script downloads the pinned ONNX model and verifies its SHA-256 checksum.
 
 ### 4. Configure & Start
 ```bash
 ssh user@vps
 cd /opt/mangahue
 nano .env   # Set TELEGRAM_BOT_TOKEN
-docker compose up -d
-docker compose logs -f
+docker compose --profile telegram-small up -d telegram-small
+docker compose logs -f telegram-small
 ```
 
 ### 5. Test
@@ -72,8 +69,8 @@ cargo run -p mangahue-telegram -- --mock --work-dir .mangahue\telegram
 ### With real model
 ```powershell
 cargo run -p mangahue-telegram -- `
-  --model .\models\pretrained\manga-colorization-v2 `
-  --preset .\configs\engine.pretrained-small.yaml `
+  --model .\models\manga-onnx\manga-colorize-fp16.onnx `
+  --preset .\configs\engine.onnx-small.yaml `
   --hint-propagate --max-concurrent-jobs 1
 ```
 
@@ -100,8 +97,8 @@ Just send a manga chapter URL to start colorization.
 # Full setup (API + Worker + Telegram with PyTorch)
 docker compose --profile telegram up -d
 
-# Minimal setup (Telegram only, small model, no PyTorch in image)
-docker compose --profile telegram-small up -d
+# Minimal setup (Telegram only, compact ONNX model, no PyTorch)
+docker compose --profile telegram-small up -d telegram-small
 
 # API + Worker only (no Telegram bot)
 docker compose up -d
@@ -167,8 +164,8 @@ checkpoints/
   .env                    # Environment config
   docker-compose.yml      # Production compose file
   models/
-    pretrained/
-      manga-colorization-v2/   # Small model (CPU)
+    manga-onnx/
+      manga-colorize-fp16.onnx # Compact model (CPU)
     manga-ninja/               # Premium model (GPU, optional)
   configs/                # Engine presets & styles
   scripts/
