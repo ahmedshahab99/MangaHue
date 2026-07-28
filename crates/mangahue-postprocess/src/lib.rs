@@ -59,7 +59,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut output,
             input.original_grayscale,
             input.line_mask,
-            Some(input.bubble_mask),
+            None,
             input.style,
             &mut report.chroma_pixels_completed,
             &mut report.material_pixels_refined,
