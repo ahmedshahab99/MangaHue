@@ -497,7 +497,7 @@ fn render_material_pixel(
     let fill_ratio = region.count as f32 / region_area;
     let texture = (region.texture_sum / region.count.max(1) as f64) as f32;
     let warm_candidate = red > 9.0 && blue < 1.0 && base_luma > 72.0;
-    let skin = warm_candidate && fill_ratio > 0.38 && texture < 8.5;
+    let skin = warm_candidate && !region.touches_border && fill_ratio > 0.38 && texture < 8.5;
     let dark_material = base_luma < 105.0;
     if warm_candidate && !skin && base_luma > 164.0 {
         red *= 0.18;
@@ -511,13 +511,13 @@ fn render_material_pixel(
     let ambient_occlusion = (1.0 - ink_distance.min(12) as f32 / 12.0).powi(2);
 
     if skin {
-        red += 12.0 * (1.0 - shadow * 0.3);
-        blue -= 8.0 * (1.0 - shadow * 0.45);
+        red += 19.0 * (1.0 - shadow * 0.26);
+        blue -= 14.0 * (1.0 - shadow * 0.4);
         let cheek_band = (1.0 - ((local_y - 0.58).abs() / 0.22)).clamp(0.0, 1.0);
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
         red += cheek_band * side_weight * 5.8;
         blue -= cheek_band * side_weight * 2.2;
-        target_luma += highlight * 2.0 - 14.0 - shadow * 4.0 - ambient_occlusion * 7.5;
+        target_luma += highlight * 2.0 - 26.0 - shadow * 5.0 - ambient_occlusion * 8.5;
     } else if dark_material {
         red += style.shadow_strength * (1.3 + highlight);
         blue += style.shadow_strength * (2.3 + highlight * 1.4);
@@ -659,7 +659,13 @@ mod tests {
     fn palette_inference_colors_large_unseeded_materials() {
         let mut image = RgbImage::from_pixel(20, 20, Rgb([172, 172, 172]));
         let original = GrayImage::from_pixel(20, 20, Luma([172]));
-        let lines = GrayImage::from_pixel(20, 20, Luma([0]));
+        let mut lines = GrayImage::from_pixel(20, 20, Luma([0]));
+        for coordinate in 0..20 {
+            lines.put_pixel(coordinate, 0, Luma([255]));
+            lines.put_pixel(coordinate, 19, Luma([255]));
+            lines.put_pixel(0, coordinate, Luma([255]));
+            lines.put_pixel(19, coordinate, Luma([255]));
+        }
         let style = StyleProfile {
             palette: vec![ColorRgb::new(198, 146, 126)],
             ..StyleProfile::default()
@@ -670,7 +676,7 @@ mod tests {
         let pixel = image.get_pixel(10, 10);
         assert!(pixel[0] > pixel[2]);
         assert!(report.inferred_regions >= 1);
-        assert_eq!(report.pixels_rendered, 400);
+        assert_eq!(report.pixels_rendered, 324);
     }
 
     #[test]
