@@ -321,8 +321,8 @@ fn detect_face_cavity_field(original_gray: &GrayImage, line_mask: &GrayImage) ->
             component.count as f32 / (component_width.max(1) * component_height.max(1)) as f32;
         if component.touches_border
             || component.count < 140
-            || !(38..=210).contains(&component_width)
-            || !(38..=250).contains(&component_height)
+            || !(60..=210).contains(&component_width)
+            || !(58..=250).contains(&component_height)
             || !(0.38..=1.85).contains(&aspect)
             || !(0.07..=0.72).contains(&fill)
         {
@@ -924,8 +924,13 @@ fn render_material_pixel(
         } else {
             ((semantic.skin - 0.32) / 0.5).clamp(0.25, 1.0)
         };
-        red = red.max(13.0 + strength * 12.0);
-        blue = blue.min(-8.0 - strength * 10.0);
+        if face_skin {
+            red = red.max(10.0 + strength * 9.0);
+            blue = blue.min(-5.0 - strength * 7.0);
+        } else {
+            red = red.max(13.0 + strength * 12.0);
+            blue = blue.min(-8.0 - strength * 10.0);
+        }
     }
     if warm_candidate && !skin && base_luma > 164.0 {
         red *= 0.18;
@@ -939,13 +944,16 @@ fn render_material_pixel(
     let ambient_occlusion = (1.0 - ink_distance.min(12) as f32 / 12.0).powi(2);
 
     if skin {
-        red += 19.0 * (1.0 - shadow * 0.26);
-        blue -= 14.0 * (1.0 - shadow * 0.4);
+        let red_boost = if face_skin { 10.0 } else { 19.0 };
+        let blue_boost = if face_skin { 7.0 } else { 14.0 };
+        red += red_boost * (1.0 - shadow * 0.26);
+        blue -= blue_boost * (1.0 - shadow * 0.4);
         let cheek_band = (1.0 - ((local_y - 0.58).abs() / 0.22)).clamp(0.0, 1.0);
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
         red += cheek_band * side_weight * 5.8;
         blue -= cheek_band * side_weight * 2.2;
-        target_luma += highlight * 2.0 - 26.0 - shadow * 5.0 - ambient_occlusion * 8.5;
+        let skin_depth = if face_skin { 17.0 } else { 26.0 };
+        target_luma += highlight * 2.0 - skin_depth - shadow * 5.0 - ambient_occlusion * 8.5;
     } else if dark_material {
         red += style.shadow_strength * (1.3 + highlight);
         blue += style.shadow_strength * (2.3 + highlight * 1.4);
