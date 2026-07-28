@@ -446,7 +446,7 @@ pub fn complete_material_chroma(
     exclusion_mask: Option<&GrayImage>,
     style: &StyleProfile,
     completed: &mut u64,
-    refined: &mut u64,
+    _refined: &mut u64,
 ) {
     let (width, height) = image.dimensions();
     if width == 0
@@ -567,18 +567,6 @@ pub fn complete_material_chroma(
         std::mem::swap(&mut confidence, &mut next_confidence);
     }
 
-    let palette = style
-        .palette
-        .iter()
-        .map(|color| {
-            let r = color.r as f32;
-            let g = color.g as f32;
-            let b = color.b as f32;
-            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            (y, r - y, b - y)
-        })
-        .collect::<Vec<_>>();
-
     for y in 0..height {
         for x in 0..width {
             let index = (y * width + x) as usize;
@@ -593,29 +581,8 @@ pub fn complete_material_chroma(
                     .min(source_pixels[index][1])
                     .min(source_pixels[index][2]);
             let propagated = confidence[index];
-            let mut target_red = red_chroma[index];
-            let mut target_blue = blue_chroma[index];
-
-            if propagated < 0.22 && gray[index] > 32 && gray[index] < 218 {
-                if let Some((_, palette_red, palette_blue)) =
-                    palette.iter().min_by(|left, right| {
-                        (luma[index] - left.0)
-                            .abs()
-                            .total_cmp(&(luma[index] - right.0).abs())
-                    })
-                {
-                    let prior = if gray[index] < 92 {
-                        0.18
-                    } else if gray[index] < 188 {
-                        0.12
-                    } else {
-                        0.075
-                    };
-                    target_red += (*palette_red - target_red) * prior;
-                    target_blue += (*palette_blue - target_blue) * prior;
-                    *refined += 1;
-                }
-            }
+            let target_red = red_chroma[index];
+            let target_blue = blue_chroma[index];
 
             let apply_strength = if fixed_seed[index] {
                 1.0
@@ -1165,15 +1132,12 @@ mod tests {
     }
 
     #[test]
-    fn material_prior_adds_restrained_color_and_preserves_luminance() {
+    fn local_completion_does_not_invent_color_without_evidence() {
         let mut image = RgbImage::from_pixel(9, 9, Rgb([170, 170, 170]));
         let original = GrayImage::from_pixel(9, 9, Luma([170]));
         let lines = GrayImage::from_pixel(9, 9, Luma([0]));
         let protected = GrayImage::from_pixel(9, 9, Luma([0]));
-        let style = StyleProfile {
-            palette: vec![mangahue_core::ColorRgb::new(190, 145, 125)],
-            ..StyleProfile::default()
-        };
+        let style = StyleProfile::default();
         let mut completed = 0;
         let mut refined = 0;
 
@@ -1188,10 +1152,7 @@ mod tests {
         );
 
         let pixel = image.get_pixel(4, 4);
-        let output_luma =
-            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        assert!(pixel[0] > pixel[2]);
-        assert!((output_luma - 170.0).abs() < 8.0);
-        assert!(refined > 0);
+        assert!((pixel[0] as i16 - pixel[2] as i16).abs() < 5);
+        assert_eq!(refined, 0);
     }
 }
