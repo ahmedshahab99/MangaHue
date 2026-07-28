@@ -496,9 +496,16 @@ fn render_material_pixel(
         ((region.max_x - region.min_x + 1) * (region.max_y - region.min_y + 1)).max(1) as f32;
     let fill_ratio = region.count as f32 / region_area;
     let texture = (region.texture_sum / region.count.max(1) as f64) as f32;
-    let warm_candidate = red > 9.0 && blue < 1.0 && base_luma > 72.0;
+    let region_red = (region.existing_red_sum / region.count.max(1) as f64) as f32;
+    let region_blue = (region.existing_blue_sum / region.count.max(1) as f64) as f32;
+    let observed_skin = region_red > 5.0 && region_blue < -3.0;
+    let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
     let skin = warm_candidate && !region.touches_border && fill_ratio > 0.38 && texture < 8.5;
     let dark_material = base_luma < 105.0;
+    if skin && observed_skin {
+        red = red.max(region_red * 1.35);
+        blue = blue.min(region_blue * 1.3);
+    }
     if warm_candidate && !skin && base_luma > 164.0 {
         red *= 0.18;
         blue *= 0.18;
