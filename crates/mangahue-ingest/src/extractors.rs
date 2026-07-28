@@ -166,7 +166,11 @@ fn extract_nhentai(
                             json["images"]["pages"].as_array(),
                         ) {
                             for page in images.iter().take(max_pages) {
-                                let ext = page["t"].as_str().unwrap_or("j");
+                                let ext = match page["t"].as_str().unwrap_or("j") {
+                                    "p" => "png",
+                                    "w" => "webp",
+                                    _ => "jpg",
+                                };
                                 let num = page["num"].as_u64().unwrap_or(1);
                                 let img = format!(
                                     "https://i.nhentai.net/galleries/{}/{}.{}",
@@ -188,20 +192,26 @@ fn extract_nhentai(
 
 fn nhentai_thumb_to_full(src: &str) -> String {
     // Convert any //t, //t1, //t2, ... //t999 subdomain to //i, //i1, //i2, ...
-    let mut s = src.to_string();
-    if let Some(t_pos) = s.find("//t") {
-        let after_slash = &s[t_pos + 2..];
-        let mut end = 1; // after 't'
-        while end < after_slash.len() && after_slash.as_bytes()[end].is_ascii_digit() {
-            end += 1;
+    let mut s = src.trim().to_string();
+    if let Ok(mut parsed) = Url::parse(&s) {
+        if let Some(host) = parsed.host_str().map(str::to_string) {
+            let lower = host.to_ascii_lowercase();
+            if let Some(suffix) = lower
+                .strip_prefix('t')
+                .and_then(|value| value.strip_suffix(".nhentai.net"))
+            {
+                let _ = parsed.set_host(Some(&format!("i{suffix}.nhentai.net")));
+                s = parsed.to_string();
+            } else if let Some(suffix) = lower
+                .strip_prefix('t')
+                .and_then(|value| value.strip_suffix(".nhentai.to"))
+            {
+                let _ = parsed.set_host(Some(&format!("i{suffix}.nhentai.to")));
+                s = parsed.to_string();
+            }
         }
-        if end < after_slash.len() && &after_slash[end..end + 12] == ".nhentai.net" {
-            let new_host = format!("//i{}.nhentai.net", &after_slash[1..end]);
-            s = format!("{}{}{}", &s[..t_pos], new_host, &s[t_pos + 2 + end + 12..]);
-        } else if end < after_slash.len() && &after_slash[end..end + 11] == ".nhentai.to" {
-            let new_host = format!("//i{}.nhentai.to", &after_slash[1..end]);
-            s = format!("{}{}{}", &s[..t_pos], new_host, &s[t_pos + 2 + end + 11..]);
-        }
+    } else if s.starts_with("//t") {
+        s = s.replacen("//t", "//i", 1);
     }
 
     // Remove 't' suffix before extension: 1t.jpg → 1.jpg, 23t.png → 23.png
@@ -451,49 +461,71 @@ fn extract_imhentai(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Stri
 // ── Generic ──────────────────────────────────────────────────────────────
 fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<String>> {
     let document = Html::parse_document(html);
-    let mut urls = Vec::new();
-    let mut seen = HashSet::new();
-
-    let selectors: &[(&str, &[&str])] = &[
-        ("meta[property='og:image']", &["content"]),
-        ("meta[name='twitter:image']", &["content"]),
-        (
-            "img.chapter-img, img.page-img, img.reader-img, img.manga-page",
-            &["src", "data-src", "data-original", "data-lazy-src"],
-        ),
-        (
-            "img[src*='chapter'], img[src*='page'], img[src*='galleries']",
-            &["src", "data-src", "data-original"],
-        ),
-        (
-            "img",
-            &["src", "data-src", "data-original", "data-lazy-src"],
-        ),
-        ("source", &["srcset"]),
+    let image_attrs = [
+        "data-srcset",
+        "srcset",
+        "data-original",
+        "data-full",
+        "data-src",
+        "data-lazy-src",
+        "data-url",
+        "data-image",
+        "data-cfsrc",
+        "src",
     ];
 
-    for (selector_text, attrs) in selectors {
-        if let Ok(sel) = Selector::parse(selector_text) {
-            for element in document.select(&sel) {
-                for attr in *attrs {
-                    if let Some(value) = element.value().attr(attr) {
-                        for candidate in expand_srcset_simple(value) {
-                            if is_likely_content_image(&candidate) {
-                                if let Ok(abs) = base.join(&candidate) {
-                                    let s = abs.to_string();
-                                    if seen.insert(s.clone()) {
-                                        urls.push(s);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    let mut reader = Vec::new();
+    let mut reader_seen = HashSet::new();
+    collect_dom_images(
+        &document,
+        "#readerarea img, #reader-area img, #manga-reader img, #chapter-reader img, \
+         .reader-area img, .reader-content img, .reading-content img, \
+         .chapter-content img, .chapter-reader img, .container-chapter-reader img, \
+         .page-break img, .manga-page img, [data-page] img, img[data-page]",
+        &image_attrs,
+        base,
+        &mut reader,
+        &mut reader_seen,
+    );
+    if reader.len() >= 2 {
+        return Ok(reader.into_iter().take(max_pages).collect());
+    }
+
+    let mut scripts = Vec::new();
+    let mut script_seen = HashSet::new();
+    collect_script_images(&document, base, &mut scripts, &mut script_seen);
+    if scripts.len() >= 2 {
+        return Ok(scripts.into_iter().take(max_pages).collect());
+    }
+
+    let mut dom = Vec::new();
+    let mut dom_seen = HashSet::new();
+    collect_dom_images(
+        &document,
+        "img, picture source",
+        &image_attrs,
+        base,
+        &mut dom,
+        &mut dom_seen,
+    );
+
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in reader.into_iter().chain(scripts).chain(dom) {
+        if seen.insert(candidate.clone()) {
+            urls.push(candidate);
         }
-        if !urls.is_empty() {
-            break;
-        }
+    }
+    if urls.is_empty() {
+        collect_dom_images(
+            &document,
+            "meta[property='og:image'], meta[name='twitter:image'], \
+             meta[property='twitter:image']",
+            &["content"],
+            base,
+            &mut urls,
+            &mut seen,
+        );
     }
 
     Ok(urls.into_iter().take(max_pages).collect())
@@ -501,16 +533,205 @@ fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Strin
 
 fn expand_srcset_simple(value: &str) -> Vec<String> {
     if value.contains(',') {
-        value
+        let mut candidates = value
             .split(',')
             .filter_map(|entry| {
                 let trimmed = entry.trim();
-                trimmed.split_whitespace().next().map(|s| s.to_string())
+                let mut parts = trimmed.split_whitespace();
+                let url = parts.next()?.to_string();
+                let descriptor = parts
+                    .next()
+                    .and_then(srcset_descriptor_value)
+                    .unwrap_or(1.0);
+                Some((descriptor, url))
             })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.0.total_cmp(&left.0));
+        candidates
+            .into_iter()
+            .map(|(_, candidate)| candidate)
             .collect()
     } else {
         vec![value.trim().to_string()]
     }
+}
+
+fn srcset_descriptor_value(value: &str) -> Option<f32> {
+    value
+        .strip_suffix('w')
+        .or_else(|| value.strip_suffix('x'))
+        .and_then(|number| number.parse::<f32>().ok())
+}
+
+fn collect_dom_images(
+    document: &Html,
+    selector_text: &str,
+    attrs: &[&str],
+    base: &Url,
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let Ok(selector) = Selector::parse(selector_text) else {
+        return;
+    };
+    for element in document.select(&selector) {
+        if element_is_tiny(
+            element.value().attr("width"),
+            element.value().attr("height"),
+        ) {
+            continue;
+        }
+        let before = output.len();
+        for attr in attrs {
+            let Some(value) = element.value().attr(attr) else {
+                continue;
+            };
+            let candidates = expand_srcset_simple(value);
+            for candidate in candidates {
+                if push_normalized_candidate(base, &candidate, false, output, seen) {
+                    break;
+                }
+            }
+            if output.len() > before {
+                break;
+            }
+        }
+    }
+}
+
+fn element_is_tiny(width: Option<&str>, height: Option<&str>) -> bool {
+    let parse = |value: Option<&str>| {
+        value.and_then(|raw| raw.trim().trim_end_matches("px").parse::<u32>().ok())
+    };
+    matches!((parse(width), parse(height)), (Some(w), Some(h)) if w <= 160 && h <= 160)
+}
+
+fn collect_script_images(
+    document: &Html,
+    base: &Url,
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let Ok(selector) = Selector::parse("script") else {
+        return;
+    };
+    for script in document.select(&selector) {
+        let text = script.inner_html();
+        let script_type = script.value().attr("type").unwrap_or("");
+        let trimmed = text.trim();
+        let looks_like_json =
+            script_type.contains("json") || matches!(trimmed.chars().next(), Some('{') | Some('['));
+        if looks_like_json {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                collect_json_image_strings(&value, base, output, seen);
+            }
+        }
+        for token in quoted_script_tokens(&text) {
+            push_normalized_candidate(base, &token, true, output, seen);
+        }
+    }
+}
+
+fn collect_json_image_strings(
+    value: &serde_json::Value,
+    base: &Url,
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        serde_json::Value::String(candidate) => {
+            push_normalized_candidate(base, candidate, true, output, seen);
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_json_image_strings(value, base, output, seen);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                collect_json_image_strings(value, base, output, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn quoted_script_tokens(script: &str) -> Vec<String> {
+    let bytes = script.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        if quote != b'"' && quote != b'\'' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let start = index;
+        let mut escaped = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == quote {
+                if index > start {
+                    tokens.push(script[start..index].to_string());
+                }
+                index += 1;
+                break;
+            }
+            index += 1;
+        }
+    }
+    tokens
+}
+
+fn push_normalized_candidate(
+    base: &Url,
+    raw: &str,
+    require_image_marker: bool,
+    output: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> bool {
+    let candidate = normalize_embedded_url(raw);
+    if !is_likely_content_image(&candidate)
+        || (require_image_marker && !has_image_marker(&candidate))
+    {
+        return false;
+    }
+    let Ok(mut absolute) = base.join(&candidate) else {
+        return false;
+    };
+    absolute.set_fragment(None);
+    let normalized = absolute.to_string();
+    if seen.insert(normalized.clone()) {
+        output.push(normalized);
+        true
+    } else {
+        false
+    }
+}
+
+fn normalize_embedded_url(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(['"', '\'', '(', ')'])
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\/", "/")
+        .replace("&amp;", "&")
+}
+
+fn has_image_marker(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    [
+        ".jpg", ".jpeg", ".png", ".webp", ".avif", ".bmp", ".tif", ".tiff",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower.contains("format=image")
+        || lower.contains("type=image")
 }
 
 fn is_likely_content_image(url: &str) -> bool {
@@ -527,6 +748,11 @@ fn is_likely_content_image(url: &str) -> bool {
         || lower.contains("spinner")
         || lower.contains("1x1")
         || lower.contains("blank")
+        || lower.contains("favicon")
+        || lower.contains("emoji")
+        || lower.contains("tracking")
+        || lower.contains("advert")
+        || lower.contains("/ads/")
     {
         return false;
     }
@@ -582,5 +808,71 @@ mod tests {
         let base = Url::parse("https://example.com/").unwrap();
         let urls = extract_generic(html, &base, 10).unwrap();
         assert_eq!(urls, vec!["https://example.com/page1.png"]);
+    }
+
+    #[test]
+    fn generic_prefers_reader_pages_over_open_graph_cover() {
+        let html = r#"
+            <meta property="og:image" content="/cover.jpg">
+            <div class="reading-content">
+              <img data-src="/chapter/page-001.webp">
+              <img data-src="/chapter/page-002.webp">
+            </div>
+        "#;
+        let base = Url::parse("https://example.com/title/chapter-1").unwrap();
+        let urls = extract_generic(html, &base, 10).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/chapter/page-001.webp",
+                "https://example.com/chapter/page-002.webp"
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_extracts_pages_from_embedded_javascript() {
+        let html = r#"
+            <script>
+              window.__PAGES__ = ["https:\/\/cdn.example.test\/p01.jpg",
+                                  "https:\/\/cdn.example.test\/p02.jpg"];
+            </script>
+        "#;
+        let base = Url::parse("https://example.com/chapter/1").unwrap();
+        let urls = extract_generic(html, &base, 10).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.test/p01.jpg",
+                "https://cdn.example.test/p02.jpg"
+            ]
+        );
+    }
+
+    #[test]
+    fn generic_chooses_highest_resolution_srcset() {
+        let html = r#"
+            <div id="readerarea">
+              <img srcset="/p1-small.jpg 480w, /p1-large.jpg 1600w">
+              <img srcset="/p2-small.jpg 1x, /p2-large.jpg 2x">
+            </div>
+        "#;
+        let base = Url::parse("https://example.com/chapter/").unwrap();
+        let urls = extract_generic(html, &base, 10).unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/p1-large.jpg",
+                "https://example.com/p2-large.jpg"
+            ]
+        );
+    }
+
+    #[test]
+    fn nhentai_thumbnail_conversion_handles_numbered_hosts() {
+        assert_eq!(
+            nhentai_thumb_to_full("https://t2.nhentai.net/galleries/12/23t.webp"),
+            "https://i2.nhentai.net/galleries/12/23.webp"
+        );
     }
 }

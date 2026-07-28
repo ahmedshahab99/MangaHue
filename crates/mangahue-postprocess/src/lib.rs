@@ -22,6 +22,10 @@ pub struct PostprocessReport {
     pub protected_pixels_restored: u64,
     pub bleed_pixels_corrected: u64,
     pub tone_pixels_preserved: u64,
+    #[serde(default)]
+    pub chroma_pixels_completed: u64,
+    #[serde(default)]
+    pub material_pixels_refined: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
 }
@@ -33,6 +37,8 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         protected_pixels_restored: 0,
         bleed_pixels_corrected: 0,
         tone_pixels_preserved: 0,
+        chroma_pixels_completed: 0,
+        material_pixels_refined: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
     };
@@ -49,6 +55,15 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         let lut = MangaColorLUT::new(input.style);
         apply_lut_grading(&mut output, &lut, input.line_mask, input.original_grayscale);
         apply_palette_harmony(&mut output, input.style, input.line_mask);
+        complete_material_chroma(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.protected_mask,
+            input.style,
+            &mut report.chroma_pixels_completed,
+            &mut report.material_pixels_refined,
+        );
     }
 
     if let Some(tone_mask) = input.tone_mask {
@@ -398,6 +413,297 @@ fn apply_palette_harmony(image: &mut RgbImage, style: &StyleProfile, line_mask: 
         pixel[1] = ((luma - 0.2126 * pixel[0] as f32 - 0.0722 * pixel[2] as f32) / 0.7152)
             .round()
             .clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// Complete sparse model chroma inside manga regions without changing geometry.
+///
+/// The model's confident colors are treated as seeds. Chroma diffuses through
+/// similar grayscale pixels, while ink and strong luminance transitions act as
+/// barriers. Remaining neutral material receives a restrained luminance-matched
+/// palette prior. Original luminance is retained, so line art and screentones
+/// remain available to later reconstruction stages.
+pub fn complete_material_chroma(
+    image: &mut RgbImage,
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+    protected_mask: Option<&GrayImage>,
+    style: &StyleProfile,
+    completed: &mut u64,
+    refined: &mut u64,
+) {
+    let (width, height) = image.dimensions();
+    if width == 0
+        || height == 0
+        || original_gray.dimensions() != (width, height)
+        || line_mask.dimensions() != (width, height)
+    {
+        return;
+    }
+
+    let len = width as usize * height as usize;
+    let source_pixels = image.pixels().copied().collect::<Vec<_>>();
+    let mut luma = vec![0.0f32; len];
+    let mut red_chroma = vec![0.0f32; len];
+    let mut blue_chroma = vec![0.0f32; len];
+    let mut confidence = vec![0.0f32; len];
+    let mut fixed_seed = vec![false; len];
+    let mut blocked = vec![false; len];
+    let mut gray = vec![0u8; len];
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            let pixel = source_pixels[index];
+            let y_value =
+                0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+            let chroma =
+                pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
+            let ink = line_mask.get_pixel(x, y)[0];
+            let protected = protected_mask
+                .map(|mask| mask.get_pixel(x, y)[0])
+                .unwrap_or(0);
+            let is_blocked = ink > 112 || protected > 96;
+            let seed_confidence = ((chroma as f32 - 5.0) / 24.0).clamp(0.0, 1.0);
+
+            luma[index] = y_value;
+            red_chroma[index] = pixel[0] as f32 - y_value;
+            blue_chroma[index] = pixel[2] as f32 - y_value;
+            confidence[index] = if is_blocked { 0.0 } else { seed_confidence };
+            fixed_seed[index] = seed_confidence >= 0.48 && !is_blocked;
+            blocked[index] = is_blocked;
+            gray[index] = original_gray.get_pixel(x, y)[0];
+        }
+    }
+
+    let similarity = (0..=255)
+        .map(|difference| (-(difference as f32) / 20.0).exp())
+        .collect::<Vec<_>>();
+    let mut next_red = red_chroma.clone();
+    let mut next_blue = blue_chroma.clone();
+    let mut next_confidence = confidence.clone();
+    const ITERATIONS: usize = 18;
+    const NEIGHBORS: [(i32, i32); 8] = [
+        (-1, 0),
+        (1, 0),
+        (0, -1),
+        (0, 1),
+        (-1, -1),
+        (1, -1),
+        (-1, 1),
+        (1, 1),
+    ];
+
+    for _ in 0..ITERATIONS {
+        for y in 0..height {
+            for x in 0..width {
+                let index = (y * width + x) as usize;
+                if blocked[index] || fixed_seed[index] {
+                    next_red[index] = red_chroma[index];
+                    next_blue[index] = blue_chroma[index];
+                    next_confidence[index] = confidence[index];
+                    continue;
+                }
+
+                let mut red_sum = 0.0f32;
+                let mut blue_sum = 0.0f32;
+                let mut weight_sum = 0.0f32;
+                let mut support_sum = 0.0f32;
+                for (dx, dy) in NEIGHBORS {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let neighbor = (ny as u32 * width + nx as u32) as usize;
+                    if blocked[neighbor] || confidence[neighbor] <= 0.005 {
+                        continue;
+                    }
+                    let difference = gray[index].abs_diff(gray[neighbor]) as usize;
+                    let diagonal = if dx != 0 && dy != 0 { 0.707 } else { 1.0 };
+                    let weight = confidence[neighbor] * similarity[difference] * diagonal;
+                    red_sum += red_chroma[neighbor] * weight;
+                    blue_sum += blue_chroma[neighbor] * weight;
+                    weight_sum += weight;
+                    support_sum += similarity[difference] * diagonal;
+                }
+
+                if weight_sum > 0.01 {
+                    let proposal_red = red_sum / weight_sum;
+                    let proposal_blue = blue_sum / weight_sum;
+                    let proposal_confidence = (weight_sum / support_sum.max(0.01)).clamp(0.0, 1.0);
+                    let spread =
+                        (proposal_confidence * (1.0 - confidence[index]) * 0.58).clamp(0.0, 0.58);
+                    next_red[index] =
+                        red_chroma[index] + (proposal_red - red_chroma[index]) * spread;
+                    next_blue[index] =
+                        blue_chroma[index] + (proposal_blue - blue_chroma[index]) * spread;
+                    next_confidence[index] = confidence[index].max(proposal_confidence * 0.82);
+                } else {
+                    next_red[index] = red_chroma[index];
+                    next_blue[index] = blue_chroma[index];
+                    next_confidence[index] = confidence[index];
+                }
+            }
+        }
+        std::mem::swap(&mut red_chroma, &mut next_red);
+        std::mem::swap(&mut blue_chroma, &mut next_blue);
+        std::mem::swap(&mut confidence, &mut next_confidence);
+    }
+
+    let palette = style
+        .palette
+        .iter()
+        .map(|color| {
+            let r = color.r as f32;
+            let g = color.g as f32;
+            let b = color.b as f32;
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            (y, r - y, b - y)
+        })
+        .collect::<Vec<_>>();
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            if blocked[index] {
+                continue;
+            }
+
+            let old_chroma = source_pixels[index][0]
+                .max(source_pixels[index][1])
+                .max(source_pixels[index][2])
+                - source_pixels[index][0]
+                    .min(source_pixels[index][1])
+                    .min(source_pixels[index][2]);
+            let propagated = confidence[index];
+            let mut target_red = red_chroma[index];
+            let mut target_blue = blue_chroma[index];
+
+            if propagated < 0.22 && gray[index] > 32 && gray[index] < 247 {
+                if let Some((_, palette_red, palette_blue)) =
+                    palette.iter().min_by(|left, right| {
+                        (luma[index] - left.0)
+                            .abs()
+                            .total_cmp(&(luma[index] - right.0).abs())
+                    })
+                {
+                    let prior = if gray[index] < 92 {
+                        0.18
+                    } else if gray[index] < 188 {
+                        0.12
+                    } else {
+                        0.075
+                    };
+                    target_red += (*palette_red - target_red) * prior;
+                    target_blue += (*palette_blue - target_blue) * prior;
+                    *refined += 1;
+                }
+            }
+
+            let apply_strength = if fixed_seed[index] {
+                1.0
+            } else {
+                (0.28 + propagated * 0.72).clamp(0.28, 0.92)
+            };
+            let red = rgb_from_luma_chroma(
+                luma[index],
+                target_red * apply_strength,
+                target_blue * apply_strength,
+            );
+            image.put_pixel(x, y, red);
+
+            let new_pixel = image.get_pixel(x, y);
+            let new_chroma = new_pixel[0].max(new_pixel[1]).max(new_pixel[2])
+                - new_pixel[0].min(new_pixel[1]).min(new_pixel[2]);
+            if old_chroma < 10 && new_chroma >= 10 {
+                *completed += 1;
+            }
+        }
+    }
+
+    refine_skin_and_material_light(image, original_gray, line_mask, protected_mask, style);
+}
+
+fn rgb_from_luma_chroma(luma: f32, red_chroma: f32, blue_chroma: f32) -> Rgb<u8> {
+    let green_chroma = (-0.2126 * red_chroma - 0.0722 * blue_chroma) / 0.7152;
+    let mut scale = 1.0f32;
+    for chroma in [red_chroma, green_chroma, blue_chroma] {
+        if chroma > 0.0 {
+            scale = scale.min((255.0 - luma) / chroma);
+        } else if chroma < 0.0 {
+            scale = scale.min(luma / -chroma);
+        }
+    }
+    let red = luma + red_chroma * scale.clamp(0.0, 1.0);
+    let blue = luma + blue_chroma * scale.clamp(0.0, 1.0);
+    let green = luma + green_chroma * scale.clamp(0.0, 1.0);
+    Rgb([
+        red.round().clamp(0.0, 255.0) as u8,
+        green.round().clamp(0.0, 255.0) as u8,
+        blue.round().clamp(0.0, 255.0) as u8,
+    ])
+}
+
+fn refine_skin_and_material_light(
+    image: &mut RgbImage,
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+    protected_mask: Option<&GrayImage>,
+    style: &StyleProfile,
+) {
+    let (width, height) = image.dimensions();
+    let source = image.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
+            let protected = protected_mask
+                .map(|mask| mask.get_pixel(x, y)[0])
+                .unwrap_or(0);
+            if ink > 0.44 || protected > 96 {
+                continue;
+            }
+            let pixel = source.get_pixel(x, y);
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+            let y_value = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let red_delta = r - g;
+            let blue_delta = g - b;
+            let skin = y_value > 72.0
+                && y_value < 246.0
+                && red_delta > 6.0
+                && red_delta < 82.0
+                && blue_delta > -4.0
+                && blue_delta < 58.0;
+
+            let original = original_gray.get_pixel(x, y)[0] as f32;
+            let shadow = ((154.0 - original) / 154.0).clamp(0.0, 1.0);
+            let highlight = ((original - 205.0) / 50.0).clamp(0.0, 1.0);
+            let shade =
+                -shadow * style.shadow_strength * 5.0 + highlight * style.highlight_strength * 2.5;
+            let mut out = [r + shade, g + shade, b + shade];
+
+            if skin {
+                let warmth = (1.0 - shadow * 0.45) * (1.0 - ink) * 2.8;
+                out[0] += warmth;
+                out[1] += warmth * 0.28;
+                out[2] -= warmth * 0.38;
+            } else if y_value < 108.0 {
+                out[0] += style.shadow_strength * 0.9;
+                out[2] += style.shadow_strength * 1.4;
+            }
+
+            image.put_pixel(
+                x,
+                y,
+                Rgb([
+                    out[0].round().clamp(0.0, 255.0) as u8,
+                    out[1].round().clamp(0.0, 255.0) as u8,
+                    out[2].round().clamp(0.0, 255.0) as u8,
+                ]),
+            );
+        }
     }
 }
 
@@ -772,5 +1078,71 @@ mod tests {
         assert_eq!(restored, 1);
         assert!((180.0f32 - after_luma).abs() < (180.0f32 - before_luma).abs());
         assert!(chroma >= 100);
+    }
+
+    #[test]
+    fn chroma_completion_fills_region_but_respects_ink_wall() {
+        let mut image = RgbImage::from_pixel(15, 5, Rgb([150, 150, 150]));
+        image.put_pixel(2, 2, Rgb([205, 112, 88]));
+        let original = GrayImage::from_pixel(15, 5, Luma([150]));
+        let mut lines = GrayImage::from_pixel(15, 5, Luma([0]));
+        for y in 0..5 {
+            lines.put_pixel(7, y, Luma([255]));
+        }
+        let protected = GrayImage::from_pixel(15, 5, Luma([0]));
+        let style = StyleProfile {
+            palette: Vec::new(),
+            ..StyleProfile::default()
+        };
+        let mut completed = 0;
+        let mut refined = 0;
+
+        complete_material_chroma(
+            &mut image,
+            &original,
+            &lines,
+            Some(&protected),
+            &style,
+            &mut completed,
+            &mut refined,
+        );
+
+        let left = image.get_pixel(5, 2);
+        let right = image.get_pixel(11, 2);
+        assert!(left[0] > left[1] && left[1] > left[2]);
+        assert_eq!(right.0, [150, 150, 150]);
+        assert!(completed > 0);
+        assert_eq!(refined, 0);
+    }
+
+    #[test]
+    fn material_prior_adds_restrained_color_and_preserves_luminance() {
+        let mut image = RgbImage::from_pixel(9, 9, Rgb([170, 170, 170]));
+        let original = GrayImage::from_pixel(9, 9, Luma([170]));
+        let lines = GrayImage::from_pixel(9, 9, Luma([0]));
+        let protected = GrayImage::from_pixel(9, 9, Luma([0]));
+        let style = StyleProfile {
+            palette: vec![mangahue_core::ColorRgb::new(190, 145, 125)],
+            ..StyleProfile::default()
+        };
+        let mut completed = 0;
+        let mut refined = 0;
+
+        complete_material_chroma(
+            &mut image,
+            &original,
+            &lines,
+            Some(&protected),
+            &style,
+            &mut completed,
+            &mut refined,
+        );
+
+        let pixel = image.get_pixel(4, 4);
+        let output_luma =
+            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        assert!(pixel[0] > pixel[2]);
+        assert!((output_luma - 170.0).abs() < 8.0);
+        assert!(refined > 0);
     }
 }

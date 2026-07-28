@@ -27,14 +27,14 @@ inference:
 hints:
   user_hints_enabled: true
   character_memory_enabled: true
-  style_hints_enabled: false
+  style_hints_enabled: true
   hint_blur_radius: 4.0
   hint_strength: 1.0
 
 postprocess:
-  restore_lines: false
+  restore_lines: true
   line_strength: 1.12
-  bubble_cleanup: false
+  bubble_cleanup: true
   bleeding_correction: false
   palette_correction: true
   final_sharpening: 0.02

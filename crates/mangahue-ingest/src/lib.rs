@@ -3,7 +3,7 @@ mod extractors;
 use anyhow::{Context, Result};
 pub use extractors::extract_manga_urls;
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, USER_AGENT};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
@@ -156,10 +156,11 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
                 });
                 continue;
             }
-            match download_image_url(
+            match download_image_url_with_referer(
                 &client,
                 &user_agent,
                 parsed,
+                Some(&source_url),
                 &request.output_dir,
                 pages.len() + 1,
                 request.max_bytes_per_page,
@@ -288,9 +289,29 @@ pub fn download_image_url(
     index: usize,
     max_bytes: u64,
 ) -> Result<IngestedPage> {
-    let response = client
+    download_image_url_with_referer(client, user_agent, url, None, output_dir, index, max_bytes)
+}
+
+pub fn download_image_url_with_referer(
+    client: &Client,
+    user_agent: &str,
+    url: Url,
+    referer: Option<&Url>,
+    output_dir: &Path,
+    index: usize,
+    max_bytes: u64,
+) -> Result<IngestedPage> {
+    let mut request = client
         .get(url.clone())
         .header(USER_AGENT, user_agent)
+        .header(
+            ACCEPT,
+            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+        );
+    if let Some(referer) = referer {
+        request = request.header(REFERER, referer.as_str());
+    }
+    let response = request
         .send()
         .with_context(|| format!("failed to fetch {url}"))?
         .error_for_status()

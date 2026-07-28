@@ -487,7 +487,7 @@ impl MangaHueEngine {
 
         let postprocess_start = Instant::now();
         emit_progress(&progress, "postprocess", 5, 6, None);
-        let (mut final_image, _postprocess_report) = finalize(PostprocessInput {
+        let (mut final_image, postprocess_report) = finalize(PostprocessInput {
             colorized: merged,
             original_grayscale: &preprocess.original_grayscale,
             line_mask: &preprocess.line_mask,
@@ -497,6 +497,29 @@ impl MangaHueEngine {
             style: &style,
             config: &config.postprocess,
         })?;
+        report.add_stage_report(
+            StageReport::new("postprocess")
+                .metric(
+                    "chroma_pixels_completed",
+                    postprocess_report.chroma_pixels_completed as f64,
+                )
+                .metric(
+                    "material_pixels_refined",
+                    postprocess_report.material_pixels_refined as f64,
+                )
+                .metric(
+                    "bubble_pixels_restored",
+                    postprocess_report.bubble_pixels_restored as f64,
+                )
+                .metric(
+                    "protected_pixels_restored",
+                    postprocess_report.protected_pixels_restored as f64,
+                )
+                .metric(
+                    "tone_pixels_preserved",
+                    postprocess_report.tone_pixels_preserved as f64,
+                ),
+        );
         if let Some(raster) = &region_lock_raster {
             let lock_report = enforce_region_locks(
                 &mut final_image,

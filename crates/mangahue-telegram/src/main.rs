@@ -5,7 +5,7 @@ use mangahue_ingest::extract_manga_urls;
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
-use reqwest::header::USER_AGENT;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -1112,13 +1112,15 @@ fn handle_link(
             if cancel_token.load(Ordering::Acquire) {
                 break;
             }
-            let ext = Path::new(img_url)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("jpg");
+            let ext = image_extension_from_url(img_url);
             let local_path = downloads_dir.join(format!("page_{:03}.{}", pos + 1, ext));
-            match download_image_url_telegram(client, img_url, &local_path, args.max_bytes_per_page)
-            {
+            match download_image_url_telegram(
+                client,
+                img_url,
+                source_url.as_str(),
+                &local_path,
+                args.max_bytes_per_page,
+            ) {
                 Ok(()) => batch_pages.push((*pos, local_path)),
                 Err(e) => {
                     tracing::warn!(url = %img_url, error = %e, "download failed, skipping");
@@ -1366,17 +1368,29 @@ fn cleanup_dir(path: &Path) {
 fn download_image_url_telegram(
     client: &Client,
     url: &str,
+    referer: &str,
     output: &Path,
     max_bytes: u64,
 ) -> Result<()> {
     let resp = client
         .get(url)
-        .header(USER_AGENT, "MangaHueBot/1.0")
+        .header(USER_AGENT, "Mozilla/5.0 (compatible; MangaHue/0.1)")
+        .header(REFERER, referer)
+        .header(
+            ACCEPT,
+            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+        )
         .timeout(Duration::from_secs(60))
         .send()
         .with_context(|| format!("failed to fetch {url}"))?
         .error_for_status()
         .with_context(|| format!("server rejected {url}"))?;
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let mut reader = resp.take(max_bytes + 1);
     let mut data = Vec::new();
     reader
@@ -1385,12 +1399,46 @@ fn download_image_url_telegram(
     if data.len() as u64 > max_bytes {
         anyhow::bail!("image exceeds {max_bytes} bytes");
     }
+    if !content_type.starts_with("image/") && !has_image_magic(&data) {
+        anyhow::bail!("URL returned non-image content ({content_type})");
+    }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(output, &data)
         .with_context(|| format!("failed to write {}", output.display()))?;
     Ok(())
+}
+
+fn has_image_magic(data: &[u8]) -> bool {
+    data.starts_with(b"\xFF\xD8\xFF")
+        || data.starts_with(b"\x89PNG\r\n\x1A\n")
+        || data.starts_with(b"GIF87a")
+        || data.starts_with(b"GIF89a")
+        || data.starts_with(b"BM")
+        || (data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP")
+        || data.starts_with(b"II*\0")
+        || data.starts_with(b"MM\0*")
+}
+
+fn image_extension_from_url(value: &str) -> &'static str {
+    let path = url::Url::parse(value)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| value.split(['?', '#']).next().unwrap_or(value).to_string());
+    match Path::new(&path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "png",
+        Some("webp") => "webp",
+        Some("gif") => "gif",
+        Some("bmp") => "bmp",
+        Some("tif") | Some("tiff") => "tiff",
+        _ => "jpg",
+    }
 }
 
 fn resolve_region_locks(root: Option<&Path>, page_stem: &str) -> Option<PathBuf> {
@@ -1749,6 +1797,30 @@ mod tests {
 
         let v = validate_user_url("http://127.0.0.1/page.png");
         assert!(v.error.is_some());
+    }
+
+    #[test]
+    fn recognizes_downloaded_image_formats() {
+        assert!(has_image_magic(b"\xFF\xD8\xFF\xE0jpeg"));
+        assert!(has_image_magic(b"\x89PNG\r\n\x1A\nrest"));
+        assert!(has_image_magic(b"RIFF\x00\x00\x00\x00WEBPrest"));
+        assert!(!has_image_magic(b"<!doctype html>"));
+    }
+
+    #[test]
+    fn derives_safe_image_extensions_from_urls() {
+        assert_eq!(
+            image_extension_from_url("https://cdn.test/page.webp?token=secret"),
+            "webp"
+        );
+        assert_eq!(
+            image_extension_from_url("https://cdn.test/render?id=10&format=png"),
+            "jpg"
+        );
+        assert_eq!(
+            image_extension_from_url("https://cdn.test/page.php?file=a.png"),
+            "jpg"
+        );
     }
 
     #[test]
