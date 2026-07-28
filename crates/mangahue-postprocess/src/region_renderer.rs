@@ -191,6 +191,7 @@ pub(crate) fn render_region_graph(
     propagate_graph_colors(&mut colors, &stats, &adjacency);
 
     let illumination = box_blur_gray(original_gray, 6);
+    let ink_distance = distance_to_ink(line_mask);
     let mut report = RegionRenderReport {
         regions: stats.iter().filter(|region| region.count >= 20).count() as u64,
         seeded_regions: colors.iter().filter(|color| color.seeded).count() as u64,
@@ -220,6 +221,7 @@ pub(crate) fn render_region_graph(
                 image.get_pixel_mut(x, y),
                 original_gray.get_pixel(x, y)[0],
                 illumination.get_pixel(x, y)[0],
+                ink_distance[index],
                 ink,
                 x,
                 y,
@@ -292,6 +294,26 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
     let existing_red = (region.existing_red_sum / count) as f32;
     let existing_blue = (region.existing_blue_sum / count) as f32;
     let seed_ratio = (region.seed_weight / count) as f32;
+    let existing_magnitude = existing_red.abs() + existing_blue.abs();
+    if region.touches_border && mean_luma > 150.0 && existing_blue > 1.0 {
+        if let Some((_, red, blue)) = palette
+            .iter()
+            .filter(|(_, red, blue)| *red >= 0.0 && *blue <= 0.0)
+            .min_by(|left, right| {
+                (left.0 - mean_luma)
+                    .abs()
+                    .total_cmp(&(right.0 - mean_luma).abs())
+            })
+            .copied()
+        {
+            return RegionColor {
+                red: red * 0.78,
+                blue: blue * 0.78,
+                confidence: 0.36,
+                seeded: false,
+            };
+        }
+    }
     if region.seed_weight >= 1.8 && seed_ratio >= 0.008 {
         return RegionColor {
             red: (region.red_chroma_sum / region.seed_weight) as f32,
@@ -300,8 +322,6 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
             seeded: true,
         };
     }
-
-    let existing_magnitude = existing_red.abs() + existing_blue.abs();
     if mean_luma > 218.0 && existing_magnitude < 5.0 {
         return RegionColor::default();
     }
@@ -451,6 +471,7 @@ fn render_material_pixel(
     pixel: &mut Rgb<u8>,
     original: u8,
     illumination: u8,
+    ink_distance: u16,
     ink: f32,
     x: u32,
     y: u32,
@@ -467,7 +488,7 @@ fn render_material_pixel(
     let local_x = (x - region.min_x) as f32 / region_width;
     let local_y = (y - region.min_y) as f32 / region_height;
     let directional_light =
-        ((1.0 - local_x) * 0.55 + (1.0 - local_y) * 0.45 - 0.5) * style.highlight_strength * 5.0;
+        ((1.0 - local_x) * 0.55 + (1.0 - local_y) * 0.45 - 0.5) * style.highlight_strength * 10.0;
 
     let mut red = color.red;
     let mut blue = color.blue;
@@ -487,21 +508,24 @@ fn render_material_pixel(
     let highlight = ((original as f32 - 205.0) / 50.0).clamp(0.0, 1.0);
     let mut target_luma = base_luma + directional_light - shadow * style.shadow_strength * 4.5
         + highlight * style.highlight_strength * 2.0;
+    let ambient_occlusion = (1.0 - ink_distance.min(12) as f32 / 12.0).powi(2);
 
     if skin {
-        red += 7.2 * (1.0 - shadow * 0.38);
-        blue += 2.6 * (1.0 - shadow * 0.5);
+        red += 12.0 * (1.0 - shadow * 0.3);
+        blue -= 8.0 * (1.0 - shadow * 0.45);
         let cheek_band = (1.0 - ((local_y - 0.58).abs() / 0.22)).clamp(0.0, 1.0);
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-        red += cheek_band * side_weight * 4.2;
-        blue += cheek_band * side_weight * 1.4;
-        target_luma += highlight * 1.4 - 4.2 - shadow * 2.8;
+        red += cheek_band * side_weight * 5.8;
+        blue -= cheek_band * side_weight * 2.2;
+        target_luma += highlight * 2.0 - 14.0 - shadow * 4.0 - ambient_occlusion * 7.5;
     } else if dark_material {
         red += style.shadow_strength * (1.3 + highlight);
         blue += style.shadow_strength * (2.3 + highlight * 1.4);
+        target_luma -= ambient_occlusion * 3.0;
     } else if pale_material && shadow > 0.05 {
         red -= shadow * 1.2;
         blue += shadow * 3.4;
+        target_luma -= ambient_occlusion * 4.5;
     }
 
     let confidence = color.confidence.clamp(0.0, 1.0);
@@ -564,6 +588,40 @@ fn box_blur_gray(image: &GrayImage, radius: u32) -> GrayImage {
         }
     }
     output
+}
+
+fn distance_to_ink(line_mask: &GrayImage) -> Vec<u16> {
+    let (width, height) = line_mask.dimensions();
+    let mut distance = vec![u16::MAX / 4; width as usize * height as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            if line_mask.get_pixel(x, y)[0] > 72 {
+                distance[index] = 0;
+                continue;
+            }
+            if x > 0 {
+                distance[index] = distance[index].min(distance[index - 1].saturating_add(1));
+            }
+            if y > 0 {
+                distance[index] =
+                    distance[index].min(distance[index - width as usize].saturating_add(1));
+            }
+        }
+    }
+    for y in (0..height).rev() {
+        for x in (0..width).rev() {
+            let index = (y * width + x) as usize;
+            if x + 1 < width {
+                distance[index] = distance[index].min(distance[index + 1].saturating_add(1));
+            }
+            if y + 1 < height {
+                distance[index] =
+                    distance[index].min(distance[index + width as usize].saturating_add(1));
+            }
+        }
+    }
+    distance
 }
 
 #[cfg(test)]
@@ -629,5 +687,15 @@ mod tests {
 
         let pixel = image.get_pixel(10, 10);
         assert!((pixel[0] as i16 - pixel[2] as i16).abs() < 5);
+    }
+
+    #[test]
+    fn ink_distance_field_expands_from_line_geometry() {
+        let mut lines = GrayImage::from_pixel(7, 1, Luma([0]));
+        lines.put_pixel(3, 0, Luma([255]));
+
+        let distance = distance_to_ink(&lines);
+
+        assert_eq!(distance, vec![3, 2, 1, 0, 1, 2, 3]);
     }
 }
