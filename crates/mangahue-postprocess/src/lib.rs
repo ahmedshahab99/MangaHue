@@ -95,7 +95,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut output,
             input.original_grayscale,
             tone_mask,
-            input.config.line_strength,
+            input.config.line_strength * 0.55,
             &mut report.tone_pixels_preserved,
         );
     }
@@ -596,7 +596,7 @@ pub fn complete_material_chroma(
             let mut target_red = red_chroma[index];
             let mut target_blue = blue_chroma[index];
 
-            if propagated < 0.22 && gray[index] > 32 && gray[index] < 247 {
+            if propagated < 0.22 && gray[index] > 32 && gray[index] < 218 {
                 if let Some((_, palette_red, palette_blue)) =
                     palette.iter().min_by(|left, right| {
                         (luma[index] - left.0)

@@ -302,6 +302,9 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
     }
 
     let existing_magnitude = existing_red.abs() + existing_blue.abs();
+    if mean_luma > 218.0 && existing_magnitude < 5.0 {
+        return RegionColor::default();
+    }
     if existing_magnitude >= 3.5 {
         return RegionColor {
             red: existing_red * 1.3,
@@ -477,13 +480,13 @@ fn render_material_pixel(
         + highlight * style.highlight_strength * 2.0;
 
     if skin {
-        red += 4.8 * (1.0 - shadow * 0.45);
-        blue -= 3.2 * (1.0 - shadow * 0.35);
+        red += 7.2 * (1.0 - shadow * 0.38);
+        blue += 2.6 * (1.0 - shadow * 0.5);
         let cheek_band = (1.0 - ((local_y - 0.58).abs() / 0.22)).clamp(0.0, 1.0);
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-        red += cheek_band * side_weight * 2.6;
-        blue -= cheek_band * side_weight * 1.2;
-        target_luma += highlight * 1.6;
+        red += cheek_band * side_weight * 4.2;
+        blue += cheek_band * side_weight * 1.4;
+        target_luma += highlight * 1.4 - 4.2 - shadow * 2.8;
     } else if dark_material {
         red += style.shadow_strength * (1.3 + highlight);
         blue += style.shadow_strength * (2.3 + highlight * 1.4);
@@ -601,5 +604,21 @@ mod tests {
         assert!(pixel[0] > pixel[2]);
         assert!(report.inferred_regions >= 1);
         assert_eq!(report.pixels_rendered, 400);
+    }
+
+    #[test]
+    fn bright_neutral_fabric_is_not_forced_into_skin_palette() {
+        let mut image = RgbImage::from_pixel(20, 20, Rgb([232, 232, 232]));
+        let original = GrayImage::from_pixel(20, 20, Luma([232]));
+        let lines = GrayImage::from_pixel(20, 20, Luma([0]));
+        let style = StyleProfile {
+            palette: vec![ColorRgb::new(239, 184, 160)],
+            ..StyleProfile::default()
+        };
+
+        render_region_graph(&mut image, &original, &lines, &style);
+
+        let pixel = image.get_pixel(10, 10);
+        assert!((pixel[0] as i16 - pixel[2] as i16).abs() < 5);
     }
 }
