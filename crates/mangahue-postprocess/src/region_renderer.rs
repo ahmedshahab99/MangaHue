@@ -330,36 +330,42 @@ fn detect_face_cavity_field(original_gray: &GrayImage, line_mask: &GrayImage) ->
         }
 
         let head_height = component_height.min(component_width * 6 / 5).max(1);
-        let center_x = (component.min_x + component.max_x) as f32 * 0.5;
+        let base_center_x = (component.min_x + component.max_x) as f32 * 0.5;
         let center_y = component.min_y as f32 + head_height as f32 * 0.58;
         let radius_x = (component_width as f32 * 0.31).max(12.0);
         let radius_y = (head_height as f32 * 0.35).max(14.0);
+        let mut best_center_x = base_center_x;
+        let mut best_bright_ratio = 0.0_f32;
+        let mut best_dark_ratio = 1.0_f32;
+        let mut best_quality = f32::NEG_INFINITY;
+        for horizontal_shift in [-0.24_f32, -0.12, 0.0, 0.12, 0.24] {
+            let candidate_x = base_center_x + component_width as f32 * horizontal_shift;
+            let (bright_ratio, dark_ratio) = measure_cavity_ellipse(
+                original_gray,
+                line_mask,
+                candidate_x,
+                center_y,
+                radius_x,
+                radius_y,
+            );
+            let quality = bright_ratio - dark_ratio * 0.58;
+            if quality > best_quality {
+                best_quality = quality;
+                best_center_x = candidate_x;
+                best_bright_ratio = bright_ratio;
+                best_dark_ratio = dark_ratio;
+            }
+        }
+        let center_x = best_center_x;
+        let bright_ratio = best_bright_ratio;
+        let dark_ratio = best_dark_ratio;
+        if bright_ratio < 0.34 || dark_ratio > 0.48 {
+            continue;
+        }
         let x0 = (center_x - radius_x).floor().max(0.0) as u32;
         let x1 = (center_x + radius_x).ceil().min((width - 1) as f32) as u32;
         let y0 = (center_y - radius_y).floor().max(0.0) as u32;
         let y1 = (center_y + radius_y).ceil().min((height - 1) as f32) as u32;
-        let mut cavity_pixels = 0_u32;
-        let mut bright_pixels = 0_u32;
-        let mut dark_pixels = 0_u32;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let dx = (x as f32 - center_x) / radius_x;
-                let dy = (y as f32 - center_y) / radius_y;
-                if dx * dx + dy * dy > 1.0 {
-                    continue;
-                }
-                cavity_pixels += 1;
-                let gray = original_gray.get_pixel(x, y)[0];
-                let ink = line_mask.get_pixel(x, y)[0];
-                bright_pixels += u32::from(gray > 145 && ink < 108);
-                dark_pixels += u32::from(gray < 88);
-            }
-        }
-        let bright_ratio = bright_pixels as f32 / cavity_pixels.max(1) as f32;
-        let dark_ratio = dark_pixels as f32 / cavity_pixels.max(1) as f32;
-        if bright_ratio < 0.34 || dark_ratio > 0.48 {
-            continue;
-        }
         let validation =
             ((bright_ratio - 0.34) / 0.42).clamp(0.0, 1.0) * (1.0 - dark_ratio).clamp(0.4, 1.0);
         for y in y0..=y1 {
@@ -379,6 +385,42 @@ fn detect_face_cavity_field(original_gray: &GrayImage, line_mask: &GrayImage) ->
         }
     }
     field
+}
+
+fn measure_cavity_ellipse(
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+    center_x: f32,
+    center_y: f32,
+    radius_x: f32,
+    radius_y: f32,
+) -> (f32, f32) {
+    let (width, height) = original_gray.dimensions();
+    let x0 = (center_x - radius_x).floor().max(0.0) as u32;
+    let x1 = (center_x + radius_x).ceil().min((width - 1) as f32) as u32;
+    let y0 = (center_y - radius_y).floor().max(0.0) as u32;
+    let y1 = (center_y + radius_y).ceil().min((height - 1) as f32) as u32;
+    let mut cavity_pixels = 0_u32;
+    let mut bright_pixels = 0_u32;
+    let mut dark_pixels = 0_u32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = (x as f32 - center_x) / radius_x;
+            let dy = (y as f32 - center_y) / radius_y;
+            if dx * dx + dy * dy > 1.0 {
+                continue;
+            }
+            cavity_pixels += 1;
+            let gray = original_gray.get_pixel(x, y)[0];
+            let ink = line_mask.get_pixel(x, y)[0];
+            bright_pixels += u32::from(gray > 145 && ink < 108);
+            dark_pixels += u32::from(gray < 88);
+        }
+    }
+    (
+        bright_pixels as f32 / cavity_pixels.max(1) as f32,
+        dark_pixels as f32 / cavity_pixels.max(1) as f32,
+    )
 }
 
 fn infer_region_semantics(
