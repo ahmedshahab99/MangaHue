@@ -471,9 +471,18 @@ fn render_material_pixel(
 
     let mut red = color.red;
     let mut blue = color.blue;
-    let skin = red > 9.0 && blue < -2.0 && base_luma > 72.0;
+    let region_area =
+        ((region.max_x - region.min_x + 1) * (region.max_y - region.min_y + 1)).max(1) as f32;
+    let fill_ratio = region.count as f32 / region_area;
+    let texture = (region.texture_sum / region.count.max(1) as f64) as f32;
+    let warm_candidate = red > 9.0 && blue < 1.0 && base_luma > 72.0;
+    let skin = warm_candidate && fill_ratio > 0.38 && texture < 8.5;
     let dark_material = base_luma < 105.0;
-    let pale_material = base_luma > 178.0 && red.abs() + blue.abs() < 18.0;
+    if warm_candidate && !skin && base_luma > 164.0 {
+        red *= 0.18;
+        blue *= 0.18;
+    }
+    let pale_material = base_luma > 178.0 && red.abs() + blue.abs() < 20.0;
     let shadow = ((150.0 - original as f32) / 120.0).clamp(0.0, 1.0);
     let highlight = ((original as f32 - 205.0) / 50.0).clamp(0.0, 1.0);
     let mut target_luma = base_luma + directional_light - shadow * style.shadow_strength * 4.5
