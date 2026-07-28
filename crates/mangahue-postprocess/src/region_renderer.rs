@@ -280,7 +280,8 @@ fn infer_region_semantics(stats: &[RegionStats], colors: &[RegionColor]) -> Vec<
             } else {
                 0.0
             };
-            let large_bright_region = region.count > 900 && luma > 172.0;
+            let elongated = width > height * 1.42 || height > width * 1.42;
+            let large_bright_region = region.count > 900 && luma > 172.0 && elongated;
             let neutral = red.abs() + blue.abs() < 12.0;
             let fabric =
                 if neutral && (region.touches_border || large_bright_region) && texture < 12.0 {
@@ -924,5 +925,28 @@ mod tests {
 
         assert!(semantics[1].skin > 0.42);
         assert!(semantics[2].skin < 0.08);
+    }
+
+    #[test]
+    fn bright_round_region_is_not_mistaken_for_large_fabric() {
+        let round_region = RegionStats {
+            count: 4_000,
+            min_x: 10,
+            min_y: 10,
+            max_x: 109,
+            max_y: 109,
+            luma_sum: 920_000.0,
+            texture_sum: 4_000.0,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 0.0,
+            existing_blue_sum: 0.0,
+            touches_border: false,
+        };
+
+        let semantics = infer_region_semantics(&[round_region], &[RegionColor::default()]);
+
+        assert_eq!(semantics[0].fabric, 0.0);
     }
 }
