@@ -8,6 +8,7 @@ pub(crate) struct RegionRenderReport {
     pub seeded_regions: u64,
     pub inferred_regions: u64,
     pub semantic_skin_regions: u64,
+    pub face_cavity_pixels: u64,
     pub pixels_rendered: u64,
 }
 
@@ -204,6 +205,7 @@ pub(crate) fn render_region_graph(
 
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
+    let face_cavity = detect_face_cavity_field(original_gray, line_mask);
     let mut report = RegionRenderReport {
         regions: stats.iter().filter(|region| region.count >= 20).count() as u64,
         seeded_regions: colors.iter().filter(|color| color.seeded).count() as u64,
@@ -215,6 +217,7 @@ pub(crate) fn render_region_graph(
             .iter()
             .filter(|semantic| semantic.skin > 0.42)
             .count() as u64,
+        face_cavity_pixels: face_cavity.iter().filter(|score| **score > 0.12).count() as u64,
         pixels_rendered: 0,
     };
 
@@ -244,6 +247,7 @@ pub(crate) fn render_region_graph(
                 region,
                 color,
                 semantics[region_index],
+                face_cavity[index],
                 style,
             );
             report.pixels_rendered += 1;
@@ -251,6 +255,130 @@ pub(crate) fn render_region_graph(
     }
 
     report
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DarkComponent {
+    count: u32,
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+    touches_border: bool,
+}
+
+fn detect_face_cavity_field(original_gray: &GrayImage, line_mask: &GrayImage) -> Vec<f32> {
+    let (width, height) = original_gray.dimensions();
+    let len = width as usize * height as usize;
+    let mut union_find = UnionFind::new(len);
+    let is_dark =
+        |x: u32, y: u32| original_gray.get_pixel(x, y)[0] < 94 && line_mask.get_pixel(x, y)[0] > 18;
+    for y in 0..height {
+        for x in 0..width {
+            if !is_dark(x, y) {
+                continue;
+            }
+            let index = (y * width + x) as usize;
+            if x + 1 < width && is_dark(x + 1, y) {
+                union_find.union(index as u32, (index + 1) as u32);
+            }
+            if y + 1 < height && is_dark(x, y + 1) {
+                union_find.union(index as u32, (index + width as usize) as u32);
+            }
+        }
+    }
+
+    let mut components = HashMap::<u32, DarkComponent>::new();
+    for y in 0..height {
+        for x in 0..width {
+            if !is_dark(x, y) {
+                continue;
+            }
+            let root = union_find.find(y * width + x);
+            let component = components.entry(root).or_insert(DarkComponent {
+                count: 0,
+                min_x: x,
+                min_y: y,
+                max_x: x,
+                max_y: y,
+                touches_border: false,
+            });
+            component.count += 1;
+            component.min_x = component.min_x.min(x);
+            component.min_y = component.min_y.min(y);
+            component.max_x = component.max_x.max(x);
+            component.max_y = component.max_y.max(y);
+            component.touches_border |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+        }
+    }
+
+    let mut field = vec![0.0_f32; len];
+    for component in components.values() {
+        let component_width = component.max_x - component.min_x + 1;
+        let component_height = component.max_y - component.min_y + 1;
+        let aspect = component_width as f32 / component_height.max(1) as f32;
+        let fill =
+            component.count as f32 / (component_width.max(1) * component_height.max(1)) as f32;
+        if component.touches_border
+            || component.count < 140
+            || !(38..=210).contains(&component_width)
+            || !(38..=250).contains(&component_height)
+            || !(0.38..=1.85).contains(&aspect)
+            || !(0.07..=0.72).contains(&fill)
+        {
+            continue;
+        }
+
+        let head_height = component_height.min(component_width * 6 / 5).max(1);
+        let center_x = (component.min_x + component.max_x) as f32 * 0.5;
+        let center_y = component.min_y as f32 + head_height as f32 * 0.58;
+        let radius_x = (component_width as f32 * 0.31).max(12.0);
+        let radius_y = (head_height as f32 * 0.35).max(14.0);
+        let x0 = (center_x - radius_x).floor().max(0.0) as u32;
+        let x1 = (center_x + radius_x).ceil().min((width - 1) as f32) as u32;
+        let y0 = (center_y - radius_y).floor().max(0.0) as u32;
+        let y1 = (center_y + radius_y).ceil().min((height - 1) as f32) as u32;
+        let mut cavity_pixels = 0_u32;
+        let mut bright_pixels = 0_u32;
+        let mut dark_pixels = 0_u32;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = (x as f32 - center_x) / radius_x;
+                let dy = (y as f32 - center_y) / radius_y;
+                if dx * dx + dy * dy > 1.0 {
+                    continue;
+                }
+                cavity_pixels += 1;
+                let gray = original_gray.get_pixel(x, y)[0];
+                let ink = line_mask.get_pixel(x, y)[0];
+                bright_pixels += u32::from(gray > 145 && ink < 108);
+                dark_pixels += u32::from(gray < 88);
+            }
+        }
+        let bright_ratio = bright_pixels as f32 / cavity_pixels.max(1) as f32;
+        let dark_ratio = dark_pixels as f32 / cavity_pixels.max(1) as f32;
+        if bright_ratio < 0.34 || dark_ratio > 0.48 {
+            continue;
+        }
+        let validation =
+            ((bright_ratio - 0.34) / 0.42).clamp(0.0, 1.0) * (1.0 - dark_ratio).clamp(0.4, 1.0);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let gray = original_gray.get_pixel(x, y)[0];
+                let ink = line_mask.get_pixel(x, y)[0];
+                if gray < 112 || ink > 122 {
+                    continue;
+                }
+                let dx = (x as f32 - center_x) / radius_x;
+                let dy = (y as f32 - center_y) / radius_y;
+                let radial = (1.0 - dx * dx - dy * dy).clamp(0.0, 1.0);
+                let score = radial.sqrt() * validation;
+                let index = (y * width + x) as usize;
+                field[index] = field[index].max(score);
+            }
+        }
+    }
+    field
 }
 
 fn infer_region_semantics(
@@ -712,6 +840,7 @@ fn render_material_pixel(
     region: RegionStats,
     color: RegionColor,
     semantic: RegionSemantic,
+    face_cavity: f32,
     style: &StyleProfile,
 ) {
     let current_luma = rgb_luma(pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
@@ -735,18 +864,24 @@ fn render_material_pixel(
     let region_blue = (region.existing_blue_sum / region.count.max(1) as f64) as f32;
     let observed_skin = region_red > 5.0 && region_blue < -3.0;
     let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
+    let face_skin = face_cavity > 0.12;
     let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
-    let skin = (warm_candidate || semantic_skin)
-        && !region.touches_border
-        && fill_ratio > 0.2
-        && texture < 9.5;
+    let skin = face_skin
+        || ((warm_candidate || semantic_skin)
+            && !region.touches_border
+            && fill_ratio > 0.2
+            && texture < 9.5);
     let dark_material = base_luma < 105.0;
     if skin && observed_skin {
         red = red.max(region_red * 1.35);
         blue = blue.min(region_blue * 1.3);
     }
-    if skin && semantic_skin {
-        let strength = ((semantic.skin - 0.32) / 0.5).clamp(0.25, 1.0);
+    if skin && (semantic_skin || face_skin) {
+        let strength = if face_skin {
+            face_cavity.clamp(0.35, 1.0)
+        } else {
+            ((semantic.skin - 0.32) / 0.5).clamp(0.25, 1.0)
+        };
         red = red.max(13.0 + strength * 12.0);
         blue = blue.min(-8.0 - strength * 10.0);
     }
@@ -1053,5 +1188,32 @@ mod tests {
         let score = face_topology_score(&region, &original, &lines);
 
         assert!(score > 0.34);
+    }
+
+    #[test]
+    fn hair_component_generates_a_bounded_face_cavity_field() {
+        let mut original = GrayImage::from_pixel(120, 120, Luma([220]));
+        let mut lines = GrayImage::from_pixel(120, 120, Luma([0]));
+        for y in 20..=40 {
+            for x in 20..=99 {
+                original.put_pixel(x, y, Luma([38]));
+                lines.put_pixel(x, y, Luma([220]));
+            }
+        }
+        for y in 20..=90 {
+            for x in 20..=29 {
+                original.put_pixel(x, y, Luma([42]));
+                lines.put_pixel(x, y, Luma([210]));
+            }
+            for x in 90..=99 {
+                original.put_pixel(x, y, Luma([42]));
+                lines.put_pixel(x, y, Luma([210]));
+            }
+        }
+
+        let field = detect_face_cavity_field(&original, &lines);
+
+        assert!(field[62 * 120 + 60] > 0.2);
+        assert_eq!(field[110 * 120 + 60], 0.0);
     }
 }

@@ -524,6 +524,10 @@ impl MangaHueEngine {
                     postprocess_report.semantic_skin_regions as f64,
                 )
                 .metric(
+                    "face_cavity_pixels",
+                    postprocess_report.face_cavity_pixels as f64,
+                )
+                .metric(
                     "region_pixels_rendered",
                     postprocess_report.region_pixels_rendered as f64,
                 )
