@@ -199,7 +199,7 @@ pub(crate) fn render_region_graph(
     propagate_graph_colors(&mut colors, &stats, &adjacency);
     let semantic_adjacency =
         build_cross_ink_adjacency(&roots, &root_to_region, &stats, line_mask, width, height);
-    let mut semantics = infer_region_semantics(&stats, &colors);
+    let mut semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
     propagate_region_semantics(&mut semantics, &stats, &semantic_adjacency);
 
     let illumination = box_blur_gray(original_gray, 6);
@@ -253,7 +253,12 @@ pub(crate) fn render_region_graph(
     report
 }
 
-fn infer_region_semantics(stats: &[RegionStats], colors: &[RegionColor]) -> Vec<RegionSemantic> {
+fn infer_region_semantics(
+    stats: &[RegionStats],
+    colors: &[RegionColor],
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+) -> Vec<RegionSemantic> {
     stats
         .iter()
         .zip(colors)
@@ -275,11 +280,15 @@ fn infer_region_semantics(stats: &[RegionStats], colors: &[RegionColor]) -> Vec<
                 * ((2.0 - color.blue) / 18.0).clamp(0.0, 1.0);
             let plausible_skin =
                 !region.touches_border && luma > 72.0 && texture < 9.5 && fill > 0.2;
-            let skin = if plausible_skin {
+            let mut skin = if plausible_skin {
                 warm_evidence.max(graph_warmth * color.confidence) * 0.94
             } else {
                 0.0
             };
+            let face_topology = face_topology_score(region, original_gray, line_mask);
+            if face_topology > 0.34 {
+                skin = skin.max(0.48 + face_topology * 0.42);
+            }
             let elongated = width > height * 1.42 || height > width * 1.42;
             let large_bright_region = region.count > 900 && luma > 172.0 && elongated;
             let neutral = red.abs() + blue.abs() < 12.0;
@@ -296,10 +305,69 @@ fn infer_region_semantics(stats: &[RegionStats], colors: &[RegionColor]) -> Vec<
             RegionSemantic {
                 skin,
                 fabric,
-                skin_seed: skin > 0.34,
+                skin_seed: skin > 0.34 || face_topology > 0.34,
             }
         })
         .collect()
+}
+
+fn face_topology_score(
+    region: &RegionStats,
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+) -> f32 {
+    let count = region.count.max(1) as f32;
+    let mean_luma = (region.luma_sum / count as f64) as f32;
+    let texture = (region.texture_sum / count as f64) as f32;
+    let width = region.max_x - region.min_x + 1;
+    let height = region.max_y - region.min_y + 1;
+    let aspect = width as f32 / height.max(1) as f32;
+    let fill = count / (width.max(1) * height.max(1)) as f32;
+    if region.touches_border
+        || region.count < 650
+        || width < 28
+        || height < 28
+        || !(0.62..=1.52).contains(&aspect)
+        || !(0.24..=0.76).contains(&fill)
+        || !(168.0..=251.0).contains(&mean_luma)
+        || texture > 9.8
+    {
+        return 0.0;
+    }
+
+    let top_end = region.min_y + (height * 36 / 100).max(1);
+    let lower_start = region.min_y + height * 58 / 100;
+    let mut top_dark = 0_u32;
+    let mut top_total = 0_u32;
+    let mut interior_ink = 0_u32;
+    let mut interior_total = 0_u32;
+    let mut lower_bright = 0_u32;
+    let mut lower_total = 0_u32;
+    for y in region.min_y..=region.max_y {
+        for x in region.min_x..=region.max_x {
+            let gray = original_gray.get_pixel(x, y)[0];
+            let ink = line_mask.get_pixel(x, y)[0];
+            interior_total += 1;
+            interior_ink += u32::from(ink > 105 || gray < 82);
+            if y <= top_end {
+                top_total += 1;
+                top_dark += u32::from(ink > 92 || gray < 105);
+            }
+            if y >= lower_start {
+                lower_total += 1;
+                lower_bright += u32::from(ink < 72 && gray > 155);
+            }
+        }
+    }
+
+    let top_ratio = top_dark as f32 / top_total.max(1) as f32;
+    let ink_ratio = interior_ink as f32 / interior_total.max(1) as f32;
+    let lower_ratio = lower_bright as f32 / lower_total.max(1) as f32;
+    let dark_cap = ((top_ratio - 0.13) / 0.30).clamp(0.0, 1.0);
+    let feature_density = ((ink_ratio - 0.045) / 0.15).clamp(0.0, 1.0);
+    let open_lower = ((lower_ratio - 0.32) / 0.48).clamp(0.0, 1.0);
+    (dark_cap * 0.48 + feature_density * 0.30 + open_lower * 0.22)
+        * dark_cap.min(feature_density + 0.25)
 }
 
 fn build_cross_ink_adjacency(
@@ -945,8 +1013,45 @@ mod tests {
             touches_border: false,
         };
 
-        let semantics = infer_region_semantics(&[round_region], &[RegionColor::default()]);
+        let original = GrayImage::from_pixel(120, 120, Luma([230]));
+        let lines = GrayImage::from_pixel(120, 120, Luma([0]));
+        let semantics = infer_region_semantics(
+            &[round_region],
+            &[RegionColor::default()],
+            &original,
+            &lines,
+        );
 
         assert_eq!(semantics[0].fabric, 0.0);
+    }
+
+    #[test]
+    fn dark_cap_and_eye_structure_identify_bright_face_cavity() {
+        let region = RegionStats {
+            count: 1_800,
+            min_x: 20,
+            min_y: 20,
+            max_x: 79,
+            max_y: 79,
+            luma_sum: 396_000.0,
+            texture_sum: 3_600.0,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 0.0,
+            existing_blue_sum: 0.0,
+            touches_border: false,
+        };
+        let original = GrayImage::from_pixel(100, 100, Luma([220]));
+        let mut lines = GrayImage::from_pixel(100, 100, Luma([0]));
+        for y in 20..=40 {
+            for x in 20..=79 {
+                lines.put_pixel(x, y, Luma([180]));
+            }
+        }
+
+        let score = face_topology_score(&region, &original, &lines);
+
+        assert!(score > 0.34);
     }
 }
