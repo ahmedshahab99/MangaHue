@@ -202,12 +202,13 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
             original * (1.0 - prediction_weight) + predicted_luma[index] * prediction_weight;
         let midtone = (1.0 - ((target_luma - 132.0).abs() / 132.0)).clamp(0.0, 1.0);
         let edge_ink = edge * adjacent_ink;
-        let desired_chroma_scale =
-            (1.12 + midtone * 0.18) * (1.0 - ink * 0.78) * (1.0 - edge_ink * 0.38);
-        let red = red_chroma[index] * desired_chroma_scale;
-        let blue = blue_chroma[index] * desired_chroma_scale;
+        let chroma_boost = 1.12 + midtone * 0.18;
+        let red = red_chroma[index] * chroma_boost;
+        let blue = blue_chroma[index] * chroma_boost;
         let green = -(0.2126 * red + 0.0722 * blue) / 0.7152;
-        let gamut_scale = chroma_gamut_scale(target_luma, [red, green, blue]);
+        let structural_attenuation = (1.0 - ink * 0.78) * (1.0 - edge_ink * 0.38);
+        let gamut_scale =
+            chroma_gamut_scale(target_luma, [red, green, blue]) * structural_attenuation;
 
         pixel[0] = (target_luma + red * gamut_scale).round().clamp(0.0, 255.0) as u8;
         pixel[1] = (target_luma + green * gamut_scale)
@@ -240,7 +241,6 @@ fn joint_bilateral_pass(
     let stride = width as usize;
     for y in 0..height {
         for x in 0..width {
-            let center = guide.get_pixel(x, y)[0];
             let mut red_sum = 0.0_f32;
             let mut blue_sum = 0.0_f32;
             let mut weight_sum = 0.0_f32;
@@ -255,10 +255,10 @@ fn joint_bilateral_pass(
                 } else {
                     (y as i32 + offset).clamp(0, height as i32 - 1) as u32
                 };
-                let sample = guide.get_pixel(sample_x, sample_y)[0];
-                let difference = center.abs_diff(sample) as usize;
+                let path_difference =
+                    guide_path_difference(guide, x, y, sample_x, sample_y, horizontal);
                 let spatial = spatial_weights[(offset + 2) as usize];
-                let weight = spatial * range_weights[difference];
+                let weight = spatial * range_weights[path_difference];
                 let sample_index = sample_y as usize * stride + sample_x as usize;
                 red_sum += source_red[sample_index] * weight;
                 blue_sum += source_blue[sample_index] * weight;
@@ -269,6 +269,41 @@ fn joint_bilateral_pass(
             target_blue[index] = blue_sum / weight_sum.max(f32::EPSILON);
         }
     }
+}
+
+fn guide_path_difference(
+    guide: &GrayImage,
+    start_x: u32,
+    start_y: u32,
+    end_x: u32,
+    end_y: u32,
+    horizontal: bool,
+) -> usize {
+    let mut current_x = start_x;
+    let mut current_y = start_y;
+    let mut previous = guide.get_pixel(current_x, current_y)[0];
+    let mut accumulated = 0_u16;
+
+    while current_x != end_x || current_y != end_y {
+        if horizontal {
+            current_x = if end_x > current_x {
+                current_x + 1
+            } else {
+                current_x - 1
+            };
+        } else {
+            current_y = if end_y > current_y {
+                current_y + 1
+            } else {
+                current_y - 1
+            };
+        }
+        let next = guide.get_pixel(current_x, current_y)[0];
+        accumulated = accumulated.saturating_add(previous.abs_diff(next) as u16);
+        previous = next;
+    }
+
+    accumulated.min(255) as usize
 }
 
 fn rgb_luma(pixel: &Rgb<u8>) -> f32 {
