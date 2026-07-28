@@ -1,3 +1,5 @@
+mod region_renderer;
+
 use anyhow::Result;
 use image::{GrayImage, Rgb, RgbImage};
 use mangahue_config::PostprocessSection;
@@ -26,6 +28,14 @@ pub struct PostprocessReport {
     pub chroma_pixels_completed: u64,
     #[serde(default)]
     pub material_pixels_refined: u64,
+    #[serde(default)]
+    pub material_regions: u64,
+    #[serde(default)]
+    pub seeded_material_regions: u64,
+    #[serde(default)]
+    pub inferred_material_regions: u64,
+    #[serde(default)]
+    pub region_pixels_rendered: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
 }
@@ -39,6 +49,10 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         tone_pixels_preserved: 0,
         chroma_pixels_completed: 0,
         material_pixels_refined: 0,
+        material_regions: 0,
+        seeded_material_regions: 0,
+        inferred_material_regions: 0,
+        region_pixels_rendered: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
     };
@@ -64,6 +78,16 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut report.chroma_pixels_completed,
             &mut report.material_pixels_refined,
         );
+        let region_report = region_renderer::render_region_graph(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.style,
+        );
+        report.material_regions = region_report.regions;
+        report.seeded_material_regions = region_report.seeded_regions;
+        report.inferred_material_regions = region_report.inferred_regions;
+        report.region_pixels_rendered = region_report.pixels_rendered;
     }
 
     if let Some(tone_mask) = input.tone_mask {

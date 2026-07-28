@@ -508,6 +508,22 @@ impl MangaHueEngine {
                     postprocess_report.material_pixels_refined as f64,
                 )
                 .metric(
+                    "material_regions",
+                    postprocess_report.material_regions as f64,
+                )
+                .metric(
+                    "seeded_material_regions",
+                    postprocess_report.seeded_material_regions as f64,
+                )
+                .metric(
+                    "inferred_material_regions",
+                    postprocess_report.inferred_material_regions as f64,
+                )
+                .metric(
+                    "region_pixels_rendered",
+                    postprocess_report.region_pixels_rendered as f64,
+                )
+                .metric(
                     "bubble_pixels_restored",
                     postprocess_report.bubble_pixels_restored as f64,
                 )
