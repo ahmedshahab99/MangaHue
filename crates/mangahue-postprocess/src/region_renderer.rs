@@ -166,8 +166,7 @@ pub(crate) fn render_region_graph(
                 smooth_gray.get_pixel(x, y)[0],
                 x,
                 y,
-                width,
-                height,
+                (width, height),
             );
         }
     }
@@ -260,9 +259,9 @@ fn accumulate_region(
     smooth: u8,
     x: u32,
     y: u32,
-    width: u32,
-    height: u32,
+    dimensions: (u32, u32),
 ) {
+    let (width, height) = dimensions;
     let luma = rgb_luma(pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
     let red = pixel[0] as f32 - luma;
     let blue = pixel[2] as f32 - luma;
