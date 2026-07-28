@@ -59,7 +59,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut output,
             input.original_grayscale,
             input.line_mask,
-            input.protected_mask,
+            Some(input.bubble_mask),
             input.style,
             &mut report.chroma_pixels_completed,
             &mut report.material_pixels_refined,
@@ -85,14 +85,6 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.bubble_mask,
             &mut report.bubble_pixels_restored,
         );
-        if let Some(protected_mask) = input.protected_mask {
-            clean_speech_bubbles(
-                &mut output,
-                input.original_grayscale,
-                protected_mask,
-                &mut report.protected_pixels_restored,
-            );
-        }
     }
 
     if input.config.restore_lines {
@@ -427,7 +419,7 @@ pub fn complete_material_chroma(
     image: &mut RgbImage,
     original_gray: &GrayImage,
     line_mask: &GrayImage,
-    protected_mask: Option<&GrayImage>,
+    exclusion_mask: Option<&GrayImage>,
     style: &StyleProfile,
     completed: &mut u64,
     refined: &mut u64,
@@ -460,10 +452,10 @@ pub fn complete_material_chroma(
             let chroma =
                 pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
             let ink = line_mask.get_pixel(x, y)[0];
-            let protected = protected_mask
+            let excluded = exclusion_mask
                 .map(|mask| mask.get_pixel(x, y)[0])
                 .unwrap_or(0);
-            let is_blocked = ink > 112 || protected > 96;
+            let is_blocked = ink > 112 || excluded > 96;
             let seed_confidence = ((chroma as f32 - 5.0) / 24.0).clamp(0.0, 1.0);
 
             luma[index] = y_value;
@@ -622,7 +614,7 @@ pub fn complete_material_chroma(
         }
     }
 
-    refine_skin_and_material_light(image, original_gray, line_mask, protected_mask, style);
+    refine_skin_and_material_light(image, original_gray, line_mask, exclusion_mask, style);
 }
 
 fn rgb_from_luma_chroma(luma: f32, red_chroma: f32, blue_chroma: f32) -> Rgb<u8> {
@@ -649,7 +641,7 @@ fn refine_skin_and_material_light(
     image: &mut RgbImage,
     original_gray: &GrayImage,
     line_mask: &GrayImage,
-    protected_mask: Option<&GrayImage>,
+    exclusion_mask: Option<&GrayImage>,
     style: &StyleProfile,
 ) {
     let (width, height) = image.dimensions();
@@ -657,10 +649,10 @@ fn refine_skin_and_material_light(
     for y in 0..height {
         for x in 0..width {
             let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
-            let protected = protected_mask
+            let excluded = exclusion_mask
                 .map(|mask| mask.get_pixel(x, y)[0])
                 .unwrap_or(0);
-            if ink > 0.44 || protected > 96 {
+            if ink > 0.44 || excluded > 96 {
                 continue;
             }
             let pixel = source.get_pixel(x, y);
@@ -986,6 +978,39 @@ mod tests {
         assert_eq!(restored, 2);
         assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255]);
         assert_eq!(image.get_pixel(1, 0).0, [120, 80, 60]);
+    }
+
+    #[test]
+    fn broad_protected_mask_does_not_erase_generated_color() {
+        let colorized = RgbImage::from_pixel(3, 3, Rgb([210, 132, 104]));
+        let original = GrayImage::from_pixel(3, 3, Luma([180]));
+        let lines = GrayImage::from_pixel(3, 3, Luma([0]));
+        let bubbles = GrayImage::from_pixel(3, 3, Luma([0]));
+        let protected = GrayImage::from_pixel(3, 3, Luma([255]));
+        let style = StyleProfile::default();
+        let config = PostprocessSection {
+            restore_lines: false,
+            line_strength: 1.0,
+            bubble_cleanup: true,
+            bleeding_correction: false,
+            palette_correction: false,
+            final_sharpening: 0.0,
+        };
+
+        let (output, report) = finalize(PostprocessInput {
+            colorized,
+            original_grayscale: &original,
+            line_mask: &lines,
+            bubble_mask: &bubbles,
+            tone_mask: None,
+            protected_mask: Some(&protected),
+            style: &style,
+            config: &config,
+        })
+        .unwrap();
+
+        assert_eq!(output.get_pixel(1, 1).0, [210, 132, 104]);
+        assert_eq!(report.protected_pixels_restored, 0);
     }
 
     #[test]
