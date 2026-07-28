@@ -131,45 +131,90 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
     }
 
     let (width, height) = original_gray.dimensions();
-    let mut output = image::imageops::resize(
+    let resized = image::imageops::resize(
         colorized,
         width,
         height,
         image::imageops::FilterType::Lanczos3,
     );
+    let pixel_count = (width as usize) * (height as usize);
+    let mut red_chroma = vec![0.0_f32; pixel_count];
+    let mut blue_chroma = vec![0.0_f32; pixel_count];
+    let mut predicted_luma = vec![0.0_f32; pixel_count];
 
+    for (index, pixel) in resized.pixels().enumerate() {
+        let luma = rgb_luma(pixel);
+        predicted_luma[index] = luma;
+        red_chroma[index] = pixel[0] as f32 - luma;
+        blue_chroma[index] = pixel[2] as f32 - luma;
+    }
+
+    let range_weights: Vec<f32> = (0..=255)
+        .map(|difference| {
+            let normalized = difference as f32 / 22.0;
+            (-0.5 * normalized * normalized).exp()
+        })
+        .collect();
+    let spatial_weights = [0.18_f32, 0.58, 1.0, 0.58, 0.18];
+    let mut scratch_red = vec![0.0_f32; pixel_count];
+    let mut scratch_blue = vec![0.0_f32; pixel_count];
+
+    joint_bilateral_pass(
+        &red_chroma,
+        &blue_chroma,
+        &mut scratch_red,
+        &mut scratch_blue,
+        original_gray,
+        &range_weights,
+        &spatial_weights,
+        true,
+    );
+    joint_bilateral_pass(
+        &scratch_red,
+        &scratch_blue,
+        &mut red_chroma,
+        &mut blue_chroma,
+        original_gray,
+        &range_weights,
+        &spatial_weights,
+        false,
+    );
+
+    let mut output = RgbImage::new(width, height);
     for (x, y, pixel) in output.enumerate_pixels_mut() {
+        let index = (y as usize) * (width as usize) + x as usize;
         let original = original_gray.get_pixel(x, y)[0] as f32;
         let left = original_gray.get_pixel(x.saturating_sub(1), y)[0] as f32;
         let right = original_gray.get_pixel((x + 1).min(width - 1), y)[0] as f32;
         let top = original_gray.get_pixel(x, y.saturating_sub(1))[0] as f32;
         let bottom = original_gray.get_pixel(x, (y + 1).min(height - 1))[0] as f32;
+        let local_min = original.min(left).min(right).min(top).min(bottom);
         let gradient = (right - left).abs() + (bottom - top).abs();
-        let edge = ((gradient - 18.0) / 90.0).clamp(0.0, 1.0);
-        let predicted_luma =
-            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        let target_luma = original * 0.58 + predicted_luma * 0.42;
-        let tonal_distance = ((target_luma / 255.0 - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-        let desired_chroma_scale = (1.08 - tonal_distance * 0.16) * (1.0 - edge * 0.76);
-        let mut gamut_scale = desired_chroma_scale;
-        for channel in 0..3 {
-            let chroma = pixel[channel] as f32 - predicted_luma;
-            if chroma > 0.0 {
-                gamut_scale = gamut_scale.min((255.0 - target_luma) / chroma);
-            } else if chroma < 0.0 {
-                gamut_scale = gamut_scale.min(target_luma / -chroma);
-            }
-        }
-        let chroma_scale = gamut_scale.clamp(0.0, desired_chroma_scale);
-
-        for channel in 0..3 {
-            let chroma = pixel[channel] as f32 - predicted_luma;
-            pixel[channel] = (target_luma + chroma * chroma_scale)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-        }
-
+        let edge = ((gradient - 20.0) / 100.0).clamp(0.0, 1.0);
         let ink = ((112.0 - original) / 112.0).clamp(0.0, 1.0).powf(1.7);
+        let adjacent_ink = ((124.0 - local_min) / 124.0).clamp(0.0, 1.0);
+        let chroma_energy = red_chroma[index]
+            .abs()
+            .max(blue_chroma[index].abs())
+            .clamp(0.0, 64.0);
+        let prediction_weight = 0.44 + chroma_energy / 64.0 * 0.24;
+        let target_luma =
+            original * (1.0 - prediction_weight) + predicted_luma[index] * prediction_weight;
+        let midtone = (1.0 - ((target_luma - 132.0).abs() / 132.0)).clamp(0.0, 1.0);
+        let edge_ink = edge * adjacent_ink;
+        let desired_chroma_scale =
+            (1.12 + midtone * 0.18) * (1.0 - ink * 0.78) * (1.0 - edge_ink * 0.38);
+        let red = red_chroma[index] * desired_chroma_scale;
+        let blue = blue_chroma[index] * desired_chroma_scale;
+        let green = -(0.2126 * red + 0.0722 * blue) / 0.7152;
+        let gamut_scale = chroma_gamut_scale(target_luma, [red, green, blue]);
+
+        pixel[0] = (target_luma + red * gamut_scale).round().clamp(0.0, 255.0) as u8;
+        pixel[1] = (target_luma + green * gamut_scale)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        pixel[2] = (target_luma + blue * gamut_scale).round().clamp(0.0, 255.0) as u8;
+
         let ink_anchor = ink * 0.94;
         for channel in 0..3 {
             pixel[channel] = (pixel[channel] as f32 * (1.0 - ink_anchor) + original * ink_anchor)
@@ -178,6 +223,68 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
         }
     }
     output
+}
+
+#[allow(clippy::too_many_arguments)]
+fn joint_bilateral_pass(
+    source_red: &[f32],
+    source_blue: &[f32],
+    target_red: &mut [f32],
+    target_blue: &mut [f32],
+    guide: &GrayImage,
+    range_weights: &[f32],
+    spatial_weights: &[f32; 5],
+    horizontal: bool,
+) {
+    let (width, height) = guide.dimensions();
+    let stride = width as usize;
+    for y in 0..height {
+        for x in 0..width {
+            let center = guide.get_pixel(x, y)[0];
+            let mut red_sum = 0.0_f32;
+            let mut blue_sum = 0.0_f32;
+            let mut weight_sum = 0.0_f32;
+            for offset in -2_i32..=2 {
+                let sample_x = if horizontal {
+                    (x as i32 + offset).clamp(0, width as i32 - 1) as u32
+                } else {
+                    x
+                };
+                let sample_y = if horizontal {
+                    y
+                } else {
+                    (y as i32 + offset).clamp(0, height as i32 - 1) as u32
+                };
+                let sample = guide.get_pixel(sample_x, sample_y)[0];
+                let difference = center.abs_diff(sample) as usize;
+                let spatial = spatial_weights[(offset + 2) as usize];
+                let weight = spatial * range_weights[difference];
+                let sample_index = sample_y as usize * stride + sample_x as usize;
+                red_sum += source_red[sample_index] * weight;
+                blue_sum += source_blue[sample_index] * weight;
+                weight_sum += weight;
+            }
+            let index = y as usize * stride + x as usize;
+            target_red[index] = red_sum / weight_sum.max(f32::EPSILON);
+            target_blue[index] = blue_sum / weight_sum.max(f32::EPSILON);
+        }
+    }
+}
+
+fn rgb_luma(pixel: &Rgb<u8>) -> f32 {
+    0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
+}
+
+fn chroma_gamut_scale(luma: f32, chroma: [f32; 3]) -> f32 {
+    let mut scale = 1.0_f32;
+    for value in chroma {
+        if value > 0.0 {
+            scale = scale.min((255.0 - luma) / value);
+        } else if value < 0.0 {
+            scale = scale.min(luma / -value);
+        }
+    }
+    scale.clamp(0.0, 1.0)
 }
 
 pub fn restore_lines(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {
@@ -1035,6 +1142,48 @@ mod tests {
         let interior_chroma = interior.0.iter().max().unwrap() - interior.0.iter().min().unwrap();
 
         assert!(edge_chroma < interior_chroma);
+    }
+
+    #[test]
+    fn full_resolution_reconstruction_retains_material_chroma() {
+        let colorized = RgbImage::from_pixel(2, 2, Rgb([220, 150, 130]));
+        let original = GrayImage::from_pixel(8, 8, Luma([220]));
+
+        let restored = reconstruct_full_resolution(&colorized, &original);
+        let pixel = restored.get_pixel(4, 4);
+        let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
+
+        assert!(chroma >= 75);
+        assert!(pixel[0] > pixel[1] && pixel[1] > pixel[2]);
+    }
+
+    #[test]
+    fn joint_bilateral_chroma_does_not_cross_an_ink_boundary() {
+        let guide = GrayImage::from_raw(5, 1, vec![225, 225, 24, 225, 225]).unwrap();
+        let source_red = vec![42.0, 42.0, 0.0, -38.0, -38.0];
+        let source_blue = vec![-24.0, -24.0, 0.0, 35.0, 35.0];
+        let mut target_red = vec![0.0; 5];
+        let mut target_blue = vec![0.0; 5];
+        let range_weights: Vec<f32> = (0..=255)
+            .map(|difference| {
+                let normalized = difference as f32 / 22.0;
+                (-0.5 * normalized * normalized).exp()
+            })
+            .collect();
+
+        joint_bilateral_pass(
+            &source_red,
+            &source_blue,
+            &mut target_red,
+            &mut target_blue,
+            &guide,
+            &range_weights,
+            &[0.18, 0.58, 1.0, 0.58, 0.18],
+            true,
+        );
+
+        assert!(target_red[1] > 35.0 && target_blue[1] < -18.0);
+        assert!(target_red[3] < -30.0 && target_blue[3] > 28.0);
     }
 
     #[test]
