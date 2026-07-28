@@ -520,6 +520,10 @@ impl MangaHueEngine {
                     postprocess_report.inferred_material_regions as f64,
                 )
                 .metric(
+                    "semantic_skin_regions",
+                    postprocess_report.semantic_skin_regions as f64,
+                )
+                .metric(
                     "region_pixels_rendered",
                     postprocess_report.region_pixels_rendered as f64,
                 )

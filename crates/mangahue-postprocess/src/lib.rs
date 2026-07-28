@@ -35,6 +35,8 @@ pub struct PostprocessReport {
     #[serde(default)]
     pub inferred_material_regions: u64,
     #[serde(default)]
+    pub semantic_skin_regions: u64,
+    #[serde(default)]
     pub region_pixels_rendered: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
@@ -52,6 +54,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         material_regions: 0,
         seeded_material_regions: 0,
         inferred_material_regions: 0,
+        semantic_skin_regions: 0,
         region_pixels_rendered: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
@@ -87,6 +90,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         report.material_regions = region_report.regions;
         report.seeded_material_regions = region_report.seeded_regions;
         report.inferred_material_regions = region_report.inferred_regions;
+        report.semantic_skin_regions = region_report.semantic_skin_regions;
         report.region_pixels_rendered = region_report.pixels_rendered;
     }
 

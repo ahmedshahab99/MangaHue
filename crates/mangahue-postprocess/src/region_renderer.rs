@@ -7,6 +7,7 @@ pub(crate) struct RegionRenderReport {
     pub regions: u64,
     pub seeded_regions: u64,
     pub inferred_regions: u64,
+    pub semantic_skin_regions: u64,
     pub pixels_rendered: u64,
 }
 
@@ -53,6 +54,13 @@ struct RegionColor {
     blue: f32,
     confidence: f32,
     seeded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RegionSemantic {
+    skin: f32,
+    fabric: f32,
+    skin_seed: bool,
 }
 
 struct UnionFind {
@@ -189,6 +197,10 @@ pub(crate) fn render_region_graph(
         .collect::<Vec<_>>();
     let adjacency = build_adjacency(&roots, &root_to_region, &stats, line_mask, width, height);
     propagate_graph_colors(&mut colors, &stats, &adjacency);
+    let semantic_adjacency =
+        build_cross_ink_adjacency(&roots, &root_to_region, &stats, line_mask, width, height);
+    let mut semantics = infer_region_semantics(&stats, &colors);
+    propagate_region_semantics(&mut semantics, &stats, &semantic_adjacency);
 
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
@@ -198,6 +210,10 @@ pub(crate) fn render_region_graph(
         inferred_regions: colors
             .iter()
             .filter(|color| !color.seeded && color.confidence > 0.08)
+            .count() as u64,
+        semantic_skin_regions: semantics
+            .iter()
+            .filter(|semantic| semantic.skin > 0.42)
             .count() as u64,
         pixels_rendered: 0,
     };
@@ -227,6 +243,7 @@ pub(crate) fn render_region_graph(
                 y,
                 region,
                 color,
+                semantics[region_index],
                 style,
             );
             report.pixels_rendered += 1;
@@ -234,6 +251,154 @@ pub(crate) fn render_region_graph(
     }
 
     report
+}
+
+fn infer_region_semantics(stats: &[RegionStats], colors: &[RegionColor]) -> Vec<RegionSemantic> {
+    stats
+        .iter()
+        .zip(colors)
+        .map(|(region, color)| {
+            if region.count < 20 {
+                return RegionSemantic::default();
+            }
+            let count = region.count as f64;
+            let luma = (region.luma_sum / count) as f32;
+            let texture = (region.texture_sum / count) as f32;
+            let red = (region.existing_red_sum / count) as f32;
+            let blue = (region.existing_blue_sum / count) as f32;
+            let width = (region.max_x - region.min_x + 1).max(1) as f32;
+            let height = (region.max_y - region.min_y + 1).max(1) as f32;
+            let fill = region.count as f32 / (width * height);
+            let warm_evidence =
+                ((red - 3.0) / 18.0).clamp(0.0, 1.0) * ((-blue - 1.5) / 15.0).clamp(0.0, 1.0);
+            let graph_warmth = ((color.red - 7.0) / 20.0).clamp(0.0, 1.0)
+                * ((2.0 - color.blue) / 18.0).clamp(0.0, 1.0);
+            let plausible_skin =
+                !region.touches_border && luma > 72.0 && texture < 9.5 && fill > 0.2;
+            let skin = if plausible_skin {
+                warm_evidence.max(graph_warmth * color.confidence) * 0.94
+            } else {
+                0.0
+            };
+            let large_bright_region = region.count > 900 && luma > 172.0;
+            let neutral = red.abs() + blue.abs() < 12.0;
+            let fabric =
+                if neutral && (region.touches_border || large_bright_region) && texture < 12.0 {
+                    if region.touches_border {
+                        0.98
+                    } else {
+                        0.78
+                    }
+                } else {
+                    0.0
+                };
+            RegionSemantic {
+                skin,
+                fabric,
+                skin_seed: skin > 0.34,
+            }
+        })
+        .collect()
+}
+
+fn build_cross_ink_adjacency(
+    roots: &[u32],
+    root_to_region: &HashMap<u32, usize>,
+    stats: &[RegionStats],
+    line_mask: &GrayImage,
+    width: u32,
+    height: u32,
+) -> Vec<Vec<(usize, f32)>> {
+    const MAX_GAP: u32 = 4;
+    let mut edges = HashMap::<(usize, usize), f32>::new();
+    for y in 0..height {
+        for x in 0..width {
+            if line_mask.get_pixel(x, y)[0] > 90 {
+                continue;
+            }
+            let index = (y * width + x) as usize;
+            let Some(&origin) = root_to_region.get(&roots[index]) else {
+                continue;
+            };
+            for (dx, dy) in [(1_u32, 0_u32), (0_u32, 1_u32)] {
+                let mut crossed_ink = false;
+                for distance in 1..=MAX_GAP {
+                    let nx = x + dx * distance;
+                    let ny = y + dy * distance;
+                    if nx >= width || ny >= height {
+                        break;
+                    }
+                    if line_mask.get_pixel(nx, ny)[0] > 90 {
+                        crossed_ink = true;
+                        continue;
+                    }
+                    if !crossed_ink {
+                        break;
+                    }
+                    let neighbor_index = (ny * width + nx) as usize;
+                    let Some(&neighbor) = root_to_region.get(&roots[neighbor_index]) else {
+                        break;
+                    };
+                    if origin != neighbor {
+                        let pair = if origin < neighbor {
+                            (origin, neighbor)
+                        } else {
+                            (neighbor, origin)
+                        };
+                        *edges.entry(pair).or_insert(0.0) +=
+                            (MAX_GAP + 1 - distance) as f32 / MAX_GAP as f32;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut adjacency = vec![Vec::new(); stats.len()];
+    for ((left, right), boundary) in edges {
+        let left_luma = stats[left].luma_sum / stats[left].count.max(1) as f64;
+        let right_luma = stats[right].luma_sum / stats[right].count.max(1) as f64;
+        let similarity = (-(left_luma - right_luma).abs() as f32 / 42.0).exp();
+        let weight = (boundary.sqrt() * similarity).clamp(0.0, 7.0);
+        if weight > 0.06 {
+            adjacency[left].push((right, weight));
+            adjacency[right].push((left, weight));
+        }
+    }
+    adjacency
+}
+
+fn propagate_region_semantics(
+    semantics: &mut Vec<RegionSemantic>,
+    stats: &[RegionStats],
+    adjacency: &[Vec<(usize, f32)>],
+) {
+    let mut next = semantics.clone();
+    for _ in 0..8 {
+        for index in 0..semantics.len() {
+            if stats[index].count < 20 || semantics[index].skin_seed {
+                next[index] = semantics[index];
+                continue;
+            }
+            let mut strongest = 0.0_f32;
+            let mut weighted_skin = 0.0_f32;
+            let mut support = 0.0_f32;
+            for &(neighbor, boundary) in &adjacency[index] {
+                let evidence = semantics[neighbor].skin * boundary;
+                strongest = strongest.max(evidence);
+                weighted_skin += evidence;
+                support += boundary;
+            }
+            let proposal = if support > 0.0 {
+                (weighted_skin / support).max(strongest / (strongest + 1.8))
+            } else {
+                0.0
+            };
+            let fabric_gate = 1.0 - semantics[index].fabric * 0.96;
+            next[index].skin = semantics[index].skin.max(proposal * 0.82 * fabric_gate);
+        }
+        std::mem::swap(semantics, &mut next);
+    }
 }
 
 fn maybe_union(
@@ -477,6 +642,7 @@ fn render_material_pixel(
     y: u32,
     region: RegionStats,
     color: RegionColor,
+    semantic: RegionSemantic,
     style: &StyleProfile,
 ) {
     let current_luma = rgb_luma(pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
@@ -500,11 +666,20 @@ fn render_material_pixel(
     let region_blue = (region.existing_blue_sum / region.count.max(1) as f64) as f32;
     let observed_skin = region_red > 5.0 && region_blue < -3.0;
     let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
-    let skin = warm_candidate && !region.touches_border && fill_ratio > 0.38 && texture < 8.5;
+    let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
+    let skin = (warm_candidate || semantic_skin)
+        && !region.touches_border
+        && fill_ratio > 0.2
+        && texture < 9.5;
     let dark_material = base_luma < 105.0;
     if skin && observed_skin {
         red = red.max(region_red * 1.35);
         blue = blue.min(region_blue * 1.3);
+    }
+    if skin && semantic_skin {
+        let strength = ((semantic.skin - 0.32) / 0.5).clamp(0.25, 1.0);
+        red = red.max(13.0 + strength * 12.0);
+        blue = blue.min(-8.0 - strength * 10.0);
     }
     if warm_candidate && !skin && base_luma > 164.0 {
         red *= 0.18;
@@ -710,5 +885,44 @@ mod tests {
         let distance = distance_to_ink(&lines);
 
         assert_eq!(distance, vec![3, 2, 1, 0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn semantic_skin_crosses_ink_while_fabric_gate_blocks_transfer() {
+        let region = RegionStats {
+            count: 400,
+            min_x: 2,
+            min_y: 2,
+            max_x: 21,
+            max_y: 21,
+            luma_sum: 80_000.0,
+            texture_sum: 800.0,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 0.0,
+            existing_blue_sum: 0.0,
+            touches_border: false,
+        };
+        let stats = vec![region; 3];
+        let mut semantics = vec![
+            RegionSemantic {
+                skin: 0.9,
+                fabric: 0.0,
+                skin_seed: true,
+            },
+            RegionSemantic::default(),
+            RegionSemantic {
+                skin: 0.0,
+                fabric: 0.98,
+                skin_seed: false,
+            },
+        ];
+        let adjacency = vec![vec![(1, 4.0), (2, 4.0)], vec![(0, 4.0)], vec![(0, 4.0)]];
+
+        propagate_region_semantics(&mut semantics, &stats, &adjacency);
+
+        assert!(semantics[1].skin > 0.42);
+        assert!(semantics[2].skin < 0.08);
     }
 }
