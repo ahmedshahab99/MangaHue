@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
 use mangahue_ingest::extract_manga_urls;
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::Form;
@@ -19,6 +20,12 @@ use uuid::Uuid;
 const DEFAULT_BATCH_SIZE: usize = 10;
 const DEFAULT_DAILY_PAGE_LIMIT: usize = 0;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DeliveryFormat {
+    Png,
+    Jpeg,
+}
 
 const BUILTIN_STYLES: &[(&str, &str)] = &[
     ("natural_manga", "Natural Manga (default)"),
@@ -40,6 +47,17 @@ struct Args {
     token_env: String,
     #[arg(long, default_value = ".mangahue/telegram")]
     work_dir: PathBuf,
+    #[arg(
+        long,
+        help = "Ephemeral job workspace, ideally a bounded tmpfs such as /run/mangahue"
+    )]
+    scratch_dir: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = 805_306_368,
+        help = "Maximum bytes allowed in the ephemeral job workspace"
+    )]
+    scratch_limit_bytes: u64,
     #[arg(long, default_value_t = 2016)]
     max_pages: usize,
     #[arg(long, default_value_t = 33_554_432)]
@@ -77,6 +95,10 @@ struct Args {
     poll_timeout_seconds: u64,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE, help = "Pages per media-group batch")]
     batch_size: usize,
+    #[arg(long, value_enum, default_value_t = DeliveryFormat::Jpeg)]
+    delivery_format: DeliveryFormat,
+    #[arg(long, default_value_t = 95, value_parser = clap::value_parser!(u8).range(80..=100))]
+    jpeg_quality: u8,
     #[arg(
         long,
         default_value_t = DEFAULT_DAILY_PAGE_LIMIT,
@@ -355,6 +377,16 @@ fn main() -> Result<()> {
     );
 
     std::fs::create_dir_all(&args.work_dir).context("failed to create work_dir")?;
+    let scratch_dir = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
+    std::fs::create_dir_all(scratch_dir).context("failed to create scratch_dir")?;
+    if args.scratch_dir.is_some() {
+        cleanup_stale_scratch(scratch_dir)?;
+    }
+    tracing::info!(
+        scratch_dir = %scratch_dir.display(),
+        scratch_limit_bytes = args.scratch_limit_bytes,
+        "ephemeral job workspace ready"
+    );
     let usage_dir = args.work_dir.join("usage");
     std::fs::create_dir_all(&usage_dir).context("failed to create usage dir")?;
     let usage_path = usage_dir.join("daily.json");
@@ -1005,7 +1037,9 @@ fn handle_link(
     cancel_token: Arc<AtomicBool>,
 ) -> Result<()> {
     let job_id = Uuid::new_v4().to_string();
-    let job_dir = args.work_dir.join(chat_id.to_string()).join(&job_id);
+    let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
+    let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
+    let _workspace = JobWorkspace::new(job_dir.clone());
     let downloads_dir = job_dir.join("downloads");
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
@@ -1128,7 +1162,10 @@ fn handle_link(
                 &local_path,
                 args.max_bytes_per_page,
             ) {
-                Ok(()) => batch_pages.push((*pos, local_path)),
+                Ok(()) => {
+                    ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
+                    batch_pages.push((*pos, local_path));
+                }
                 Err(e) => {
                     tracing::warn!(url = %img_url, error = %e, "download failed, skipping");
                     failed += 1;
@@ -1229,12 +1266,19 @@ fn handle_link(
                             .director_verdict
                             .unwrap_or_else(|| "colored".to_string())
                     );
+                    let delivery_path =
+                        prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+                    ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
                     send_chat_action(client, token, chat_id, "upload_document")?;
-                    if let Err(e) = send_document(client, token, chat_id, &output_path, &caption) {
+                    if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption)
+                    {
                         tracing::error!(error = %e, "send failed");
                         failed += 1;
                     } else {
                         sent += 1;
+                    }
+                    if delivery_path != output_path {
+                        let _ = std::fs::remove_file(&delivery_path);
                     }
                     let _ = std::fs::remove_file(&output_path);
                     let _ = std::fs::remove_file(local_path);
@@ -1372,6 +1416,90 @@ fn estimate_eta(times: &[f32], done: usize, total: usize) -> Option<f32> {
 fn cleanup_dir(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+struct JobWorkspace {
+    path: PathBuf,
+}
+
+impl JobWorkspace {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for JobWorkspace {
+    fn drop(&mut self) {
+        cleanup_dir(&self.path);
+        if let Some(chat_dir) = self.path.parent() {
+            let _ = std::fs::remove_dir(chat_dir);
+        }
+    }
+}
+
+fn cleanup_stale_scratch(root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("failed to inspect scratch directory {}", root.display()))?
+    {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove stale workspace {}", path.display()))?;
+        } else {
+            std::fs::remove_file(&path).with_context(|| {
+                format!("failed to remove stale scratch file {}", path.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn directory_bytes(root: &Path) -> Result<u64> {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("failed to inspect {}", dir.display()))?
+        {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                total = total.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn ensure_scratch_budget(root: &Path, limit: u64) -> Result<()> {
+    let used = directory_bytes(root)?;
+    if used > limit {
+        anyhow::bail!(
+            "RAM workspace limit exceeded ({used} bytes used, {limit} allowed); reduce batch size"
+        );
+    }
+    Ok(())
+}
+
+fn prepare_delivery(source: &Path, format: DeliveryFormat, jpeg_quality: u8) -> Result<PathBuf> {
+    match format {
+        DeliveryFormat::Png => Ok(source.to_path_buf()),
+        DeliveryFormat::Jpeg => {
+            let output = source.with_extension("jpg");
+            let profile = ExportProfile {
+                id: "telegram_hq".to_string(),
+                max_dimension: u32::MAX,
+                format: ExportFormat::Jpeg,
+                quality: jpeg_quality,
+                watermark: WatermarkMode::None,
+                preserve_resolution: true,
+            };
+            render_export(source, &output, &profile, None)?;
+            Ok(output)
+        }
     }
 }
 
@@ -1831,6 +1959,42 @@ mod tests {
             image_extension_from_url("https://cdn.test/page.php?file=a.png"),
             "jpg"
         );
+    }
+
+    #[test]
+    fn high_quality_delivery_keeps_master_and_writes_jpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("page.png");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([120, 80, 60]))
+            .save(&source)
+            .unwrap();
+
+        let delivery = prepare_delivery(&source, DeliveryFormat::Jpeg, 95).unwrap();
+
+        assert!(source.exists());
+        assert_eq!(
+            delivery.extension().and_then(|value| value.to_str()),
+            Some("jpg")
+        );
+        assert_eq!(
+            image::ImageReader::open(&delivery)
+                .unwrap()
+                .with_guessed_format()
+                .unwrap()
+                .format(),
+            Some(image::ImageFormat::Jpeg)
+        );
+    }
+
+    #[test]
+    fn scratch_budget_counts_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("chat").join("job");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("page.bin"), vec![0_u8; 128]).unwrap();
+
+        assert!(ensure_scratch_budget(dir.path(), 128).is_ok());
+        assert!(ensure_scratch_budget(dir.path(), 127).is_err());
     }
 
     #[test]

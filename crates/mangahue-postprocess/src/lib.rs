@@ -1165,6 +1165,8 @@ mod tests {
             target_colorfulness: 1.0,
             midtone_depth: 0.08,
             local_contrast: 0.12,
+            semantic_relighting: false,
+            relighting_strength: 0.25,
         };
 
         let (output, report) = finalize(PostprocessInput {

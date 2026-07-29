@@ -100,6 +100,10 @@ pub struct PostprocessSection {
     pub midtone_depth: f32,
     #[serde(default = "default_local_contrast")]
     pub local_contrast: f32,
+    #[serde(default)]
+    pub semantic_relighting: bool,
+    #[serde(default = "default_relighting_strength")]
+    pub relighting_strength: f32,
 }
 
 fn default_target_colorfulness() -> f32 {
@@ -112,6 +116,10 @@ fn default_midtone_depth() -> f32 {
 
 fn default_local_contrast() -> f32 {
     0.12
+}
+
+fn default_relighting_strength() -> f32 {
+    0.25
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +221,8 @@ impl Default for EngineConfig {
                 target_colorfulness: default_target_colorfulness(),
                 midtone_depth: default_midtone_depth(),
                 local_contrast: default_local_contrast(),
+                semantic_relighting: false,
+                relighting_strength: default_relighting_strength(),
             },
             output: OutputSection {
                 format: "png".to_string(),

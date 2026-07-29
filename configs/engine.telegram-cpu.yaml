@@ -44,6 +44,8 @@ postprocess:
   target_colorfulness: 1.55
   midtone_depth: 0.16
   local_contrast: 0.22
+  semantic_relighting: true
+  relighting_strength: 0.38
 
 output:
   format: png

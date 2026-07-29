@@ -448,8 +448,9 @@ fn infer_region_semantics(
                 ((red - 3.0) / 18.0).clamp(0.0, 1.0) * ((-blue - 1.5) / 15.0).clamp(0.0, 1.0);
             let graph_warmth = ((color.red - 7.0) / 20.0).clamp(0.0, 1.0)
                 * ((2.0 - color.blue) / 18.0).clamp(0.0, 1.0);
+            let texture_limit = 9.5 + warm_evidence.max(graph_warmth) * 7.5;
             let plausible_skin =
-                !region.touches_border && luma > 72.0 && texture < 9.5 && fill > 0.2;
+                !region.touches_border && luma > 72.0 && texture < texture_limit && fill > 0.2;
             let mut skin = if plausible_skin {
                 warm_evidence.max(graph_warmth * color.confidence) * 0.94
             } else {
@@ -908,11 +909,16 @@ fn render_material_pixel(
     let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
     let face_skin = face_cavity > 0.12;
     let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
+    let texture_limit = if observed_skin || semantic_skin {
+        17.0
+    } else {
+        9.5
+    };
     let skin = face_skin
         || ((warm_candidate || semantic_skin)
             && !region.touches_border
             && fill_ratio > 0.2
-            && texture < 9.5);
+            && texture < texture_limit);
     let dark_material = base_luma < 105.0;
     if skin && observed_skin {
         red = red.max(region_red * 1.35);
@@ -925,8 +931,8 @@ fn render_material_pixel(
             ((semantic.skin - 0.32) / 0.5).clamp(0.25, 1.0)
         };
         if face_skin {
-            red = red.max(10.0 + strength * 9.0);
-            blue = blue.min(-5.0 - strength * 7.0);
+            red = red.max(16.0 + strength * 13.0);
+            blue = blue.min(-9.0 - strength * 10.0);
         } else {
             red = red.max(13.0 + strength * 12.0);
             blue = blue.min(-8.0 - strength * 10.0);
@@ -944,15 +950,15 @@ fn render_material_pixel(
     let ambient_occlusion = (1.0 - ink_distance.min(12) as f32 / 12.0).powi(2);
 
     if skin {
-        let red_boost = if face_skin { 10.0 } else { 19.0 };
-        let blue_boost = if face_skin { 7.0 } else { 14.0 };
+        let red_boost = if face_skin { 16.0 } else { 21.0 };
+        let blue_boost = if face_skin { 11.0 } else { 15.0 };
         red += red_boost * (1.0 - shadow * 0.26);
         blue -= blue_boost * (1.0 - shadow * 0.4);
         let cheek_band = (1.0 - ((local_y - 0.58).abs() / 0.22)).clamp(0.0, 1.0);
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
         red += cheek_band * side_weight * 5.8;
         blue -= cheek_band * side_weight * 2.2;
-        let skin_depth = if face_skin { 17.0 } else { 26.0 };
+        let skin_depth = if face_skin { 28.0 } else { 29.0 };
         target_luma += highlight * 2.0 - skin_depth - shadow * 5.0 - ambient_occlusion * 8.5;
     } else if dark_material {
         red += style.shadow_strength * (1.3 + highlight);
@@ -967,7 +973,14 @@ fn render_material_pixel(
     let confidence = color.confidence.clamp(0.0, 1.0);
     let existing_red = pixel[0] as f32 - current_luma;
     let existing_blue = pixel[2] as f32 - current_luma;
-    let blend = (0.28 + confidence * 0.68) * (1.0 - ink).powi(2);
+    let evidence_blend = (0.28 + confidence * 0.68) * (1.0 - ink).powi(2);
+    let blend = if face_skin {
+        evidence_blend.max(0.76 * (1.0 - ink).powi(2))
+    } else if semantic_skin {
+        evidence_blend.max(0.64 * (1.0 - ink).powi(2))
+    } else {
+        evidence_blend
+    };
     red = existing_red + (red - existing_red) * blend;
     blue = existing_blue + (blue - existing_blue) * blend;
     *pixel = rgb_from_luma_chroma(target_luma.clamp(0.0, 255.0), red, blue);
@@ -1265,5 +1278,89 @@ mod tests {
 
         assert!(field[62 * 120 + 60] > 0.2);
         assert_eq!(field[110 * 120 + 60], 0.0);
+    }
+
+    #[test]
+    fn face_evidence_produces_visible_skin_chroma_and_depth() {
+        let mut pixel = Rgb([226, 226, 226]);
+        let region = RegionStats {
+            count: 1_800,
+            min_x: 20,
+            min_y: 20,
+            max_x: 79,
+            max_y: 79,
+            luma_sum: 406_800.0,
+            texture_sum: 1_800.0,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 0.0,
+            existing_blue_sum: 0.0,
+            touches_border: false,
+        };
+
+        render_material_pixel(
+            &mut pixel,
+            226,
+            226,
+            8,
+            0.0,
+            50,
+            50,
+            region,
+            RegionColor::default(),
+            RegionSemantic {
+                skin: 0.8,
+                fabric: 0.0,
+                skin_seed: true,
+            },
+            0.8,
+            &StyleProfile::default(),
+        );
+
+        assert!(pixel[0] as i16 - pixel[2] as i16 >= 35);
+        assert!(rgb_luma(pixel[0] as f32, pixel[1] as f32, pixel[2] as f32) < 210.0);
+    }
+
+    #[test]
+    fn warm_skin_evidence_survives_manga_texture() {
+        let mut pixel = Rgb([232, 224, 219]);
+        let region = RegionStats {
+            count: 1_000,
+            min_x: 10,
+            min_y: 10,
+            max_x: 59,
+            max_y: 49,
+            luma_sum: 225_000.0,
+            texture_sum: 15_000.0,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 8_000.0,
+            existing_blue_sum: -5_000.0,
+            touches_border: false,
+        };
+
+        render_material_pixel(
+            &mut pixel,
+            225,
+            225,
+            8,
+            0.0,
+            35,
+            30,
+            region,
+            RegionColor {
+                red: 10.0,
+                blue: -5.0,
+                confidence: 0.4,
+                seeded: true,
+            },
+            RegionSemantic::default(),
+            0.0,
+            &StyleProfile::default(),
+        );
+
+        assert!(pixel[0] as i16 - pixel[2] as i16 >= 25);
     }
 }

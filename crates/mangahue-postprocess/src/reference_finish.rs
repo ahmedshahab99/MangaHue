@@ -7,6 +7,7 @@ pub(crate) struct ReferenceFinishReport {
     pub pixels_finished: u64,
     pub chroma_pixels_expanded: u64,
     pub shadow_pixels_shaped: u64,
+    pub relit_pixels: u64,
 }
 
 pub(crate) fn finish_reference_style(
@@ -35,6 +36,9 @@ pub(crate) fn finish_reference_style(
         .collect::<Vec<_>>();
     let local = box_mean(&luma, width, height, 7);
     let scene = box_mean(&luma, width, height, 29);
+    let ink_distance = config
+        .semantic_relighting
+        .then(|| distance_from_ink(line_mask, 18));
     let mut report = ReferenceFinishReport::default();
 
     for y in 0..height {
@@ -75,8 +79,26 @@ pub(crate) fn finish_reference_style(
                 detail * config.local_contrast * 1.7 + broad_detail * config.local_contrast * 0.72;
             let style_shadow = shadow_support * style.shadow_strength * 0.018;
             let style_highlight = highlight_support * style.highlight_strength * 0.008;
+            let mut relighting = 0.0;
+            if let Some(distance) = ink_distance.as_ref() {
+                let edge_depth = 1.0 - smoothstep(1.5, 15.0, distance[index]);
+                let x0 = x.saturating_sub(3);
+                let x1 = (x + 3).min(width - 1);
+                let y0 = y.saturating_sub(3);
+                let y1 = (y + 3).min(height - 1);
+                let gradient_x =
+                    local[(y * width + x1) as usize] - local[(y * width + x0) as usize];
+                let gradient_y =
+                    local[(y1 * width + x) as usize] - local[(y0 * width + x) as usize];
+                let directional = (-gradient_x * 0.55 - gradient_y * 0.84).clamp(-0.08, 0.08);
+                let material_gate = (1.0 - paper) * bell(original, 0.55, 0.52);
+                relighting = config.relighting_strength
+                    * material_gate
+                    * (directional * 0.34 - edge_depth * shadow_support * 0.018);
+            }
             let target_luma =
-                (old_luma - depth - style_shadow + style_highlight + local_shape).clamp(0.0, 1.0);
+                (old_luma - depth - style_shadow + style_highlight + local_shape + relighting)
+                    .clamp(0.0, 1.0);
 
             let neutral_gate = smoothstep(0.008, 0.035, chroma);
             let vivid_gate = smoothstep(0.015, 0.13, chroma);
@@ -120,10 +142,49 @@ pub(crate) fn finish_reference_style(
             if depth + style_shadow > 0.012 {
                 report.shadow_pixels_shaped += 1;
             }
+            if relighting.abs() > 0.001 {
+                report.relit_pixels += 1;
+            }
         }
     }
 
     report
+}
+
+fn distance_from_ink(line_mask: &GrayImage, max_distance: u16) -> Vec<f32> {
+    let (width, height) = line_mask.dimensions();
+    let width_usize = width as usize;
+    let mut distance = vec![max_distance; width_usize * height as usize];
+    for y in 0..height as usize {
+        for x in 0..width_usize {
+            if line_mask.get_pixel(x as u32, y as u32)[0] >= 112 {
+                distance[y * width_usize + x] = 0;
+            } else {
+                let mut best = max_distance;
+                if x > 0 {
+                    best = best.min(distance[y * width_usize + x - 1].saturating_add(1));
+                }
+                if y > 0 {
+                    best = best.min(distance[(y - 1) * width_usize + x].saturating_add(1));
+                }
+                distance[y * width_usize + x] = best;
+            }
+        }
+    }
+    for y in (0..height as usize).rev() {
+        for x in (0..width_usize).rev() {
+            let index = y * width_usize + x;
+            let mut best = distance[index];
+            if x + 1 < width_usize {
+                best = best.min(distance[index + 1].saturating_add(1));
+            }
+            if y + 1 < height as usize {
+                best = best.min(distance[index + width_usize].saturating_add(1));
+            }
+            distance[index] = best;
+        }
+    }
+    distance.into_iter().map(f32::from).collect()
 }
 
 fn box_mean(source: &[f32], width: u32, height: u32, radius: u32) -> Vec<f32> {
@@ -244,6 +305,8 @@ mod tests {
             target_colorfulness: 1.35,
             midtone_depth: 0.12,
             local_contrast: 0.18,
+            semantic_relighting: true,
+            relighting_strength: 0.4,
         }
     }
 
@@ -309,5 +372,31 @@ mod tests {
         );
 
         assert!(image.pixels().all(|pixel| *pixel == original_pixel));
+    }
+
+    #[test]
+    fn relighting_adds_depth_near_ink_without_crossing_it() {
+        let mut image = RgbImage::from_pixel(32, 32, Rgb([202, 168, 154]));
+        let gray = GrayImage::from_pixel(32, 32, Luma([100]));
+        let mut lines = GrayImage::from_pixel(32, 32, Luma([0]));
+        for y in 0..32 {
+            lines.put_pixel(8, y, Luma([255]));
+        }
+        let empty = GrayImage::from_pixel(32, 32, Luma([0]));
+        let untouched_ink = *image.get_pixel(8, 16);
+
+        let report = finish_reference_style(
+            &mut image,
+            &gray,
+            &lines,
+            &empty,
+            None,
+            &StyleProfile::default(),
+            &config(),
+        );
+
+        assert_eq!(*image.get_pixel(8, 16), untouched_ink);
+        assert!(report.relit_pixels > 0);
+        assert_ne!(*image.get_pixel(10, 16), *image.get_pixel(24, 16));
     }
 }
