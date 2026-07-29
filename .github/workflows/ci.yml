@@ -2,7 +2,7 @@ name: MangaHue CI
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [main]
   pull_request:
 
 permissions:
