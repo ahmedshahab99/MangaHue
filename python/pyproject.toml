@@ -18,6 +18,10 @@ pretrained = [
   "torch>=2.2",
   "torchvision>=0.17",
 ]
+studio = [
+  "openvino-genai>=2025.2,<2027",
+  "huggingface-hub>=0.25",
+]
 
 [project.scripts]
 mangahue-export-onnx = "mangahue_train.export_onnx:main"
@@ -26,6 +30,7 @@ mangahue-prepare-dataset = "mangahue_train.prepare_dataset:main"
 mangahue-audit-dataset = "mangahue_train.audit_dataset:main"
 mangahue-evaluate = "mangahue_train.evaluate:main"
 mangahue-benchmark-quality = "mangahue_train.benchmark_quality:main"
+mangahue-studio-colorize = "mangahue_train.studio_openvino_worker:main"
 
 [build-system]
 requires = ["setuptools>=68"]
