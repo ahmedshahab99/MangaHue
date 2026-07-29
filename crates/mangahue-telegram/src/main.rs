@@ -46,6 +46,8 @@ struct Args {
     max_bytes_per_page: u64,
     #[arg(long)]
     model: Option<PathBuf>,
+    #[arg(long, help = "Approved colored style or character reference image")]
+    reference_image: Option<PathBuf>,
     #[arg(
         long = "ensemble-model",
         help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
@@ -1186,6 +1188,7 @@ fn handle_link(
                 input_path: local_path.clone(),
                 output_path: output_path.clone(),
                 model_path: args.model.clone(),
+                reference_image_path: args.reference_image.clone(),
                 enable_ensemble: !args.ensemble_models.is_empty(),
                 ensemble_model_paths: args.ensemble_models.clone(),
                 config_path: args.config.clone(),

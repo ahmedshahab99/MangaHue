@@ -488,10 +488,10 @@ fn chroma_complement(
     let drawable =
         smoothstep(0.025, 0.16, primary_luma) * (1.0 - smoothstep(0.88, 0.985, primary_luma));
     let evidence = smoothstep(0.012, 0.105, best_advantage);
-    let neutral_need = 1.0 - smoothstep(0.09, 0.24, primary_chroma);
+    let neutral_need = 1.0 - smoothstep(0.035, 0.16, primary_chroma);
     let agreement_guard = 1.0 - smoothstep(0.72, 1.0, disagreement);
     let borrow =
-        (drawable * evidence * (0.36 + neutral_need * 0.64) * agreement_guard).clamp(0.0, 0.88);
+        (drawable * evidence * (0.04 + neutral_need * 0.76) * agreement_guard).clamp(0.0, 0.62);
 
     if borrow <= 0.001 {
         return (primary, 0.0);

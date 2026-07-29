@@ -154,6 +154,190 @@ pub fn is_ddcolor_onnx_model(path: impl AsRef<Path>) -> bool {
             .is_some_and(|name| name.to_ascii_lowercase().contains("ddcolor"))
 }
 
+pub fn is_reference_cgan_model_dir(path: impl AsRef<Path>) -> bool {
+    path.as_ref().join("074000_gray.pt").is_file()
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceCganWorkerLaunch {
+    python: String,
+    model_path: PathBuf,
+    reference_path: PathBuf,
+    worker_threads: usize,
+}
+
+impl ReferenceCganWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let child = Command::new(&self.python)
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.reference_cgan_worker")
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--reference")
+            .arg(&self.reference_path)
+            .arg("--size")
+            .arg("256")
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to launch reference cGAN worker with '{}'",
+                    self.python
+                )
+            })?;
+        let mut process =
+            attach_worker_process(child, "reference-cgan-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "reference cGAN worker")?;
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+pub struct ReferenceCganBackend {
+    launch: ReferenceCganWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+impl ReferenceCganBackend {
+    pub fn new(model_dir: impl AsRef<Path>, reference_path: impl AsRef<Path>) -> Result<Self> {
+        let requested_model = model_dir.as_ref();
+        let model_dir = requested_model.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve reference cGAN model directory {}",
+                requested_model.display()
+            )
+        })?;
+        if !is_reference_cgan_model_dir(&model_dir) {
+            anyhow::bail!(
+                "reference cGAN checkpoint missing in {}",
+                model_dir.display()
+            );
+        }
+        let requested_reference = reference_path.as_ref();
+        let reference_path = requested_reference.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve reference style image {}",
+                requested_reference.display()
+            )
+        })?;
+        let python = std::env::var("MANGAHUE_REFERENCE_PYTHON")
+            .or_else(|_| std::env::var("MANGAHUE_PYTHON"))
+            .unwrap_or_else(|_| "python".to_string());
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let launch = ReferenceCganWorkerLaunch {
+            python,
+            model_path: model_dir.join("074000_gray.pt"),
+            reference_path,
+            worker_threads,
+        };
+        let process = launch.spawn()?;
+        Ok(Self {
+            launch,
+            process: Mutex::new(process),
+        })
+    }
+
+    pub fn shared(
+        model_dir: impl AsRef<Path>,
+        reference_path: impl AsRef<Path>,
+    ) -> Result<Arc<Self>> {
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<ReferenceCganBackend>>>> =
+            OnceLock::new();
+        let canonical_model = model_dir.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve reference cGAN model {}",
+                model_dir.as_ref().display()
+            )
+        })?;
+        let canonical_reference = reference_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve reference image {}",
+                reference_path.as_ref().display()
+            )
+        })?;
+        let key = format!(
+            "{}\x00{}",
+            canonical_model.display(),
+            canonical_reference.display()
+        );
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|error| anyhow!("reference cGAN registry poisoned: {error}"))?;
+        if let Some(worker) = workers.get(&key) {
+            return Ok(Arc::clone(worker));
+        }
+        let worker = Arc::new(Self::new(&canonical_model, &canonical_reference)?);
+        workers.insert(key, Arc::clone(&worker));
+        Ok(worker)
+    }
+}
+
+impl ColorizationBackend for ReferenceCganBackend {
+    fn name(&self) -> &str {
+        "reference-cgan"
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let temp = tempfile::tempdir()
+            .map_err(|error| EngineError::Inference(format!("reference cGAN temp dir: {error}")))?;
+        let lineart_path = temp.path().join("lineart.png");
+        let output_path = temp.path().join("output.png");
+        input
+            .lineart
+            .save(&lineart_path)
+            .map_err(|error| EngineError::Inference(format!("reference cGAN save: {error}")))?;
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "output": output_path,
+        });
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|error| EngineError::Inference(format!("reference cGAN lock: {error}")))?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "reference cGAN worker failed ({first_error}) and restart failed: {restart_error}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "reference cGAN worker failed after restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!(
+                "reference cGAN failed: {}",
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+            )));
+        }
+        image::open(&output_path)
+            .map(|image| image.to_rgb8())
+            .map_err(|error| EngineError::Inference(format!("reference cGAN output: {error}")))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DdColorOnnxWorkerLaunch {
     python: String,

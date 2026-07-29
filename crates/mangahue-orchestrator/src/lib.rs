@@ -34,6 +34,8 @@ pub struct ColorizeRequest {
     pub input_path: PathBuf,
     pub output_path: PathBuf,
     pub model_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_image_path: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub preset_path: Option<PathBuf>,
     pub style_path: Option<PathBuf>,
@@ -778,13 +780,25 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
-    select_backend_for_model(model_path, config)
+    select_backend_for_model(model_path, config, request.reference_image_path.as_deref())
 }
 
 fn select_backend_for_model(
     model_path: &Path,
     config: &EngineConfig,
+    reference_image_path: Option<&Path>,
 ) -> Result<Box<dyn ColorizationBackend>> {
+    if mangahue_inference::is_reference_cgan_model_dir(model_path) {
+        let reference_path = reference_image_path.ok_or_else(|| {
+            anyhow!(
+                "reference cGAN requires a reference image; pass --reference-image path/to/style.jpg"
+            )
+        })?;
+        return Ok(Box::new(mangahue_inference::ReferenceCganBackend::shared(
+            model_path,
+            reference_path,
+        )?));
+    }
     if mangahue_inference::is_ddcolor_onnx_model(model_path) {
         return Ok(Box::new(mangahue_inference::DdColorOnnxBackend::shared(
             model_path,
@@ -1057,7 +1071,7 @@ fn build_ensembler(
         .ensemble_model_paths
         .iter()
         .map(|path| {
-            select_backend_for_model(path, config)
+            select_backend_for_model(path, config, request.reference_image_path.as_deref())
                 .map(Arc::<dyn ColorizationBackend>::from)
                 .with_context(|| format!("failed to load ensemble model {}", path.display()))
         })
