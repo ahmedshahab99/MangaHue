@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 
 from mangahue_train.onnx_worker import _load_input, _pad_input
+from mangahue_train.ddcolor_onnx_worker import _lab_to_rgb, _rgb_to_lab_l
 
 
 def test_five_channel_input_normalizes_and_masks_hints(tmp_path: Path) -> None:
@@ -50,3 +51,15 @@ def test_input_padding_uses_white_lineart_and_empty_hints() -> None:
     assert np.all(padded[:, 0, :, 47:] == 1.0)
     assert np.all(padded[:, 1:, 33:, :] == 0.0)
     assert np.all(padded[:, 1:, :, 47:] == 0.0)
+
+
+def test_ddcolor_lab_round_trip_preserves_neutral_ramp() -> None:
+    ramp = np.linspace(0.0, 1.0, 64, dtype=np.float32)
+    rgb = np.repeat(ramp[:, None], 3, axis=1).reshape(8, 8, 3)
+    l_channel = _rgb_to_lab_l(rgb)
+    lab = np.stack(
+        (l_channel, np.zeros_like(l_channel), np.zeros_like(l_channel)),
+        axis=-1,
+    )
+    restored = _lab_to_rgb(lab)
+    assert np.max(np.abs(restored - rgb)) < 2e-4

@@ -12,7 +12,6 @@ mangahue-core = { path = "../mangahue-core" }
 mangahue-inference = { path = "../mangahue-inference" }
 serde.workspace = true
 serde_json.workspace = true
-rayon.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 

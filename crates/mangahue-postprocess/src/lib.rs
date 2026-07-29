@@ -1,3 +1,4 @@
+mod reference_finish;
 mod region_renderer;
 
 use anyhow::Result;
@@ -40,6 +41,12 @@ pub struct PostprocessReport {
     pub face_cavity_pixels: u64,
     #[serde(default)]
     pub region_pixels_rendered: u64,
+    #[serde(default)]
+    pub reference_pixels_finished: u64,
+    #[serde(default)]
+    pub reference_chroma_pixels_expanded: u64,
+    #[serde(default)]
+    pub reference_shadow_pixels_shaped: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
 }
@@ -59,6 +66,9 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         semantic_skin_regions: 0,
         face_cavity_pixels: 0,
         region_pixels_rendered: 0,
+        reference_pixels_finished: 0,
+        reference_chroma_pixels_expanded: 0,
+        reference_shadow_pixels_shaped: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
     };
@@ -96,6 +106,21 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         report.semantic_skin_regions = region_report.semantic_skin_regions;
         report.face_cavity_pixels = region_report.face_cavity_pixels;
         report.region_pixels_rendered = region_report.pixels_rendered;
+    }
+
+    if input.config.reference_finishing {
+        let finish_report = reference_finish::finish_reference_style(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.bubble_mask,
+            input.protected_mask,
+            input.style,
+            input.config,
+        );
+        report.reference_pixels_finished = finish_report.pixels_finished;
+        report.reference_chroma_pixels_expanded = finish_report.chroma_pixels_expanded;
+        report.reference_shadow_pixels_shaped = finish_report.shadow_pixels_shaped;
     }
 
     if let Some(tone_mask) = input.tone_mask {
@@ -1136,6 +1161,10 @@ mod tests {
             bleeding_correction: false,
             palette_correction: false,
             final_sharpening: 0.0,
+            reference_finishing: false,
+            target_colorfulness: 1.0,
+            midtone_depth: 0.08,
+            local_contrast: 0.12,
         };
 
         let (output, report) = finalize(PostprocessInput {

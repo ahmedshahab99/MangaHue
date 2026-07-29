@@ -5,10 +5,10 @@ use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
     CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
 };
-use mangahue_ensemble::{ConfidenceMap, Ensembler};
+use mangahue_ensemble::{ConfidenceMap, ConsensusStrategy, EnsembleConfig, Ensembler};
 use mangahue_hints::{
-    apply_region_locks_to_hints, enforce_region_locks, generate_hints, load_region_locks,
-    load_user_hints, propagate_hints, rasterize_region_locks,
+    apply_region_locks_to_hints, apply_region_style_hints, enforce_region_locks, generate_hints,
+    load_region_locks, load_user_hints, propagate_hints, rasterize_region_locks,
 };
 use mangahue_image::{crop_gray, crop_rgb, load_image, save_gray, save_rgb};
 use mangahue_inference::{
@@ -261,11 +261,22 @@ impl MangaHueEngine {
             &characters,
             &config.hints,
         );
+        apply_region_style_hints(
+            &mut hints,
+            &preprocess.clean_lineart,
+            &preprocess.bubble_mask,
+            &style,
+            &config.hints,
+        );
         report.hint_ms = hint_start.elapsed().as_millis();
         report.add_stage_report(
             StageReport::new("hints")
                 .metric("applied_hints", hints.applied_hints as f64)
                 .metric("style_hints", hints.style_hints_applied as f64)
+                .metric(
+                    "region_style_hints",
+                    hints.region_style_hints_applied as f64,
+                )
                 .metric("memory_hints", hints.memory_hints_applied as f64)
                 .metric("user_hints", hints.user_hints_applied as f64)
                 .metric("hint_coverage", mask_coverage(&hints.hint_mask) as f64),
@@ -329,7 +340,7 @@ impl MangaHueEngine {
 
         if use_ensemble {
             backend_name = "ensemble".to_string();
-            let ens = build_ensembler(&request, &config)?;
+            let ens = build_ensembler(&request, &config, &style)?;
             info!(
                 ensemble_variants = 1usize + request.ensemble_model_paths.len(),
                 jobs = parallel_jobs,
@@ -530,6 +541,18 @@ impl MangaHueEngine {
                 .metric(
                     "region_pixels_rendered",
                     postprocess_report.region_pixels_rendered as f64,
+                )
+                .metric(
+                    "reference_pixels_finished",
+                    postprocess_report.reference_pixels_finished as f64,
+                )
+                .metric(
+                    "reference_chroma_pixels_expanded",
+                    postprocess_report.reference_chroma_pixels_expanded as f64,
+                )
+                .metric(
+                    "reference_shadow_pixels_shaped",
+                    postprocess_report.reference_shadow_pixels_shaped as f64,
                 )
                 .metric(
                     "bubble_pixels_restored",
@@ -755,6 +778,18 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
+    select_backend_for_model(model_path, config)
+}
+
+fn select_backend_for_model(
+    model_path: &Path,
+    config: &EngineConfig,
+) -> Result<Box<dyn ColorizationBackend>> {
+    if mangahue_inference::is_ddcolor_onnx_model(model_path) {
+        return Ok(Box::new(mangahue_inference::DdColorOnnxBackend::shared(
+            model_path,
+        )?));
+    }
     if mangahue_inference::is_ddcolor_model_dir(model_path) {
         return Ok(Box::new(mangahue_inference::DdColorBackend::shared(
             model_path,
@@ -1012,20 +1047,31 @@ fn build_pool(jobs: usize) -> rayon::ThreadPool {
         })
 }
 
-fn build_ensembler(request: &ColorizeRequest, config: &EngineConfig) -> Result<Ensembler> {
-    let metadata_path = config.inference.model_metadata_path.as_path();
-    let mut model_paths: Vec<PathBuf> =
-        Vec::with_capacity(request.ensemble_model_paths.len().max(1));
-    model_paths.extend(request.ensemble_model_paths.iter().cloned());
-    if model_paths.is_empty() {
-        if let Some(ref primary) = request.model_path {
-            model_paths.push(primary.clone());
-        }
-    }
-    if model_paths.is_empty() {
-        return Err(anyhow!("ensemble requires at least one model path"));
-    }
-    Ensembler::from_onnx(&model_paths, metadata_path)
+fn build_ensembler(
+    request: &ColorizeRequest,
+    config: &EngineConfig,
+    style: &StyleProfile,
+) -> Result<Ensembler> {
+    let primary: Arc<dyn ColorizationBackend> = Arc::from(select_backend(request, config, style)?);
+    let auxiliaries = request
+        .ensemble_model_paths
+        .iter()
+        .map(|path| {
+            select_backend_for_model(path, config)
+                .map(Arc::<dyn ColorizationBackend>::from)
+                .with_context(|| format!("failed to load ensemble model {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Ensembler::new(
+        primary,
+        auxiliaries,
+        EnsembleConfig {
+            enabled: true,
+            fallback_mock_count: 0,
+            consensus_strategy: ConsensusStrategy::ChromaComplement,
+            weight_divergence: true,
+        },
+    ))
 }
 
 fn check_cancel(cancel: &Option<Arc<AtomicBool>>) -> bool {

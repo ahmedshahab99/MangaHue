@@ -1557,7 +1557,6 @@ dependencies = [
  "image",
  "mangahue-core",
  "mangahue-inference",
- "rayon",
  "serde",
  "serde_json",
  "tempfile",

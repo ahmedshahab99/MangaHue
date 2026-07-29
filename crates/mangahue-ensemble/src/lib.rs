@@ -4,7 +4,6 @@ use mangahue_core::ColorRgb;
 use mangahue_inference::{
     ColorizationBackend, MockColorizationBackend, ModelInput, OnnxColorizationBackend,
 };
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -36,6 +35,7 @@ pub enum ConsensusStrategy {
     MajorityWeighted,
     DivergenceReject,
     AverageBlend,
+    ChromaComplement,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,8 +157,11 @@ impl Ensembler {
             all.extend(self.auxiliaries.iter().map(Arc::clone));
             all
         };
+        // Model workers are already internally parallel. Running large CPU
+        // models concurrently multiplies peak memory and hurts throughput on
+        // the small production VPS, so variants are deliberately serialized.
         let results: Vec<BackendVariant> = all
-            .par_iter()
+            .iter()
             .map(|backend| {
                 let start = Instant::now();
                 let result = backend.colorize(input).map_err(|error| {
@@ -254,6 +257,26 @@ impl Ensembler {
                             confidence.placed(x, y, conf, ConfidenceCause::Consensus);
                         }
                     }
+                    ConsensusStrategy::ChromaComplement => {
+                        let (pixel, borrowed) =
+                            chroma_complement(votes[0], &votes[1..], disagreement);
+                        merged.put_pixel(x, y, Rgb(pixel));
+                        let confidence_value = if borrowed > 0.05 {
+                            (0.92 - disagreement * 0.28).clamp(0.35, 0.95)
+                        } else {
+                            (1.0 - disagreement * 0.35).clamp(0.45, 1.0)
+                        };
+                        confidence.placed(
+                            x,
+                            y,
+                            confidence_value,
+                            if borrowed > 0.05 {
+                                ConfidenceCause::ChromaBorrowed
+                            } else {
+                                ConfidenceCause::PrimaryOnly
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -297,6 +320,7 @@ pub enum ConfidenceCause {
     Consensus,
     PrimaryOnly,
     Blended,
+    ChromaBorrowed,
     SoftDisagreement,
     Rejected,
     NoBackends,
@@ -371,7 +395,7 @@ impl ConfidenceMap {
                 let cause = self.cause_at(x, y);
                 let intensity = match cause {
                     ConfidenceCause::SoftDisagreement | ConfidenceCause::Rejected => 200u8,
-                    ConfidenceCause::Blended => 80u8,
+                    ConfidenceCause::Blended | ConfidenceCause::ChromaBorrowed => 80u8,
                     ConfidenceCause::Consensus | ConfidenceCause::PrimaryOnly => 20u8,
                     ConfidenceCause::NoBackends => 255u8,
                 };
@@ -421,6 +445,140 @@ fn average_pixel(votes: &[[u8; 3]]) -> [u8; 3] {
     ]
 }
 
+fn chroma_complement(
+    primary: [u8; 3],
+    auxiliaries: &[[u8; 3]],
+    disagreement: f32,
+) -> ([u8; 3], f32) {
+    if auxiliaries.is_empty() {
+        return (primary, 0.0);
+    }
+
+    let primary_linear = [
+        srgb_to_linear(primary[0]),
+        srgb_to_linear(primary[1]),
+        srgb_to_linear(primary[2]),
+    ];
+    let primary_luma = linear_luma(primary_linear);
+    let primary_chroma = chroma_magnitude(primary_linear, primary_luma);
+    if primary_luma <= 0.012 || primary_luma >= 0.94 {
+        return (primary, 0.0);
+    }
+
+    let mut best = primary_linear;
+    let mut best_advantage = 0.0f32;
+    for auxiliary in auxiliaries {
+        let candidate = [
+            srgb_to_linear(auxiliary[0]),
+            srgb_to_linear(auxiliary[1]),
+            srgb_to_linear(auxiliary[2]),
+        ];
+        let candidate_luma = linear_luma(candidate);
+        let candidate_chroma = chroma_magnitude(candidate, candidate_luma);
+        let advantage = candidate_chroma - primary_chroma;
+        if advantage > best_advantage {
+            best = candidate;
+            best_advantage = advantage;
+        }
+    }
+
+    // Protect ink, paper white, and already-confident primary color. The
+    // auxiliary contributes chroma only in drawable midtones where it carries
+    // substantially more color evidence than the primary model.
+    let drawable =
+        smoothstep(0.025, 0.16, primary_luma) * (1.0 - smoothstep(0.88, 0.985, primary_luma));
+    let evidence = smoothstep(0.012, 0.105, best_advantage);
+    let neutral_need = 1.0 - smoothstep(0.09, 0.24, primary_chroma);
+    let agreement_guard = 1.0 - smoothstep(0.72, 1.0, disagreement);
+    let borrow =
+        (drawable * evidence * (0.36 + neutral_need * 0.64) * agreement_guard).clamp(0.0, 0.88);
+
+    if borrow <= 0.001 {
+        return (primary, 0.0);
+    }
+
+    let best_luma = linear_luma(best);
+    let best_chroma = [
+        best[0] - best_luma,
+        best[1] - best_luma,
+        best[2] - best_luma,
+    ];
+    let primary_chroma_vector = [
+        primary_linear[0] - primary_luma,
+        primary_linear[1] - primary_luma,
+        primary_linear[2] - primary_luma,
+    ];
+    let fused = [
+        primary_luma + mix(primary_chroma_vector[0], best_chroma[0], borrow),
+        primary_luma + mix(primary_chroma_vector[1], best_chroma[1], borrow),
+        primary_luma + mix(primary_chroma_vector[2], best_chroma[2], borrow),
+    ];
+    (gamut_map_preserving_luma(fused, primary_luma), borrow)
+}
+
+fn srgb_to_linear(value: u8) -> f32 {
+    let value = value as f32 / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn linear_luma(rgb: [f32; 3]) -> f32 {
+    rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722
+}
+
+fn chroma_magnitude(rgb: [f32; 3], luma: f32) -> f32 {
+    let dr = rgb[0] - luma;
+    let dg = rgb[1] - luma;
+    let db = rgb[2] - luma;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+fn gamut_map_preserving_luma(mut rgb: [f32; 3], luma: f32) -> [u8; 3] {
+    let min_channel = rgb.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_channel = rgb.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let scale_low = if min_channel < 0.0 {
+        luma / (luma - min_channel).max(1e-6)
+    } else {
+        1.0
+    };
+    let scale_high = if max_channel > 1.0 {
+        (1.0 - luma) / (max_channel - luma).max(1e-6)
+    } else {
+        1.0
+    };
+    let scale = scale_low.min(scale_high).clamp(0.0, 1.0);
+    for channel in &mut rgb {
+        *channel = luma + (*channel - luma) * scale;
+    }
+    [
+        linear_to_srgb(rgb[0]),
+        linear_to_srgb(rgb[1]),
+        linear_to_srgb(rgb[2]),
+    ]
+}
+
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn mix(a: f32, b: f32, amount: f32) -> f32 {
+    a + (b - a) * amount
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +606,35 @@ mod tests {
         assert_eq!(merged.dimensions(), (w, h));
         assert!(report.variant_count == 3);
         assert!(confidence.mean_confidence() > 0.0);
+    }
+
+    #[test]
+    fn chroma_complement_preserves_primary_luma_and_borrows_color() {
+        let primary = [150, 150, 150];
+        let auxiliary = [[210, 118, 82]];
+        let (fused, borrowed) = chroma_complement(primary, &auxiliary, 0.18);
+        let source_luma = linear_luma([
+            srgb_to_linear(primary[0]),
+            srgb_to_linear(primary[1]),
+            srgb_to_linear(primary[2]),
+        ]);
+        let fused_luma = linear_luma([
+            srgb_to_linear(fused[0]),
+            srgb_to_linear(fused[1]),
+            srgb_to_linear(fused[2]),
+        ]);
+        assert!(borrowed > 0.2);
+        assert!((source_luma - fused_luma).abs() < 0.015);
+        assert!(fused[0] > fused[1] && fused[1] > fused[2]);
+    }
+
+    #[test]
+    fn chroma_complement_protects_paper_and_ink() {
+        for primary in [[3, 3, 3], [252, 252, 252]] {
+            let (fused, borrowed) = chroma_complement(primary, &[[230, 70, 30]], 0.2);
+            assert_eq!(fused, primary);
+            assert!(borrowed < 0.01);
+        }
     }
 
     fn palette(rgb: [u8; 3]) -> Vec<mangahue_core::ColorRgb> {

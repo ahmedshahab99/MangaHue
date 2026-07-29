@@ -22,6 +22,8 @@ pub struct HintResult {
     pub style_hints_applied: usize,
     pub memory_hints_applied: usize,
     pub user_hints_applied: usize,
+    #[serde(default)]
+    pub region_style_hints_applied: usize,
     pub notes: Vec<String>,
 }
 
@@ -323,8 +325,276 @@ pub fn generate_hints(
         style_hints_applied,
         memory_hints_applied,
         user_hints_applied,
+        region_style_hints_applied: 0,
         notes,
     }
+}
+
+pub fn apply_region_style_hints(
+    result: &mut HintResult,
+    lineart: &GrayImage,
+    bubble_mask: &GrayImage,
+    style: &StyleProfile,
+    config: &HintsSection,
+) -> usize {
+    if !config.region_style_hints_enabled
+        || config.region_style_hint_budget == 0
+        || style.palette.is_empty()
+        || lineart.dimensions() != result.hint_mask.dimensions()
+        || bubble_mask.dimensions() != result.hint_mask.dimensions()
+    {
+        return 0;
+    }
+
+    let (width, height) = lineart.dimensions();
+    let len = width as usize * height as usize;
+    let mut visited = vec![false; len];
+    let mut components = Vec::<StyleRegion>::new();
+    let page_area = len.max(1) as u64;
+    let minimum_area = (page_area / 5000).max(48);
+    let maximum_area = page_area * 28 / 100;
+
+    for start_y in 0..height {
+        for start_x in 0..width {
+            let start = (start_y * width + start_x) as usize;
+            if visited[start]
+                || lineart.get_pixel(start_x, start_y)[0] < 168
+                || bubble_mask.get_pixel(start_x, start_y)[0] > 72
+            {
+                continue;
+            }
+
+            let mut queue = VecDeque::from([(start_x, start_y)]);
+            visited[start] = true;
+            let mut region = StyleRegion::new(start_x, start_y);
+            while let Some((x, y)) = queue.pop_front() {
+                let gray = lineart.get_pixel(x, y)[0];
+                let bubble = bubble_mask.get_pixel(x, y)[0];
+                if gray < 168 || bubble > 72 {
+                    continue;
+                }
+                region.accumulate(x, y, gray, width, height);
+                for (dx, dy) in [(-1_i32, 0_i32), (1, 0), (0, -1), (0, 1)] {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
+                        continue;
+                    }
+                    let nx = nx as u32;
+                    let ny = ny as u32;
+                    let index = (ny * width + nx) as usize;
+                    if !visited[index]
+                        && lineart.get_pixel(nx, ny)[0] >= 168
+                        && bubble_mask.get_pixel(nx, ny)[0] <= 72
+                    {
+                        visited[index] = true;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+            if region.area >= minimum_area
+                && region.area <= maximum_area
+                && !region.touches_page_border
+            {
+                components.push(region);
+            }
+        }
+    }
+
+    components.sort_by(|left, right| {
+        region_priority(right, page_area).total_cmp(&region_priority(left, page_area))
+    });
+    let palette = style
+        .palette
+        .iter()
+        .copied()
+        .filter(|color| palette_chroma(*color) >= 14)
+        .collect::<Vec<_>>();
+    if palette.is_empty() {
+        return 0;
+    }
+
+    let mut applied = 0usize;
+    let mut previous_color: Option<ColorRgb> = None;
+    for (rank, region) in components
+        .into_iter()
+        .take(config.region_style_hint_budget)
+        .enumerate()
+    {
+        let luma = region.luma_sum as f32 / region.area.max(1) as f32;
+        let color = select_region_palette_color(&palette, luma, rank, previous_color);
+        let radius = ((region.area as f32).sqrt() * 0.075)
+            .round()
+            .clamp(3.0, 14.0) as u32;
+        let (x, y) = find_region_seed(
+            lineart,
+            bubble_mask,
+            region.center_x(),
+            region.center_y(),
+            &region,
+        );
+        let hint = ColorHint {
+            x,
+            y,
+            radius,
+            color,
+            label: Some("region_style".to_string()),
+            strength: (0.16 * config.hint_strength).clamp(0.0, 0.28),
+            source: HintSource::PaletteRule,
+        };
+        rasterize_hint(&mut result.hint_map, &mut result.hint_mask, &hint, 1.0);
+        previous_color = Some(color);
+        applied += 1;
+    }
+
+    result.applied_hints += applied;
+    result.region_style_hints_applied += applied;
+    if applied > 0 {
+        result.notes.push(format!(
+            "region palette director applied {applied} bounded material hint(s)"
+        ));
+    }
+    applied
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StyleRegion {
+    area: u64,
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+    x_sum: u64,
+    y_sum: u64,
+    luma_sum: u64,
+    touches_page_border: bool,
+}
+
+impl StyleRegion {
+    fn new(x: u32, y: u32) -> Self {
+        Self {
+            area: 0,
+            min_x: x,
+            min_y: y,
+            max_x: x,
+            max_y: y,
+            x_sum: 0,
+            y_sum: 0,
+            luma_sum: 0,
+            touches_page_border: false,
+        }
+    }
+
+    fn accumulate(&mut self, x: u32, y: u32, gray: u8, width: u32, height: u32) {
+        self.area += 1;
+        self.min_x = self.min_x.min(x);
+        self.min_y = self.min_y.min(y);
+        self.max_x = self.max_x.max(x);
+        self.max_y = self.max_y.max(y);
+        self.x_sum += x as u64;
+        self.y_sum += y as u64;
+        self.luma_sum += gray as u64;
+        self.touches_page_border |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
+    }
+
+    fn center_x(self) -> u32 {
+        (self.x_sum / self.area.max(1)) as u32
+    }
+
+    fn center_y(self) -> u32 {
+        (self.y_sum / self.area.max(1)) as u32
+    }
+}
+
+fn region_priority(region: &StyleRegion, page_area: u64) -> f32 {
+    let area = region.area as f32 / page_area.max(1) as f32;
+    let width = (region.max_x - region.min_x + 1) as f32;
+    let height = (region.max_y - region.min_y + 1) as f32;
+    let fill = region.area as f32 / (width * height).max(1.0);
+    area.sqrt() * 0.72 + fill.clamp(0.0, 1.0) * 0.28
+}
+
+fn palette_chroma(color: ColorRgb) -> u8 {
+    color
+        .r
+        .max(color.g)
+        .max(color.b)
+        .saturating_sub(color.r.min(color.g).min(color.b))
+}
+
+fn color_luma(color: ColorRgb) -> f32 {
+    0.2126 * color.r as f32 + 0.7152 * color.g as f32 + 0.0722 * color.b as f32
+}
+
+fn select_region_palette_color(
+    palette: &[ColorRgb],
+    region_luma: f32,
+    rank: usize,
+    previous: Option<ColorRgb>,
+) -> ColorRgb {
+    palette
+        .iter()
+        .copied()
+        .enumerate()
+        .min_by(|(left_index, left), (right_index, right)| {
+            let score = |index: usize, color: ColorRgb| {
+                let luma_cost = (color_luma(color) - region_luma).abs();
+                let repeat_cost = previous
+                    .map(|last| color_distance(last, color) < 34.0)
+                    .unwrap_or(false) as u8 as f32
+                    * 22.0;
+                let diversity = ((index + rank * 3) % palette.len()) as f32 * 0.35;
+                luma_cost + repeat_cost + diversity
+            };
+            score(*left_index, *left).total_cmp(&score(*right_index, *right))
+        })
+        .map(|(_, color)| color)
+        .unwrap_or(palette[0])
+}
+
+fn color_distance(left: ColorRgb, right: ColorRgb) -> f32 {
+    let dr = left.r as f32 - right.r as f32;
+    let dg = left.g as f32 - right.g as f32;
+    let db = left.b as f32 - right.b as f32;
+    (dr * dr + dg * dg + db * db).sqrt()
+}
+
+fn find_region_seed(
+    lineart: &GrayImage,
+    bubble_mask: &GrayImage,
+    center_x: u32,
+    center_y: u32,
+    region: &StyleRegion,
+) -> (u32, u32) {
+    let mut best = (center_x, center_y);
+    let mut best_score = 0_u8;
+    let step_x = ((region.max_x - region.min_x + 1) / 16).max(1);
+    let step_y = ((region.max_y - region.min_y + 1) / 16).max(1);
+    let mut y = region.min_y;
+    while y <= region.max_y {
+        let mut x = region.min_x;
+        while x <= region.max_x {
+            if bubble_mask.get_pixel(x, y)[0] <= 72 {
+                let score = lineart.get_pixel(x, y)[0];
+                let distance_bias =
+                    (x.abs_diff(center_x) + y.abs_diff(center_y)).min(255) as u8 / 8;
+                let score = score.saturating_sub(distance_bias);
+                if score > best_score {
+                    best = (x, y);
+                    best_score = score;
+                }
+            }
+            x = x.saturating_add(step_x);
+            if x == 0 {
+                break;
+            }
+        }
+        y = y.saturating_add(step_y);
+        if y == 0 {
+            break;
+        }
+    }
+    best
 }
 
 pub fn rasterize_hint(
@@ -1147,5 +1417,50 @@ mod tests {
 
         let (_, unchanged) = propagate_hints(&map, &mask, &lineart, 0, 0.2);
         assert_eq!(unchanged, mask);
+    }
+
+    #[test]
+    fn region_style_director_seeds_enclosed_materials_and_excludes_bubbles() {
+        let mut config = EngineConfig::default();
+        config.hints.style_hints_enabled = false;
+        config.hints.region_style_hints_enabled = true;
+        config.hints.region_style_hint_budget = 8;
+        let size = ImageSize::new(96, 64);
+        let mut result = generate_hints(size, None, &StyleProfile::default(), &[], &config.hints);
+        let mut lineart = GrayImage::from_pixel(96, 64, Luma([255]));
+        let mut bubbles = GrayImage::from_pixel(96, 64, Luma([0]));
+        for x in 8..40 {
+            lineart.put_pixel(x, 8, Luma([0]));
+            lineart.put_pixel(x, 40, Luma([0]));
+        }
+        for y in 8..=40 {
+            lineart.put_pixel(8, y, Luma([0]));
+            lineart.put_pixel(40, y, Luma([0]));
+        }
+        for x in 54..86 {
+            lineart.put_pixel(x, 8, Luma([0]));
+            lineart.put_pixel(x, 40, Luma([0]));
+        }
+        for y in 8..=40 {
+            lineart.put_pixel(54, y, Luma([0]));
+            lineart.put_pixel(86, y, Luma([0]));
+        }
+        for y in 9..40 {
+            for x in 55..86 {
+                bubbles.put_pixel(x, y, Luma([255]));
+            }
+        }
+
+        let applied = apply_region_style_hints(
+            &mut result,
+            &lineart,
+            &bubbles,
+            &StyleProfile::default(),
+            &config.hints,
+        );
+
+        assert_eq!(applied, 1);
+        assert!((9..40).any(|y| (9..40).any(|x| result.hint_mask.get_pixel(x, y)[0] > 0)));
+        assert!((9..40).all(|y| (55..86).all(|x| result.hint_mask.get_pixel(x, y)[0] == 0)));
     }
 }

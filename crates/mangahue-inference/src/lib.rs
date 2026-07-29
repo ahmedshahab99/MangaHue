@@ -144,6 +144,167 @@ pub fn is_ddcolor_model_dir(path: impl AsRef<Path>) -> bool {
     path.join("pytorch_model.pt").is_file() || path.join("models").is_dir()
 }
 
+pub fn is_ddcolor_onnx_model(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.is_file()
+        && path.extension().and_then(|value| value.to_str()) == Some("onnx")
+        && path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("ddcolor"))
+}
+
+#[derive(Debug, Clone)]
+struct DdColorOnnxWorkerLaunch {
+    python: String,
+    model_path: PathBuf,
+    worker_threads: usize,
+}
+
+impl DdColorOnnxWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let child = Command::new(&self.python)
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.ddcolor_onnx_worker")
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to launch DDColor ONNX worker with '{}'",
+                    self.python
+                )
+            })?;
+        let mut process =
+            attach_worker_process(child, "ddcolor-onnx-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "DDColor ONNX worker")?;
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+pub struct DdColorOnnxBackend {
+    launch: DdColorOnnxWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+impl DdColorOnnxBackend {
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+        let requested_path = model_path.as_ref();
+        let model_path = requested_path.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve DDColor ONNX model {}",
+                requested_path.display()
+            )
+        })?;
+        if !is_ddcolor_onnx_model(&model_path) {
+            anyhow::bail!(
+                "DDColor ONNX model name must contain 'ddcolor': {}",
+                model_path.display()
+            );
+        }
+        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let launch = DdColorOnnxWorkerLaunch {
+            python,
+            model_path,
+            worker_threads,
+        };
+        let process = launch.spawn()?;
+        Ok(Self {
+            launch,
+            process: Mutex::new(process),
+        })
+    }
+
+    pub fn shared(model_path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<DdColorOnnxBackend>>>> = OnceLock::new();
+        let canonical = model_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve DDColor ONNX model {}",
+                model_path.as_ref().display()
+            )
+        })?;
+        let key = canonical.to_string_lossy().to_string();
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|error| anyhow!("DDColor ONNX registry poisoned: {error}"))?;
+        if let Some(worker) = workers.get(&key) {
+            return Ok(Arc::clone(worker));
+        }
+        let worker = Arc::new(Self::new(&canonical)?);
+        workers.insert(key, Arc::clone(&worker));
+        Ok(worker)
+    }
+}
+
+impl ColorizationBackend for DdColorOnnxBackend {
+    fn name(&self) -> &str {
+        "ddcolor-tiny-onnx"
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let temp = tempfile::tempdir()
+            .map_err(|error| EngineError::Inference(format!("DDColor temp dir: {error}")))?;
+        let lineart_path = temp.path().join("lineart.png");
+        let output_path = temp.path().join("output.png");
+        input
+            .lineart
+            .save(&lineart_path)
+            .map_err(|error| EngineError::Inference(format!("DDColor save: {error}")))?;
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "output": output_path,
+        });
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|error| EngineError::Inference(format!("DDColor lock: {error}")))?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "DDColor ONNX worker failed ({first_error}) and restart failed: {restart_error}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "DDColor ONNX worker failed after restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!(
+                "DDColor ONNX failed: {}",
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+            )));
+        }
+        image::open(&output_path)
+            .map(|image| image.to_rgb8())
+            .map_err(|error| EngineError::Inference(format!("DDColor output: {error}")))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DdColorWorkerLaunch {
     python: String,

@@ -63,6 +63,14 @@ pub struct HintsSection {
     pub style_hints_enabled: bool,
     pub hint_blur_radius: f32,
     pub hint_strength: f32,
+    #[serde(default)]
+    pub region_style_hints_enabled: bool,
+    #[serde(default = "default_region_style_hint_budget")]
+    pub region_style_hint_budget: usize,
+}
+
+fn default_region_style_hint_budget() -> usize {
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +92,26 @@ pub struct PostprocessSection {
     pub bleeding_correction: bool,
     pub palette_correction: bool,
     pub final_sharpening: f32,
+    #[serde(default)]
+    pub reference_finishing: bool,
+    #[serde(default = "default_target_colorfulness")]
+    pub target_colorfulness: f32,
+    #[serde(default = "default_midtone_depth")]
+    pub midtone_depth: f32,
+    #[serde(default = "default_local_contrast")]
+    pub local_contrast: f32,
+}
+
+fn default_target_colorfulness() -> f32 {
+    1.0
+}
+
+fn default_midtone_depth() -> f32 {
+    0.08
+}
+
+fn default_local_contrast() -> f32 {
+    0.12
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +190,8 @@ impl Default for EngineConfig {
                 style_hints_enabled: true,
                 hint_blur_radius: 4.0,
                 hint_strength: 1.0,
+                region_style_hints_enabled: false,
+                region_style_hint_budget: default_region_style_hint_budget(),
             },
             inference: InferenceSection {
                 model_path: PathBuf::from("models/example_model.onnx.placeholder"),
@@ -179,6 +209,10 @@ impl Default for EngineConfig {
                 bleeding_correction: true,
                 palette_correction: true,
                 final_sharpening: 0.15,
+                reference_finishing: false,
+                target_colorfulness: default_target_colorfulness(),
+                midtone_depth: default_midtone_depth(),
+                local_contrast: default_local_contrast(),
             },
             output: OutputSection {
                 format: "png".to_string(),
@@ -231,8 +265,22 @@ impl EngineConfig {
         if !(1..=100).contains(&self.output.quality) {
             return Err(anyhow!("output.quality must be in 1..=100"));
         }
+        if !(0.0..=2.5).contains(&self.postprocess.target_colorfulness) {
+            return Err(anyhow!(
+                "postprocess.target_colorfulness must be in 0.0..=2.5"
+            ));
+        }
+        if !(0.0..=0.35).contains(&self.postprocess.midtone_depth) {
+            return Err(anyhow!("postprocess.midtone_depth must be in 0.0..=0.35"));
+        }
+        if !(0.0..=0.6).contains(&self.postprocess.local_contrast) {
+            return Err(anyhow!("postprocess.local_contrast must be in 0.0..=0.6"));
+        }
         if self.engine.parallel_jobs > 256 {
             return Err(anyhow!("engine.parallel_jobs must be <= 256"));
+        }
+        if self.hints.region_style_hint_budget > 128 {
+            return Err(anyhow!("hints.region_style_hint_budget must be <= 128"));
         }
         Ok(())
     }

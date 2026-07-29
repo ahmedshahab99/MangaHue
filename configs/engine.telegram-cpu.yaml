@@ -30,6 +30,8 @@ hints:
   style_hints_enabled: true
   hint_blur_radius: 4.0
   hint_strength: 1.0
+  region_style_hints_enabled: true
+  region_style_hint_budget: 18
 
 postprocess:
   restore_lines: true
@@ -38,6 +40,10 @@ postprocess:
   bleeding_correction: false
   palette_correction: true
   final_sharpening: 0.02
+  reference_finishing: true
+  target_colorfulness: 1.55
+  midtone_depth: 0.16
+  local_contrast: 0.22
 
 output:
   format: png
