@@ -1775,6 +1775,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "image",
  "mangahue-export",
  "mangahue-ingest",
  "mangahue-orchestrator",

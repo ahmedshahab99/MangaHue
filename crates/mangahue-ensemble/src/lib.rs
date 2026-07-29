@@ -44,6 +44,8 @@ pub struct EnsembleReport {
     pub consensus_strategy: ConsensusStrategy,
     pub divergence_score: f32,
     pub pixel_disagreement_ratio: f32,
+    #[serde(default)]
+    pub semantic_rescue_pixels: u64,
     pub per_variant_times_ms: Vec<u128>,
     pub total_ms: u128,
     pub verdict: EnsemblerVerdict,
@@ -171,6 +173,7 @@ impl Ensembler {
                 result.map(|image| BackendVariant {
                     image,
                     elapsed_ms: ms,
+                    highlight_rescue: backend.name() == "anime-face-palette",
                 })
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -187,6 +190,7 @@ impl Ensembler {
         let mut merged = RgbImage::new(w, h);
         let mut confidence = ConfidenceMap::new(w, h);
         let mut per_pixel_disagreement = 0u64;
+        let mut semantic_rescue_pixels = 0u64;
         let total_pixels = (w as u64).saturating_mul(h as u64);
 
         for y in 0..h {
@@ -258,8 +262,23 @@ impl Ensembler {
                         }
                     }
                     ConsensusStrategy::ChromaComplement => {
-                        let (pixel, borrowed) =
-                            chroma_complement(votes[0], &votes[1..], disagreement);
+                        let auxiliaries = variants[1..]
+                            .iter()
+                            .map(|variant| {
+                                (
+                                    {
+                                        let pixel = variant.image.get_pixel(x, y);
+                                        [pixel[0], pixel[1], pixel[2]]
+                                    },
+                                    variant.highlight_rescue,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let (pixel, borrowed, semantic_rescue) =
+                            chroma_complement(votes[0], &auxiliaries, disagreement);
+                        if semantic_rescue {
+                            semantic_rescue_pixels += 1;
+                        }
                         merged.put_pixel(x, y, Rgb(pixel));
                         let confidence_value = if borrowed > 0.05 {
                             (0.92 - disagreement * 0.28).clamp(0.35, 0.95)
@@ -300,6 +319,7 @@ impl Ensembler {
             consensus_strategy: self.config.consensus_strategy,
             divergence_score,
             pixel_disagreement_ratio,
+            semantic_rescue_pixels,
             per_variant_times_ms: variants.iter().map(|v| v.elapsed_ms).collect(),
             total_ms: total_variant_ms,
             verdict,
@@ -312,6 +332,7 @@ impl Ensembler {
 struct BackendVariant {
     image: RgbImage,
     elapsed_ms: u128,
+    highlight_rescue: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,11 +468,11 @@ fn average_pixel(votes: &[[u8; 3]]) -> [u8; 3] {
 
 fn chroma_complement(
     primary: [u8; 3],
-    auxiliaries: &[[u8; 3]],
+    auxiliaries: &[([u8; 3], bool)],
     disagreement: f32,
-) -> ([u8; 3], f32) {
+) -> ([u8; 3], f32, bool) {
     if auxiliaries.is_empty() {
-        return (primary, 0.0);
+        return (primary, 0.0, false);
     }
 
     let primary_linear = [
@@ -461,13 +482,19 @@ fn chroma_complement(
     ];
     let primary_luma = linear_luma(primary_linear);
     let primary_chroma = chroma_magnitude(primary_linear, primary_luma);
-    if primary_luma <= 0.012 || primary_luma >= 0.94 {
-        return (primary, 0.0);
+    if primary_luma <= 0.012 {
+        return (primary, 0.0, false);
     }
 
     let mut best = primary_linear;
     let mut best_advantage = 0.0f32;
-    for auxiliary in auxiliaries {
+    let mut best_allows_highlight_rescue = false;
+    let mut rescue_best = primary_linear;
+    let mut rescue_advantage = 0.0f32;
+    for (auxiliary, allows_highlight_rescue) in auxiliaries {
+        if primary_luma >= 0.94 && !allows_highlight_rescue {
+            continue;
+        }
         let candidate = [
             srgb_to_linear(auxiliary[0]),
             srgb_to_linear(auxiliary[1]),
@@ -476,17 +503,63 @@ fn chroma_complement(
         let candidate_luma = linear_luma(candidate);
         let candidate_chroma = chroma_magnitude(candidate, candidate_luma);
         let advantage = candidate_chroma - primary_chroma;
+        if *allows_highlight_rescue && advantage > rescue_advantage {
+            rescue_best = candidate;
+            rescue_advantage = advantage;
+        }
         if advantage > best_advantage {
             best = candidate;
             best_advantage = advantage;
+            best_allows_highlight_rescue = *allows_highlight_rescue;
         }
+    }
+
+    // Sparse semantic experts return neutral grayscale outside their detected
+    // material. Their chromatic pixels are therefore an implicit confidence
+    // mask and should survive full-page model disagreement and paper guards.
+    if rescue_advantage >= 0.018 && primary_luma >= 0.08 {
+        let rescue_luma = linear_luma(rescue_best);
+        let rescue_chroma = [
+            rescue_best[0] - rescue_luma,
+            rescue_best[1] - rescue_luma,
+            rescue_best[2] - rescue_luma,
+        ];
+        let primary_chroma_vector = [
+            primary_linear[0] - primary_luma,
+            primary_linear[1] - primary_luma,
+            primary_linear[2] - primary_luma,
+        ];
+        let neutral_need = 1.0 - smoothstep(0.045, 0.18, primary_chroma);
+        let evidence = smoothstep(0.018, 0.11, rescue_advantage);
+        let borrow = (0.48 + 0.34 * neutral_need) * evidence;
+        let target_luma = mix(primary_luma, linear_luma(rescue_best), 0.14 * evidence);
+        let fused = [
+            target_luma + mix(primary_chroma_vector[0], rescue_chroma[0], borrow),
+            target_luma + mix(primary_chroma_vector[1], rescue_chroma[1], borrow),
+            target_luma + mix(primary_chroma_vector[2], rescue_chroma[2], borrow),
+        ];
+        return (gamut_map_preserving_luma(fused, target_luma), borrow, true);
+    }
+    if primary_luma >= 0.68 && primary_chroma <= 0.09 && rescue_advantage >= 0.08 {
+        best = rescue_best;
+        best_advantage = rescue_advantage;
+        best_allows_highlight_rescue = true;
+    }
+    if primary_luma >= 0.94 && !best_allows_highlight_rescue {
+        return (primary, 0.0, false);
     }
 
     // Protect ink, paper white, and already-confident primary color. The
     // auxiliary contributes chroma only in drawable midtones where it carries
     // substantially more color evidence than the primary model.
+    let highlight_rescue = if best_allows_highlight_rescue {
+        smoothstep(0.14, 0.28, best_advantage)
+    } else {
+        0.0
+    };
+    let paper_guard = smoothstep(0.88, 0.985, primary_luma);
     let drawable =
-        smoothstep(0.025, 0.16, primary_luma) * (1.0 - smoothstep(0.88, 0.985, primary_luma));
+        smoothstep(0.025, 0.16, primary_luma) * (1.0 - paper_guard * (1.0 - highlight_rescue));
     let evidence = smoothstep(0.012, 0.105, best_advantage);
     let neutral_need = 1.0 - smoothstep(0.035, 0.16, primary_chroma);
     let agreement_guard = 1.0 - smoothstep(0.72, 1.0, disagreement);
@@ -494,7 +567,7 @@ fn chroma_complement(
         (drawable * evidence * (0.04 + neutral_need * 0.76) * agreement_guard).clamp(0.0, 0.62);
 
     if borrow <= 0.001 {
-        return (primary, 0.0);
+        return (primary, 0.0, false);
     }
 
     let best_luma = linear_luma(best);
@@ -508,12 +581,21 @@ fn chroma_complement(
         primary_linear[1] - primary_luma,
         primary_linear[2] - primary_luma,
     ];
+    let target_luma = if primary_luma >= 0.94 && highlight_rescue > 0.0 {
+        mix(primary_luma, best_luma, borrow * 0.42)
+    } else {
+        primary_luma
+    };
     let fused = [
-        primary_luma + mix(primary_chroma_vector[0], best_chroma[0], borrow),
-        primary_luma + mix(primary_chroma_vector[1], best_chroma[1], borrow),
-        primary_luma + mix(primary_chroma_vector[2], best_chroma[2], borrow),
+        target_luma + mix(primary_chroma_vector[0], best_chroma[0], borrow),
+        target_luma + mix(primary_chroma_vector[1], best_chroma[1], borrow),
+        target_luma + mix(primary_chroma_vector[2], best_chroma[2], borrow),
     ];
-    (gamut_map_preserving_luma(fused, primary_luma), borrow)
+    (
+        gamut_map_preserving_luma(fused, target_luma),
+        borrow,
+        best_allows_highlight_rescue,
+    )
 }
 
 fn srgb_to_linear(value: u8) -> f32 {
@@ -611,8 +693,8 @@ mod tests {
     #[test]
     fn chroma_complement_preserves_primary_luma_and_borrows_color() {
         let primary = [150, 150, 150];
-        let auxiliary = [[210, 118, 82]];
-        let (fused, borrowed) = chroma_complement(primary, &auxiliary, 0.18);
+        let auxiliary = [([210, 118, 82], false)];
+        let (fused, borrowed, _) = chroma_complement(primary, &auxiliary, 0.18);
         let source_luma = linear_luma([
             srgb_to_linear(primary[0]),
             srgb_to_linear(primary[1]),
@@ -631,10 +713,35 @@ mod tests {
     #[test]
     fn chroma_complement_protects_paper_and_ink() {
         for primary in [[3, 3, 3], [252, 252, 252]] {
-            let (fused, borrowed) = chroma_complement(primary, &[[230, 70, 30]], 0.2);
+            let (fused, borrowed, _) = chroma_complement(primary, &[([230, 70, 30], false)], 0.2);
             assert_eq!(fused, primary);
             assert!(borrowed < 0.01);
         }
+    }
+
+    #[test]
+    fn face_expert_can_rescue_bright_skin_without_disabling_paper_guard() {
+        let primary = [255, 255, 255];
+        let face = [([250, 205, 189], true)];
+
+        let (fused, borrowed, rescued) = chroma_complement(primary, &face, 0.18);
+
+        assert!(borrowed > 0.4);
+        assert!(rescued);
+        assert!(fused[0] > fused[1] && fused[1] > fused[2]);
+        assert!(fused[1] < 250);
+    }
+
+    #[test]
+    fn face_expert_wins_on_bright_neutral_face_pixels() {
+        let primary = [235, 235, 235];
+        let auxiliaries = [([120, 60, 180], false), ([250, 205, 189], true)];
+
+        let (fused, borrowed, rescued) = chroma_complement(primary, &auxiliaries, 0.2);
+
+        assert!(borrowed > 0.3);
+        assert!(rescued);
+        assert!(fused[0] > fused[1] && fused[1] > fused[2]);
     }
 
     fn palette(rgb: [u8; 3]) -> Vec<mangahue_core::ColorRgb> {

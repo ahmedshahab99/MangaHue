@@ -47,12 +47,15 @@ pub struct PostprocessReport {
     pub reference_chroma_pixels_expanded: u64,
     #[serde(default)]
     pub reference_shadow_pixels_shaped: u64,
+    #[serde(default)]
+    pub semantic_chroma_restored: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
 }
 
 pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessReport)> {
     let mut output = input.colorized;
+    let semantic_evidence = output.clone();
     let mut report = PostprocessReport {
         bubble_pixels_restored: 0,
         protected_pixels_restored: 0,
@@ -69,6 +72,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         reference_pixels_finished: 0,
         reference_chroma_pixels_expanded: 0,
         reference_shadow_pixels_shaped: 0,
+        semantic_chroma_restored: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
     };
@@ -123,6 +127,13 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         report.reference_shadow_pixels_shaped = finish_report.shadow_pixels_shaped;
     }
 
+    restore_semantic_chroma(
+        &mut output,
+        &semantic_evidence,
+        input.line_mask,
+        &mut report.semantic_chroma_restored,
+    );
+
     if let Some(tone_mask) = input.tone_mask {
         preserve_screentones(
             &mut output,
@@ -156,6 +167,45 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         sharpen_lightly(&mut output, input.config.final_sharpening);
     }
     Ok((output, report))
+}
+
+fn restore_semantic_chroma(
+    output: &mut RgbImage,
+    evidence: &RgbImage,
+    line_mask: &GrayImage,
+    restored: &mut u64,
+) {
+    for (x, y, pixel) in output.enumerate_pixels_mut() {
+        if line_mask.get_pixel(x, y)[0] > 172 {
+            continue;
+        }
+        let source = evidence.get_pixel(x, y);
+        let source_max = source[0].max(source[1]).max(source[2]);
+        let source_min = source[0].min(source[1]).min(source[2]);
+        let source_chroma = (source_max - source_min) as f32;
+        if !(18.0..=112.0).contains(&source_chroma) {
+            continue;
+        }
+        let output_max = pixel[0].max(pixel[1]).max(pixel[2]);
+        let output_min = pixel[0].min(pixel[1]).min(pixel[2]);
+        let output_chroma = (output_max - output_min) as f32;
+        if output_chroma >= source_chroma * 0.66 {
+            continue;
+        }
+
+        let source_luma =
+            0.2126 * source[0] as f32 + 0.7152 * source[1] as f32 + 0.0722 * source[2] as f32;
+        let output_luma =
+            0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
+        if source_luma < 42.0 || output_luma < 35.0 {
+            continue;
+        }
+        let strength = (0.62 + (source_chroma - output_chroma) / 180.0).clamp(0.62, 0.84);
+        let red = (source[0] as f32 - source_luma) * strength;
+        let blue = (source[2] as f32 - source_luma) * strength;
+        *pixel = rgb_from_luma_chroma(output_luma, red, blue);
+        *restored += 1;
+    }
 }
 
 pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayImage) -> RgbImage {
@@ -377,6 +427,10 @@ pub fn clean_speech_bubbles(
 ) {
     for (x, y, pixel) in image.enumerate_pixels_mut() {
         if bubble_mask.get_pixel(x, y)[0] == 0 {
+            continue;
+        }
+        let chroma = pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
+        if chroma >= 14 {
             continue;
         }
         let original_luma = original_gray.get_pixel(x, y)[0] as f32;
@@ -1133,7 +1187,7 @@ mod tests {
 
     #[test]
     fn bubble_cleanup_whitens_bright_regions_and_preserves_text() {
-        let mut image = RgbImage::from_pixel(2, 1, Rgb([120, 80, 60]));
+        let mut image = RgbImage::from_pixel(2, 1, Rgb([120, 120, 120]));
         let mut original = GrayImage::from_pixel(2, 1, Luma([255]));
         original.put_pixel(1, 0, Luma([0]));
         let mask = GrayImage::from_pixel(2, 1, Luma([255]));
@@ -1143,7 +1197,38 @@ mod tests {
 
         assert_eq!(restored, 2);
         assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255]);
-        assert_eq!(image.get_pixel(1, 0).0, [120, 80, 60]);
+        assert_eq!(image.get_pixel(1, 0).0, [120, 120, 120]);
+    }
+
+    #[test]
+    fn bubble_cleanup_does_not_erase_confident_material_color() {
+        let mut image = RgbImage::from_pixel(2, 1, Rgb([238, 198, 181]));
+        image.put_pixel(1, 0, Rgb([228, 224, 222]));
+        let original = GrayImage::from_pixel(2, 1, Luma([244]));
+        let mask = GrayImage::from_pixel(2, 1, Luma([255]));
+        let mut restored = 0;
+
+        clean_speech_bubbles(&mut image, &original, &mask, &mut restored);
+
+        assert_eq!(image.get_pixel(0, 0).0, [238, 198, 181]);
+        assert!(image.get_pixel(1, 0)[0] > 245);
+        assert_eq!(restored, 1);
+    }
+
+    #[test]
+    fn semantic_evidence_restores_lost_skin_chroma_without_changing_luma() {
+        let evidence = RgbImage::from_pixel(1, 1, Rgb([240, 194, 178]));
+        let mut output = RgbImage::from_pixel(1, 1, Rgb([214, 212, 211]));
+        let lines = GrayImage::from_pixel(1, 1, Luma([0]));
+        let before = rgb_luma(output.get_pixel(0, 0));
+        let mut restored = 0;
+
+        restore_semantic_chroma(&mut output, &evidence, &lines, &mut restored);
+
+        let pixel = output.get_pixel(0, 0);
+        assert_eq!(restored, 1);
+        assert!(pixel[0] > pixel[1] && pixel[1] > pixel[2]);
+        assert!((rgb_luma(pixel) - before).abs() < 1.5);
     }
 
     #[test]

@@ -483,7 +483,8 @@ impl MangaHueEngine {
         if let Some(ref er) = ensemble_report {
             inference_report = inference_report
                 .metric("ensemble_variants", er.variant_count as f64)
-                .metric("divergence_score", er.divergence_score as f64);
+                .metric("divergence_score", er.divergence_score as f64)
+                .metric("semantic_rescue_pixels", er.semantic_rescue_pixels as f64);
         }
         report.add_stage_report(inference_report);
 
@@ -497,6 +498,13 @@ impl MangaHueEngine {
         } else {
             None
         };
+
+        if let Some(debug_dir) = request.debug_dir.as_deref() {
+            fs::create_dir_all(debug_dir)?;
+            let path = debug_dir.join("ensemble_merged.png");
+            save_rgb(&path, &merged)?;
+            report.debug_files.push(path);
+        }
 
         let postprocess_start = Instant::now();
         emit_progress(&progress, "postprocess", 5, 6, None);
@@ -555,6 +563,10 @@ impl MangaHueEngine {
                 .metric(
                     "reference_shadow_pixels_shaped",
                     postprocess_report.reference_shadow_pixels_shaped as f64,
+                )
+                .metric(
+                    "semantic_chroma_restored",
+                    postprocess_report.semantic_chroma_restored as f64,
                 )
                 .metric(
                     "bubble_pixels_restored",
@@ -788,6 +800,11 @@ fn select_backend_for_model(
     config: &EngineConfig,
     reference_image_path: Option<&Path>,
 ) -> Result<Box<dyn ColorizationBackend>> {
+    if mangahue_inference::is_anime_face_model_dir(model_path) {
+        return Ok(Box::new(mangahue_inference::AnimeFaceBackend::shared(
+            model_path,
+        )?));
+    }
     if mangahue_inference::is_reference_cgan_model_dir(model_path) {
         let reference_path = reference_image_path.ok_or_else(|| {
             anyhow!(

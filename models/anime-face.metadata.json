@@ -1,0 +1,9 @@
+{
+  "name": "Anime Face Palette Expert",
+  "role": "face_guided_chroma_expert",
+  "source_repository": "https://github.com/nagadomi/lbpcascade_animeface",
+  "download_url": "https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/master/lbpcascade_animeface.xml",
+  "license": "MIT",
+  "artifact": "lbpcascade_animeface.xml",
+  "runtime": "opencv_cpu"
+}
