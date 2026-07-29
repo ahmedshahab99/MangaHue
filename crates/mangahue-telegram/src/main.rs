@@ -888,19 +888,41 @@ fn handle_callback(
 ) -> Result<()> {
     let chat_id = cb.from.id;
 
-    answer_callback_query(client, token, &cb.id, None, None)?;
-
     let Some(data) = cb.data.as_deref() else {
+        answer_callback_query(client, token, &cb.id, None, None)?;
         return Ok(());
     };
 
     if data == "cancel_job" {
-        state.cancel(chat_id);
+        let cancelled = state.cancel(chat_id);
+        answer_callback_query(
+            client,
+            token,
+            &cb.id,
+            Some(if cancelled {
+                "Cancellation requested"
+            } else {
+                "No active job"
+            }),
+            Some(false),
+        )?;
         if let Some(ref msg) = cb.message {
-            let _ = edit_message(client, token, chat_id, msg.message_id, "Cancelled by user.");
+            let _ = edit_message(
+                client,
+                token,
+                chat_id,
+                msg.message_id,
+                if cancelled {
+                    "Stopping safely and cleaning temporary files..."
+                } else {
+                    "No active MangaHue job."
+                },
+            );
         }
         return Ok(());
     }
+
+    answer_callback_query(client, token, &cb.id, None, None)?;
 
     if data == "colorize_another" {
         send_message(
@@ -1047,9 +1069,21 @@ fn handle_link(
 
     let settings = state.get_settings(chat_id, args.batch_size);
     let style_path = state.resolve_style_path(chat_id, &args.style);
+    let cancel_kb = InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton::new("Cancel job").callback_data("cancel_job")
+        ]],
+    };
+    let cancel_markup = serde_json::to_string(&cancel_kb).unwrap_or_default();
 
     send_chat_action(client, token, chat_id, "typing")?;
-    send_message(client, token, chat_id, "Downloading pages...", None)?;
+    let scan_msg_id = send_message(
+        client,
+        token,
+        chat_id,
+        "Scanning the complete chapter...",
+        Some(&cancel_markup),
+    )?;
 
     let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
     let page_resp = client
@@ -1081,6 +1115,11 @@ fn handle_link(
     }
 
     let total = all_image_urls.len();
+    if cancel_token.load(Ordering::Acquire) {
+        let _ = edit_message(client, token, chat_id, scan_msg_id, "Cancelled.");
+        cleanup_dir(&job_dir);
+        return Ok(());
+    }
     let remaining = state.remaining_pages_today(chat_id);
     let effective_total = total.min(remaining);
     if effective_total == 0 {
@@ -1100,23 +1139,25 @@ fn handle_link(
         token,
         chat_id,
         &format!(
-            "Found *{}* page\\(s\\)\\. Processing in *{}* batch\\(es\\) of *{}*\\.",
-            effective_total, total_batches, batch_size
+            "Found all *{}* page\\(s\\)\\. Coloring them one by one in chapter order\\.",
+            effective_total
         ),
         Some("MarkdownV2"),
     )?;
+    let _ = edit_message(
+        client,
+        token,
+        chat_id,
+        scan_msg_id,
+        "Chapter scan complete. One-page processing started.",
+    );
 
-    let cancel_kb = InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![
-            InlineKeyboardButton::new("Cancel").callback_data("cancel_job")
-        ]],
-    };
     let progress_msg_id = send_message(
         client,
         token,
         chat_id,
         &format_progress(0, effective_total, 0, total_batches, None, 0),
-        Some(&serde_json::to_string(&cancel_kb).unwrap_or_default()),
+        Some(&cancel_markup),
     )?;
 
     let engine = MangaHueEngine::new();
