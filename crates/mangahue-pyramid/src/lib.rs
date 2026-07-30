@@ -110,7 +110,13 @@ impl PyramidColorizer {
             if accumulated.width() == 0 {
                 accumulated = upsampled;
             } else {
-                accumulated = blend_images(&accumulated, &upsampled, 1.0 / (i + 1) as f32);
+                let weight = self
+                    .config
+                    .blend_weights
+                    .get(i)
+                    .copied()
+                    .unwrap_or(1.0 / (i + 1) as f32);
+                accumulated = blend_images(&accumulated, &upsampled, weight);
             }
 
             per_level_ms.push(level_start.elapsed().as_millis());

@@ -16,7 +16,7 @@ use mangahue_inference::{
 };
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
-use mangahue_postprocess::{finalize, reconstruct_full_resolution, PostprocessInput};
+use mangahue_postprocess::{cross_tile_coherence, finalize, reconstruct_full_resolution, PostprocessInput};
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
 use rayon::prelude::*;
@@ -288,16 +288,21 @@ impl MangaHueEngine {
         }
 
         if hint_propagation_enabled {
+            let propagation_radius = config.hints.propagation_radius;
+            let similarity_threshold = config.hints.propagation_similarity_threshold;
             let (propagated_map, propagated_mask) = propagate_hints(
                 &hints.hint_map,
                 &hints.hint_mask,
                 &preprocess.clean_lineart,
-                48,
-                0.3,
+                propagation_radius,
+                similarity_threshold,
             );
             hints.hint_map = propagated_map;
             hints.hint_mask = propagated_mask;
-            report.warn("hints propagated with radius 48".to_string());
+            report.warn(format!(
+                "hints propagated with radius {}",
+                propagation_radius
+            ));
         }
 
         let region_lock_raster = request
@@ -474,8 +479,15 @@ impl MangaHueEngine {
             emit_progress(&progress, "inference_done", tiles_total, tiles_total, None);
         }
 
-        let merged = merge_rgb_tiles(size, &colored_tiles)?;
+        let mut merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
+
+        cross_tile_coherence(
+            &mut merged,
+            &preprocess.line_mask,
+            config.layout.tile_size,
+            config.layout.tile_overlap,
+        );
         let mut inference_report = StageReport::new("inference")
             .note(format!("backend={}", backend_name))
             .metric("parallel_jobs", parallel_jobs as f64)
@@ -1093,15 +1105,31 @@ fn build_ensembler(
                 .with_context(|| format!("failed to load ensemble model {}", path.display()))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(Ensembler::new(
+    let ensemble_config = EnsembleConfig {
+        enabled: true,
+        fallback_mock_count: 0,
+        consensus_strategy: match config.ensemble.strategy {
+            mangahue_config::EnsembleStrategy::MajorityWeighted => {
+                ConsensusStrategy::MajorityWeighted
+            }
+            mangahue_config::EnsembleStrategy::AverageBlend => ConsensusStrategy::AverageBlend,
+            mangahue_config::EnsembleStrategy::DivergenceReject => {
+                ConsensusStrategy::DivergenceReject
+            }
+            mangahue_config::EnsembleStrategy::ChromaComplement => {
+                ConsensusStrategy::ChromaComplement
+            }
+        },
+        weight_divergence: true,
+        cielab_distance: config.ensemble.cielab_distance,
+        divergence_reject_threshold: config.ensemble.divergence_reject_threshold,
+    };
+    let weights = vec![config.ensemble.primary_weight; auxiliaries.len() + 1];
+    Ok(Ensembler::with_weights(
         primary,
         auxiliaries,
-        EnsembleConfig {
-            enabled: true,
-            fallback_mock_count: 0,
-            consensus_strategy: ConsensusStrategy::ChromaComplement,
-            weight_divergence: true,
-        },
+        weights,
+        ensemble_config,
     ))
 }
 

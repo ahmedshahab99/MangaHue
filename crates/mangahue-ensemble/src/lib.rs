@@ -16,6 +16,14 @@ pub struct EnsembleConfig {
     pub fallback_mock_count: usize,
     pub consensus_strategy: ConsensusStrategy,
     pub weight_divergence: bool,
+    #[serde(default)]
+    pub cielab_distance: bool,
+    #[serde(default = "default_divergence_reject_threshold")]
+    pub divergence_reject_threshold: f32,
+}
+
+fn default_divergence_reject_threshold() -> f32 {
+    0.5
 }
 
 impl Default for EnsembleConfig {
@@ -25,6 +33,8 @@ impl Default for EnsembleConfig {
             fallback_mock_count: 2,
             consensus_strategy: ConsensusStrategy::MajorityWeighted,
             weight_divergence: true,
+            cielab_distance: false,
+            divergence_reject_threshold: default_divergence_reject_threshold(),
         }
     }
 }
@@ -63,6 +73,7 @@ pub enum EnsemblerVerdict {
 pub struct Ensembler {
     primary: Arc<dyn ColorizationBackend>,
     auxiliaries: Vec<Arc<dyn ColorizationBackend>>,
+    weights: Vec<f32>,
     config: EnsembleConfig,
 }
 
@@ -82,14 +93,41 @@ impl Ensembler {
         auxiliaries: Vec<Arc<dyn ColorizationBackend>>,
         config: EnsembleConfig,
     ) -> Self {
+        let weights = vec![1.0; auxiliaries.len() + 1];
         Self {
             primary,
             auxiliaries,
+            weights,
             config,
         }
     }
 
-    pub fn from_onnx(model_paths: &[PathBuf], metadata_path: &Path) -> Result<Self> {
+    pub fn with_weights(
+        primary: Arc<dyn ColorizationBackend>,
+        auxiliaries: Vec<Arc<dyn ColorizationBackend>>,
+        weights: Vec<f32>,
+        config: EnsembleConfig,
+    ) -> Self {
+        let mut all_weights = weights;
+        if all_weights.is_empty() {
+            all_weights = vec![1.0; auxiliaries.len() + 1];
+        }
+        if all_weights.len() != auxiliaries.len() + 1 {
+            all_weights.resize(auxiliaries.len() + 1, 1.0);
+        }
+        Self {
+            primary,
+            auxiliaries,
+            weights: all_weights,
+            config,
+        }
+    }
+
+    pub fn from_onnx(
+        model_paths: &[PathBuf],
+        metadata_path: &Path,
+        weights: Option<&[f32]>,
+    ) -> Result<Self> {
         let mut backends: Vec<Arc<dyn ColorizationBackend>> = Vec::new();
         for path in model_paths {
             let backend = OnnxColorizationBackend::new(path, metadata_path)
@@ -100,6 +138,9 @@ impl Ensembler {
             return Err(anyhow!("ensemble requires at least one ONNX model"));
         }
         let primary = backends.remove(0);
+        let model_weights = weights.map(|w| w.to_vec()).unwrap_or_else(|| {
+            vec![1.0; backends.len() + 1]
+        });
         let config = EnsembleConfig {
             enabled: true,
             fallback_mock_count: 0,
@@ -109,6 +150,7 @@ impl Ensembler {
         Ok(Self {
             primary,
             auxiliaries: backends,
+            weights: model_weights,
             config,
         })
     }
@@ -125,6 +167,7 @@ impl Ensembler {
                 Arc::new(MockColorizationBackend::new(palette)) as Arc<dyn ColorizationBackend>
             })
             .collect();
+        let weights = vec![1.0; auxiliaries.len() + 1];
         let config = EnsembleConfig {
             enabled: true,
             fallback_mock_count: auxiliaries.len().max(1),
@@ -134,6 +177,7 @@ impl Ensembler {
         Self {
             primary,
             auxiliaries,
+            weights,
             config,
         }
     }
@@ -211,19 +255,24 @@ impl Ensembler {
                     confidence.placed(x, y, 1.0, ConfidenceCause::PrimaryOnly);
                     continue;
                 }
-                let disagreement = pixel_disagreement(&votes);
+                let disagreement = if self.config.cielab_distance {
+                    cielab_disagreement(&votes)
+                } else {
+                    pixel_disagreement(&votes)
+                };
                 if disagreement > 0.6 {
                     per_pixel_disagreement += 1;
                 }
+                let pixel_weights = &self.weights[..votes.len()];
                 match self.config.consensus_strategy {
                     ConsensusStrategy::AverageBlend => {
-                        let blended = average_pixel(&votes);
+                        let blended = weighted_average_pixel(&votes, pixel_weights);
                         merged.put_pixel(x, y, Rgb(blended));
                         let conf = 1.0 - disagreement.min(1.0);
                         confidence.placed(x, y, conf, ConfidenceCause::Blended);
                     }
                     ConsensusStrategy::MajorityWeighted => {
-                        let blended = average_pixel(&votes);
+                        let blended = weighted_average_pixel(&votes, pixel_weights);
                         let conf = 1.0 - disagreement.min(1.0);
                         let line_strength = input.lineart.get_pixel(x, y)[0] as f32 / 255.0;
                         let weight = if line_strength > 0.55 {
@@ -245,7 +294,7 @@ impl Ensembler {
                         );
                     }
                     ConsensusStrategy::DivergenceReject => {
-                        if disagreement > 0.5 {
+                        if disagreement > self.config.divergence_reject_threshold {
                             let base = votes[0];
                             let fallback: [u8; 3] = [
                                 base[0].saturating_div(2),
@@ -255,7 +304,7 @@ impl Ensembler {
                             merged.put_pixel(x, y, Rgb(fallback));
                             confidence.placed(x, y, 0.0, ConfidenceCause::Rejected);
                         } else {
-                            let blended = average_pixel(&votes);
+                            let blended = weighted_average_pixel(&votes, pixel_weights);
                             let conf = 1.0 - disagreement.min(1.0);
                             merged.put_pixel(x, y, Rgb(blended));
                             confidence.placed(x, y, conf, ConfidenceCause::Consensus);
@@ -446,6 +495,84 @@ fn pixel_disagreement(votes: &[[u8; 3]]) -> f32 {
     }
     let max_spread = 255u16 * 3;
     total_spread as f32 / max_spread as f32
+}
+
+fn cielab_disagreement(votes: &[[u8; 3]]) -> f32 {
+    if votes.len() < 2 {
+        return 0.0;
+    }
+    let lab_votes: Vec<[f32; 3]> = votes.iter().map(|v| srgb_to_cielab(*v)).collect();
+    let mut max_distance = 0.0f32;
+    for i in 0..lab_votes.len() {
+        for j in (i + 1)..lab_votes.len() {
+            let d = cielab_distance(lab_votes[i], lab_votes[j]);
+            if d > max_distance {
+                max_distance = d;
+            }
+        }
+    }
+    (max_distance / 100.0).clamp(0.0, 1.0)
+}
+
+fn srgb_to_cielab(rgb: [u8; 3]) -> [f32; 3] {
+    let linear = [
+        srgb_to_linear(rgb[0]),
+        srgb_to_linear(rgb[1]),
+        srgb_to_linear(rgb[2]),
+    ];
+    let xyz = linear_to_xyz(linear);
+    xyz_to_cielab(xyz)
+}
+
+fn linear_to_xyz(rgb: [f32; 3]) -> [f32; 3] {
+    [
+        rgb[0] * 0.4124564 + rgb[1] * 0.3575761 + rgb[2] * 0.1804375,
+        rgb[0] * 0.2126729 + rgb[1] * 0.7151522 + rgb[2] * 0.0721750,
+        rgb[0] * 0.0193339 + rgb[1] * 0.1191920 + rgb[2] * 0.9503041,
+    ]
+}
+
+fn xyz_to_cielab(xyz: [f32; 3]) -> [f32; 3] {
+    let xn = 0.95047;
+    let yn = 1.0;
+    let zn = 1.08883;
+    let f = |t: f32| -> f32 {
+        let delta = 6.0 / 29.0;
+        if t > delta.powi(3) {
+            t.powf(1.0 / 3.0)
+        } else {
+            t / (3.0 * delta.powi(2)) + 4.0 / 29.0
+        }
+    };
+    let fx = f(xyz[0] / xn);
+    let fy = f(xyz[1] / yn);
+    let fz = f(xyz[2] / zn);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn cielab_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dl = a[0] - b[0];
+    let da = a[1] - b[1];
+    let db = a[2] - b[2];
+    (dl * dl + da * da + db * db).sqrt()
+}
+
+fn weighted_average_pixel(votes: &[[u8; 3]], weights: &[f32]) -> [u8; 3] {
+    let total_weight: f32 = weights.iter().sum();
+    if total_weight <= 0.0 {
+        return [128, 128, 128];
+    }
+    let mut sums = [0.0f32; 3];
+    for (vote, weight) in votes.iter().zip(weights.iter()) {
+        for c in 0..3 {
+            sums[c] += vote[c] as f32 * weight;
+        }
+    }
+    [
+        (sums[0] / total_weight).round().clamp(0.0, 255.0) as u8,
+        (sums[1] / total_weight).round().clamp(0.0, 255.0) as u8,
+        (sums[2] / total_weight).round().clamp(0.0, 255.0) as u8,
+    ]
 }
 
 fn average_pixel(votes: &[[u8; 3]]) -> [u8; 3] {

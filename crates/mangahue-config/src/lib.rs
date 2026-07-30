@@ -67,6 +67,20 @@ pub struct HintsSection {
     pub region_style_hints_enabled: bool,
     #[serde(default = "default_region_style_hint_budget")]
     pub region_style_hint_budget: usize,
+    #[serde(default = "default_propagation_radius")]
+    pub propagation_radius: u32,
+    #[serde(default = "default_propagation_similarity")]
+    pub propagation_similarity_threshold: f32,
+    #[serde(default)]
+    pub adaptive_placement_enabled: bool,
+}
+
+fn default_propagation_radius() -> u32 {
+    48
+}
+
+fn default_propagation_similarity() -> f32 {
+    0.3
 }
 
 fn default_region_style_hint_budget() -> usize {
@@ -138,6 +152,43 @@ pub struct EvalSection {
     pub screen_tone_warning_threshold: f32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnsembleStrategy {
+    MajorityWeighted,
+    AverageBlend,
+    DivergenceReject,
+    ChromaComplement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnsembleSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ensemble_strategy")]
+    pub strategy: EnsembleStrategy,
+    #[serde(default = "default_ensemble_weight_primary")]
+    pub primary_weight: f32,
+    #[serde(default)]
+    pub parallel_variants: bool,
+    #[serde(default = "default_ensemble_divergence_threshold")]
+    pub divergence_reject_threshold: f32,
+    #[serde(default)]
+    pub cielab_distance: bool,
+}
+
+fn default_ensemble_strategy() -> EnsembleStrategy {
+    EnsembleStrategy::ChromaComplement
+}
+
+fn default_ensemble_weight_primary() -> f32 {
+    1.0
+}
+
+fn default_ensemble_divergence_threshold() -> f32 {
+    0.5
+}
+
 impl Default for EvalSection {
     fn default() -> Self {
         Self {
@@ -159,7 +210,8 @@ pub struct EngineConfig {
     pub postprocess: PostprocessSection,
     pub output: OutputSection,
     pub eval: EvalSection,
-    // TODO: Add advanced_preprocess: AdvancedPreprocessConfig when it is defined in mangahue-preprocess
+    #[serde(default)]
+    pub ensemble: EnsembleSection,
 }
 
 impl Default for EngineConfig {
@@ -200,6 +252,9 @@ impl Default for EngineConfig {
                 hint_strength: 1.0,
                 region_style_hints_enabled: false,
                 region_style_hint_budget: default_region_style_hint_budget(),
+                propagation_radius: default_propagation_radius(),
+                propagation_similarity_threshold: default_propagation_similarity(),
+                adaptive_placement_enabled: false,
             },
             inference: InferenceSection {
                 model_path: PathBuf::from("models/example_model.onnx.placeholder"),
@@ -231,6 +286,14 @@ impl Default for EngineConfig {
                 write_intermediates: false,
             },
             eval: EvalSection::default(),
+            ensemble: EnsembleSection {
+                enabled: false,
+                strategy: default_ensemble_strategy(),
+                primary_weight: default_ensemble_weight_primary(),
+                parallel_variants: false,
+                divergence_reject_threshold: default_ensemble_divergence_threshold(),
+                cielab_distance: false,
+            },
         }
     }
 }
@@ -291,6 +354,22 @@ impl EngineConfig {
         }
         if self.hints.region_style_hint_budget > 128 {
             return Err(anyhow!("hints.region_style_hint_budget must be <= 128"));
+        }
+        if self.hints.propagation_radius > 256 {
+            return Err(anyhow!("hints.propagation_radius must be <= 256"));
+        }
+        if !(0.0..=1.0).contains(&self.hints.propagation_similarity_threshold) {
+            return Err(anyhow!(
+                "hints.propagation_similarity_threshold must be in 0.0..=1.0"
+            ));
+        }
+        if !(0.1..=5.0).contains(&self.ensemble.primary_weight) {
+            return Err(anyhow!("ensemble.primary_weight must be in 0.1..=5.0"));
+        }
+        if !(0.1..=1.0).contains(&self.ensemble.divergence_reject_threshold) {
+            return Err(anyhow!(
+                "ensemble.divergence_reject_threshold must be in 0.1..=1.0"
+            ));
         }
         Ok(())
     }

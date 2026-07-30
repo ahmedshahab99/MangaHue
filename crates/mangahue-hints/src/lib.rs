@@ -281,8 +281,11 @@ pub fn generate_hints(
     let mut notes = Vec::new();
 
     if config.style_hints_enabled {
-        style_hints_applied =
-            apply_style_atmosphere(&mut hint_map, &mut hint_mask, style, config.hint_strength);
+        style_hints_applied = if config.adaptive_placement_enabled {
+            apply_adaptive_style_hints(&mut hint_map, &mut hint_mask, style, config.hint_strength)
+        } else {
+            apply_style_atmosphere(&mut hint_map, &mut hint_mask, style, config.hint_strength)
+        };
         applied += style_hints_applied;
     }
 
@@ -746,6 +749,76 @@ fn apply_style_atmosphere(
         rasterize_hint(hint_map, hint_mask, &hint, global_strength);
     }
     4
+}
+
+fn apply_adaptive_style_hints(
+    hint_map: &mut RgbImage,
+    hint_mask: &mut GrayImage,
+    style: &StyleProfile,
+    global_strength: f32,
+) -> usize {
+    let width = hint_map.width();
+    let height = hint_map.height();
+    let palette = &style.palette;
+    if palette.is_empty() {
+        return 0;
+    }
+
+    let grid_cols = 3;
+    let grid_rows = 3;
+    let cell_w = width / grid_cols;
+    let cell_h = height / grid_rows;
+    let radius = (cell_w.min(cell_h) / 3).max(8);
+    let mut applied = 0;
+
+    for row in 0..grid_rows {
+        for col in 0..grid_cols {
+            let cx = col * cell_w + cell_w / 2;
+            let cy = row * cell_h + cell_h / 2;
+            let palette_idx = (row * grid_cols + col) % palette.len();
+            let color = palette[palette_idx];
+
+            let strength = if (row + col) % 2 == 0 {
+                0.22
+            } else {
+                0.14
+            };
+
+            let hint = ColorHint {
+                x: cx,
+                y: cy,
+                radius,
+                color,
+                label: Some("adaptive_grid".to_string()),
+                strength,
+                source: HintSource::StyleProfile,
+            };
+            rasterize_hint(hint_map, hint_mask, &hint, global_strength);
+            applied += 1;
+        }
+    }
+
+    let accent = palette.get(2).copied().unwrap_or(palette[0]);
+    let accent_hints = [
+        (width / 2, height / 4, radius * 2, 0.12),
+        (width / 4, height / 2, radius, 0.10),
+        (width * 3 / 4, height * 3 / 4, radius, 0.10),
+    ];
+    for (x, y, r, str) in accent_hints {
+        let hint = ColorHint {
+            x,
+            y,
+            radius: r,
+            color: accent,
+            label: Some("adaptive_accent".to_string()),
+            strength: str,
+            source: HintSource::StyleProfile,
+        };
+        rasterize_hint(hint_map, hint_mask, &hint, global_strength);
+        applied += 1;
+    }
+
+    applied
 }
 
 fn soften_mask_edges(mask: &mut GrayImage, radius: u32) {
