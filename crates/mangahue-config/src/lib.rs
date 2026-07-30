@@ -152,16 +152,17 @@ pub struct EvalSection {
     pub screen_tone_warning_threshold: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnsembleStrategy {
     MajorityWeighted,
     AverageBlend,
     DivergenceReject,
+    #[default]
     ChromaComplement,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnsembleSection {
     #[serde(default)]
     pub enabled: bool,
