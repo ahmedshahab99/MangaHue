@@ -775,7 +775,7 @@ fn apply_adaptive_style_hints(
         for col in 0..grid_cols {
             let cx = col * cell_w + cell_w / 2;
             let cy = row * cell_h + cell_h / 2;
-            let palette_idx = (row * grid_cols + col) % palette.len();
+            let palette_idx = ((row * grid_cols + col) as usize) % palette.len();
             let color = palette[palette_idx];
 
             let strength = if (row + col) % 2 == 0 {
