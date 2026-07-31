@@ -146,6 +146,8 @@ impl Ensembler {
             fallback_mock_count: 0,
             consensus_strategy: ConsensusStrategy::MajorityWeighted,
             weight_divergence: true,
+            cielab_distance: false,
+            divergence_reject_threshold: 0.5,
         };
         Ok(Self {
             primary,
@@ -173,6 +175,8 @@ impl Ensembler {
             fallback_mock_count: auxiliaries.len().max(1),
             consensus_strategy: ConsensusStrategy::MajorityWeighted,
             weight_divergence: true,
+            cielab_distance: false,
+            divergence_reject_threshold: 0.5,
         };
         Self {
             primary,
@@ -537,7 +541,7 @@ fn xyz_to_cielab(xyz: [f32; 3]) -> [f32; 3] {
     let yn = 1.0;
     let zn = 1.08883;
     let f = |t: f32| -> f32 {
-        let delta = 6.0 / 29.0;
+        let delta: f32 = 6.0 / 29.0;
         if t > delta.powi(3) {
             t.powf(1.0 / 3.0)
         } else {
