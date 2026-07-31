@@ -118,13 +118,14 @@ pub(crate) fn finish_reference_style(
             let cool_material = centered[2] > centered[0] + 0.008;
             let shadow_tint = shadow_support * style.shadow_strength * 0.008;
             if warm_material {
-                centered[0] += highlight_support * style.highlight_strength * 0.006;
-                centered[2] -= shadow_tint * 0.58;
+                centered[0] += highlight_support * style.highlight_strength * 0.008;
+                centered[2] -= shadow_tint * 0.42;
             } else if cool_material {
-                centered[2] += shadow_tint * 0.48;
+                centered[0] += shadow_tint * 0.18;
+                centered[2] += shadow_tint * 0.12;
             } else if neutral_gate > 0.15 {
-                centered[0] += highlight_support * 0.0025;
-                centered[2] += shadow_tint * 0.28;
+                centered[0] += highlight_support * 0.004;
+                centered[2] += shadow_tint * 0.08;
             }
 
             let mapped = gamut_map(target_luma, centered);

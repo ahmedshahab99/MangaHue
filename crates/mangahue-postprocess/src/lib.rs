@@ -976,8 +976,9 @@ fn refine_skin_and_material_light(
                 out[1] += warmth * 0.28;
                 out[2] -= warmth * 0.38;
             } else if y_value < 108.0 {
-                out[0] += style.shadow_strength * 0.9;
-                out[2] += style.shadow_strength * 1.4;
+                out[0] += style.shadow_strength * 1.1;
+                out[1] += style.shadow_strength * 0.15;
+                out[2] += style.shadow_strength * 0.7;
             }
 
             image.put_pixel(

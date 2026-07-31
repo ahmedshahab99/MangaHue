@@ -961,12 +961,12 @@ fn render_material_pixel(
         let skin_depth = if face_skin { 28.0 } else { 29.0 };
         target_luma += highlight * 2.0 - skin_depth - shadow * 5.0 - ambient_occlusion * 8.5;
     } else if dark_material {
-        red += style.shadow_strength * (1.3 + highlight);
-        blue += style.shadow_strength * (2.3 + highlight * 1.4);
+        red += style.shadow_strength * (1.8 + highlight);
+        blue += style.shadow_strength * (1.3 + highlight * 0.8);
         target_luma -= ambient_occlusion * 3.0;
     } else if pale_material && shadow > 0.05 {
-        red -= shadow * 1.2;
-        blue += shadow * 3.4;
+        red -= shadow * 0.5;
+        blue += shadow * 1.2;
         target_luma -= ambient_occlusion * 4.5;
     }
 
