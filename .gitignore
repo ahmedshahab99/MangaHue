@@ -24,12 +24,17 @@ web/gpu/dev_server_err.log
 
 # Local experiments and operator scratch files may contain server credentials.
 /scripts/*.py
+/scripts/deploy-v0.2.0.sh
 /local_tuning/
 /test_images/
 /download_test.py
 /test_*.py
 /*.png
 /*.jpg
+/web/app/.next/
+/web/app/out/
+/web/app/node_modules/
+*.tsbuildinfo
 
 # Private research notes can mention local infrastructure and credentials.
 /docs/AUDIT_STUDY.md

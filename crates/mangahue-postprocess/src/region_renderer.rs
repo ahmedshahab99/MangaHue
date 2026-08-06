@@ -106,6 +106,7 @@ impl UnionFind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_region_graph(
     image: &mut RgbImage,
     original_gray: &GrayImage,
@@ -231,7 +232,7 @@ pub(crate) fn render_region_graph(
     // Re-evaluate semantics with the FINAL region hues: skin classification
     // must not force the render's skin treatment onto regions the director
     // deliberately moved away from the warm sector (backgrounds, clothing).
-    let mut semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
+    let semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
 
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
@@ -715,6 +716,7 @@ fn maybe_union(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accumulate_region(
     stats: &mut RegionStats,
     pixel: Rgb<u8>,
@@ -995,7 +997,7 @@ fn propagate_graph_colors(
 /// regions are re-assigned; confident seeded regions are left alone, and
 /// skin regions stay inside the warm skin sector.
 fn chroma_diversity_director(
-    colors: &mut Vec<RegionColor>,
+    colors: &mut [RegionColor],
     stats: &[RegionStats],
     adjacency: &[Vec<(usize, f32)>],
     semantics: &[RegionSemantic],
@@ -1018,8 +1020,8 @@ fn chroma_diversity_director(
     // of the current hue (137.5 deg steps give maximal perceptual spread).
     let golden_angle = 137.5077_f32.to_radians();
     let mut candidates: Vec<Vec<(f32, f32)>> = Vec::with_capacity(n);
-    for index in 0..n {
-        let current = (colors[index].red, colors[index].blue);
+    for color in colors.iter().take(n) {
+        let current = (color.red, color.blue);
         let mut set: Vec<(f32, f32)> = vec![current];
         for &(_, pr, pb) in palette {
             set.push((pr, pb));
@@ -1080,7 +1082,7 @@ fn chroma_diversity_director(
         luma_cost * 0.8 + semantic_cost * 0.35 + separation_penalty
     };
 
-    let mut assigned = colors.clone();
+    let mut assigned = colors.to_vec();
     let mut locked = vec![false; n];
     for index in 0..n {
         // Only SKIN regions with confident seeds are locked. The model's
@@ -1264,7 +1266,6 @@ fn render_material_pixel(
         && !region_elongated
         && red > 2.0
         && blue < 2.0;
-    let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
     let face_skin = face_cavity > 0.12;
     let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
     let texture_limit = if observed_skin || semantic_skin {

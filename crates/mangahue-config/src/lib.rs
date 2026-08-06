@@ -624,9 +624,7 @@ mod tests {
         for name in AUTO_PALETTES {
             let colors = load_palette(dir.join(format!("{name}.yaml"))).unwrap();
             assert!(!colors.is_empty(), "{name} palette empty");
-            for color in &colors {
-                assert!(color.r <= 255 && color.g <= 255 && color.b <= 255);
-            }
+            assert!(colors.len() <= 64, "{name} palette unexpectedly large");
         }
     }
 

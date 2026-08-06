@@ -61,12 +61,12 @@ pub(crate) fn apply_reinhard_transfer(
         return;
     }
 
-    let (sm_l, ss_l) = stats(&src_l);
-    let (sm_a, ss_a) = stats(&src_a);
-    let (sm_b, ss_b) = stats(&src_b);
-    let (rm_l, rs_l) = stats(&ref_l);
-    let (rm_a, rs_a) = stats(&ref_a);
-    let (rm_b, rs_b) = stats(&ref_b);
+    let (sm_l, _) = stats(&src_l);
+    let (sm_a, _) = stats(&src_a);
+    let (sm_b, _) = stats(&src_b);
+    let (rm_l, _) = stats(&ref_l);
+    let (rm_a, _) = stats(&ref_a);
+    let (rm_b, _) = stats(&ref_b);
 
     let t = strength.clamp(0.0, 1.0);
     let chroma_gain = 1.05_f32;

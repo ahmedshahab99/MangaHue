@@ -17,6 +17,7 @@ pub(crate) struct ReferenceFinishReport {
     pub face_pixels_painted: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_reference_style(
     image: &mut RgbImage,
     original_gray: &GrayImage,

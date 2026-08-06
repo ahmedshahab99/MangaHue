@@ -1,6 +1,7 @@
 name: MangaHue CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -39,6 +40,14 @@ jobs:
       - run: python -m compileall python/mangahue_train python_bot
       - run: python -m pytest -q python_bot/tests python/tests
       - run: node --check web/studio/studio.js
+      - run: npm ci
+        working-directory: web/app
+      - run: npm run lint
+        working-directory: web/app
+      - run: npm run typecheck
+        working-directory: web/app
+      - run: npm run build
+        working-directory: web/app
       - run: bash -n scripts/setup-vps.sh scripts/healthcheck.sh scripts/cleanup-old-vps-bot.sh
 
   container:

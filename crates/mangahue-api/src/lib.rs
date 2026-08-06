@@ -53,6 +53,25 @@ use tracing::{error, info};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiJobKind {
+    #[default]
+    Unknown,
+    Page,
+    Batch,
+    Link,
+    Chapter,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApiJobProgress {
+    pub stage: String,
+    pub completed: usize,
+    pub total: usize,
+    pub percent: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiColorizeRequest {
     pub request: ColorizeRequest,
@@ -157,7 +176,15 @@ pub struct ApiInspectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiJob {
     pub id: String,
+    #[serde(default)]
+    pub kind: ApiJobKind,
     pub status: ApiJobStatus,
+    #[serde(default)]
+    pub progress: ApiJobProgress,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
     pub result_url: Option<String>,
     pub report_url: Option<String>,
     pub output_path: Option<PathBuf>,
@@ -171,7 +198,32 @@ pub enum ApiJobStatus {
     Queued,
     Running,
     Complete,
+    Cancelled,
     Failed,
+}
+
+impl ApiJob {
+    fn new(id: String, kind: ApiJobKind, output_path: Option<PathBuf>) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            result_url: Some(format!("/api/jobs/{id}/result")),
+            id,
+            kind,
+            status: ApiJobStatus::Queued,
+            progress: ApiJobProgress {
+                stage: "queued".to_string(),
+                completed: 0,
+                total: 0,
+                percent: 0.0,
+            },
+            created_at: now.clone(),
+            updated_at: now,
+            report_url: None,
+            output_path,
+            error: None,
+            result: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +479,7 @@ pub struct ApiLinkColorizeSummary {
     pub source_url: String,
     pub downloads_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub archive_path: Option<PathBuf>,
     pub ingest: IngestReport,
     pub processed: usize,
     pub failed: usize,
@@ -536,7 +589,7 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
         .route("/api/file", get(get_local_file))
         .route(
             "/api/upload",
-            post(upload_file).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+            post(upload_file).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route("/api/colorize", post(create_colorize_job))
         .route(
@@ -595,11 +648,18 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
         )
         .route("/api/corrections", post(add_project_correction));
 
-    // Public static assets: the user webapp, the WebGPU studio and models.
+    // Public static assets: the user webapp, operator Studio, WebGPU studio,
+    // and locally installed models. The configured Studio directory now
+    // points at the exported Next.js application.
+    let web_index = studio_dir.join("index.html");
     let static_routes = Router::new()
         .nest_service(
             "/app",
-            ServeDir::new("web/app").not_found_service(ServeFile::new("web/app/index.html")),
+            ServeDir::new(&studio_dir).not_found_service(ServeFile::new(&web_index)),
+        )
+        .nest_service(
+            "/operator",
+            ServeDir::new("web/studio").not_found_service(ServeFile::new("web/studio/index.html")),
         )
         .nest_service(
             "/gpu",
@@ -623,6 +683,10 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
             .merge(static_routes)
             .merge(user_authed)
             .merge(admin_authed)
+            .fallback_service(
+                ServeDir::new(&studio_dir)
+                    .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
+            )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 loopback_cors,
@@ -1313,7 +1377,7 @@ async fn create_colorize_job(
         .await
         .insert(id.clone(), event_tx.clone());
 
-    payload.request.cancel_token = Some(cancel_token);
+    payload.request.cancel_token = Some(cancel_token.clone());
     payload.request.cache_dir = Some(state.jobs_dir.clone());
 
     if state.sandbox_jobs {
@@ -1330,8 +1394,21 @@ async fn create_colorize_job(
     payload.request.progress_sender = Some(progress_tx);
 
     let forward_tx = event_tx.clone();
+    let progress_jobs = state.jobs.clone();
+    let progress_id = id.clone();
     tokio::task::spawn(async move {
         while let Some(update) = progress_rx.recv().await {
+            if let Some(job) = progress_jobs.write().await.get_mut(&progress_id) {
+                if matches!(job.status, ApiJobStatus::Queued | ApiJobStatus::Running) {
+                    job.progress = ApiJobProgress {
+                        stage: update.stage.clone(),
+                        completed: update.tiles_completed,
+                        total: update.tiles_total,
+                        percent: update.percent,
+                    };
+                    job.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
             let payload = serde_json::json!({
                 "status": "progress",
                 "stage": update.stage,
@@ -1345,15 +1422,11 @@ async fn create_colorize_job(
         }
     });
 
-    let job = ApiJob {
-        id: id.clone(),
-        status: ApiJobStatus::Queued,
-        result_url: Some(format!("/api/jobs/{id}/result")),
-        report_url: None,
-        output_path: Some(payload.request.output_path.clone()),
-        error: None,
-        result: None,
-    };
+    let job = ApiJob::new(
+        id.clone(),
+        ApiJobKind::Page,
+        Some(payload.request.output_path.clone()),
+    );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
     let _ = event_tx.send(r#"{"status":"queued","progress":0}"#.to_string());
@@ -1398,17 +1471,27 @@ async fn create_colorize_job(
             }
             Err(error) => {
                 error!("job {id} failed: {error:#}");
-                let _ = event_tx.send(format!(
-                    r#"{{"status":"failed","progress":100,"error":"{}"}}"#,
-                    error.to_string().replace('"', r#"\""#)
-                ));
+                let cancelled = cancel_token.load(Ordering::Relaxed);
+                let status = if cancelled {
+                    ApiJobStatus::Cancelled
+                } else {
+                    ApiJobStatus::Failed
+                };
+                let _ = event_tx.send(
+                    serde_json::json!({
+                        "status": if cancelled { "cancelled" } else { "failed" },
+                        "progress": 100,
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                );
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
                     &id,
                     &jobs_dir,
                     JobUpdate {
-                        status: ApiJobStatus::Failed,
+                        status,
                         error: Some(error.to_string()),
                         output_path: None,
                         result: None,
@@ -1429,15 +1512,11 @@ async fn create_batch_job(
     if state.sandbox_jobs {
         sandbox_batch_request(&mut payload, &state.jobs_dir, &id)?;
     }
-    let job = ApiJob {
-        id: id.clone(),
-        status: ApiJobStatus::Queued,
-        result_url: Some(format!("/api/jobs/{id}/result")),
-        report_url: None,
-        output_path: Some(payload.output_dir.clone()),
-        error: None,
-        result: None,
-    };
+    let job = ApiJob::new(
+        id.clone(),
+        ApiJobKind::Batch,
+        Some(payload.output_dir.clone()),
+    );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
     let jobs = state.jobs.clone();
@@ -1498,7 +1577,8 @@ async fn ingest_link(
     State(state): State<ApiState>,
     Json(mut payload): Json<ApiLinkIngestRequest>,
 ) -> Result<Json<IngestReport>, ApiError> {
-    validate_public_source_url(&payload.source_url)?;
+    validate_public_source_url(&payload.source_url)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
     clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
     if state.sandbox_jobs {
         let base = state
@@ -1537,28 +1617,42 @@ async fn create_link_colorize_job(
     State(state): State<ApiState>,
     Json(mut payload): Json<ApiLinkColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
-    validate_public_source_url(&payload.source_url)?;
+    validate_public_source_url(&payload.source_url)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
     clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
     let id = Uuid::new_v4().to_string();
     if state.sandbox_jobs {
         sandbox_link_request(&mut payload, &state.jobs_dir, &id)?;
     }
-    let job = ApiJob {
-        id: id.clone(),
-        status: ApiJobStatus::Queued,
-        result_url: Some(format!("/api/jobs/{id}/result")),
-        report_url: None,
-        output_path: Some(payload.output_dir.clone()),
-        error: None,
-        result: None,
-    };
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let (event_tx, _) = broadcast::channel::<String>(64);
+    state
+        .cancel_tokens
+        .write()
+        .await
+        .insert(id.clone(), cancel_token.clone());
+    state
+        .event_channels
+        .write()
+        .await
+        .insert(id.clone(), event_tx.clone());
+    payload.template.cancel_token = Some(cancel_token.clone());
+    payload.template.cache_dir = Some(state.jobs_dir.clone());
+    let job = ApiJob::new(
+        id.clone(),
+        ApiJobKind::Link,
+        Some(payload.output_dir.clone()),
+    );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
+    let _ = event_tx.send(r#"{"status":"queued","stage":"queued","progress":0}"#.to_string());
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
     let runtime = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
+        let _ =
+            event_tx.send(r#"{"status":"running","stage":"downloading","progress":2}"#.to_string());
         update_job_status_blocking(
             &runtime,
             &jobs,
@@ -1571,8 +1665,17 @@ async fn create_link_colorize_job(
                 result: None,
             },
         );
-        match run_link_colorize_payload(payload) {
+        match run_link_colorize_payload(
+            payload,
+            cancel_token.clone(),
+            &event_tx,
+            &runtime,
+            &jobs,
+            &id,
+        ) {
             Ok(summary) => {
+                let _ = event_tx
+                    .send(r#"{"status":"complete","stage":"complete","progress":100}"#.to_string());
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
@@ -1589,13 +1692,27 @@ async fn create_link_colorize_job(
                 );
             }
             Err(error) => {
+                let cancelled = cancel_token.load(Ordering::Relaxed);
+                let status = if cancelled {
+                    ApiJobStatus::Cancelled
+                } else {
+                    ApiJobStatus::Failed
+                };
+                let _ = event_tx.send(
+                    serde_json::json!({
+                        "status": if cancelled { "cancelled" } else { "failed" },
+                        "stage": if cancelled { "cancelled" } else { "failed" },
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                );
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
                     &id,
                     &jobs_dir,
                     JobUpdate {
-                        status: ApiJobStatus::Failed,
+                        status,
                         error: Some(error.to_string()),
                         output_path: None,
                         result: None,
@@ -1664,22 +1781,67 @@ async fn create_chapter_colorize_job(
     if state.sandbox_jobs {
         sandbox_chapter_request(&mut payload, &state.jobs_dir, &id)?;
     }
-    let job = ApiJob {
-        id: id.clone(),
-        status: ApiJobStatus::Queued,
-        result_url: Some(format!("/api/jobs/{id}/result")),
-        report_url: None,
-        output_path: Some(payload.output_dir.clone()),
-        error: None,
-        result: None,
-    };
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    let (event_tx, _) = broadcast::channel::<String>(64);
+    state
+        .cancel_tokens
+        .write()
+        .await
+        .insert(id.clone(), cancel_token.clone());
+    state
+        .event_channels
+        .write()
+        .await
+        .insert(id.clone(), event_tx.clone());
+    payload.template.cancel_token = Some(cancel_token.clone());
+    payload.template.cache_dir = Some(state.jobs_dir.clone());
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<mangahue_orchestrator::ProgressUpdate>();
+    payload.template.progress_sender = Some(progress_tx);
+
+    let forward_tx = event_tx.clone();
+    let progress_jobs = state.jobs.clone();
+    let progress_id = id.clone();
+    tokio::task::spawn(async move {
+        while let Some(update) = progress_rx.recv().await {
+            if let Some(job) = progress_jobs.write().await.get_mut(&progress_id) {
+                if matches!(job.status, ApiJobStatus::Queued | ApiJobStatus::Running) {
+                    job.progress = ApiJobProgress {
+                        stage: update.stage.clone(),
+                        completed: update.tiles_completed,
+                        total: update.tiles_total,
+                        percent: update.percent,
+                    };
+                    job.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
+            let _ = forward_tx.send(
+                serde_json::json!({
+                    "status": "progress",
+                    "stage": update.stage,
+                    "progress": update.percent,
+                    "completed": update.tiles_completed,
+                    "total": update.tiles_total,
+                })
+                .to_string(),
+            );
+        }
+    });
+    let job = ApiJob::new(
+        id.clone(),
+        ApiJobKind::Chapter,
+        Some(payload.output_dir.clone()),
+    );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
+    let _ = event_tx.send(r#"{"status":"queued","stage":"queued","progress":0}"#.to_string());
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
     let runtime = tokio::runtime::Handle::current();
 
     tokio::task::spawn_blocking(move || {
+        let _ = event_tx
+            .send(r#"{"status":"running","stage":"preparing_chapter","progress":1}"#.to_string());
         update_job_status_blocking(
             &runtime,
             &jobs,
@@ -1726,6 +1888,8 @@ async fn create_chapter_colorize_job(
         });
         match result {
             Ok(summary) => {
+                let _ = event_tx
+                    .send(r#"{"status":"complete","stage":"complete","progress":100}"#.to_string());
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
@@ -1742,13 +1906,27 @@ async fn create_chapter_colorize_job(
                 );
             }
             Err(error) => {
+                let cancelled = cancel_token.load(Ordering::Relaxed);
+                let status = if cancelled {
+                    ApiJobStatus::Cancelled
+                } else {
+                    ApiJobStatus::Failed
+                };
+                let _ = event_tx.send(
+                    serde_json::json!({
+                        "status": if cancelled { "cancelled" } else { "failed" },
+                        "stage": if cancelled { "cancelled" } else { "failed" },
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                );
                 update_job_status_blocking(
                     &runtime,
                     &jobs,
                     &id,
                     &jobs_dir,
                     JobUpdate {
-                        status: ApiJobStatus::Failed,
+                        status,
                         error: Some(error.to_string()),
                         output_path: None,
                         result: None,
@@ -1797,12 +1975,16 @@ async fn list_jobs(State(state): State<ApiState>) -> Result<Json<Vec<ApiJob>>, A
         jobs.insert(id.clone(), job.clone());
     }
     let mut jobs: Vec<_> = jobs.into_values().collect();
-    jobs.sort_by(|a, b| a.id.cmp(&b.id));
+    jobs.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
     Ok(Json(jobs))
 }
 
 const FILE_EXT_WHITELIST: &[&str] = &[
-    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "json", "html", "cbz",
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "json", "html", "cbz", "zip",
 ];
 
 /// Serve a file from the API's file root (the jobs workspace in public
@@ -1835,9 +2017,8 @@ async fn get_local_file(
     Ok(response)
 }
 
-/// Upload a page image into the job workspace. Returns the absolute path to
-/// pass back as `input_path` on /api/colorize (public mode confines inputs
-/// to this workspace, so the returned path is always acceptable).
+/// Upload a page or chapter archive into the job workspace. Returns the
+/// path to pass to /api/colorize or /api/chapter/colorize.
 async fn upload_file(
     State(state): State<ApiState>,
     mut multipart: axum::extract::Multipart,
@@ -1863,10 +2044,10 @@ async fn upload_file(
             anyhow!("empty upload"),
         ));
     }
-    if data.len() > 50 * 1024 * 1024 {
+    if data.len() > 250 * 1024 * 1024 {
         return Err(ApiError::with_status(
             StatusCode::PAYLOAD_TOO_LARGE,
-            anyhow!("upload exceeds 50 MB"),
+            anyhow!("upload exceeds 250 MB"),
         ));
     }
     let ext = file_name
@@ -1876,7 +2057,7 @@ async fn upload_file(
         .filter(|value| {
             matches!(
                 value.as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif"
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif" | "zip" | "cbz"
             )
         })
         .unwrap_or_else(|| "png".to_string());
@@ -1889,6 +2070,7 @@ async fn upload_file(
         "id": name,
         "path": path,
         "size": data.len(),
+        "kind": if matches!(ext.as_str(), "zip" | "cbz") { "chapter" } else { "page" },
     })))
 }
 
@@ -2218,6 +2400,26 @@ fn update_job_status_blocking(
         let mut snapshot = None;
         if let Some(job) = jobs.write().await.get_mut(id) {
             job.status = update.status;
+            job.updated_at = chrono::Utc::now().to_rfc3339();
+            match update.status {
+                ApiJobStatus::Queued => {}
+                ApiJobStatus::Running => {
+                    job.progress.stage = "running".to_string();
+                }
+                ApiJobStatus::Complete => {
+                    job.progress.stage = "complete".to_string();
+                    job.progress.percent = 100.0;
+                    if job.progress.total > 0 {
+                        job.progress.completed = job.progress.total;
+                    }
+                }
+                ApiJobStatus::Cancelled => {
+                    job.progress.stage = "cancelled".to_string();
+                }
+                ApiJobStatus::Failed => {
+                    job.progress.stage = "failed".to_string();
+                }
+            }
             if let Some(error) = update.error {
                 job.error = Some(error);
             }
@@ -2234,6 +2436,20 @@ fn update_job_status_blocking(
             if let Err(error) = persist_job(jobs_dir, &job) {
                 error!("failed to persist job {}: {error:#}", job.id);
             }
+        }
+    });
+}
+
+fn update_job_progress_blocking(
+    runtime: &tokio::runtime::Handle,
+    jobs: &Arc<RwLock<HashMap<String, ApiJob>>>,
+    id: &str,
+    progress: ApiJobProgress,
+) {
+    runtime.block_on(async {
+        if let Some(job) = jobs.write().await.get_mut(id) {
+            job.progress = progress;
+            job.updated_at = chrono::Utc::now().to_rfc3339();
         }
     });
 }
@@ -2337,7 +2553,14 @@ fn run_batch_payload(payload: ApiBatchRequest) -> Result<ApiBatchSummary> {
     })
 }
 
-fn run_link_colorize_payload(payload: ApiLinkColorizeRequest) -> Result<ApiLinkColorizeSummary> {
+fn run_link_colorize_payload(
+    payload: ApiLinkColorizeRequest,
+    cancel_token: Arc<AtomicBool>,
+    event_tx: &broadcast::Sender<String>,
+    runtime: &tokio::runtime::Handle,
+    jobs: &Arc<RwLock<HashMap<String, ApiJob>>>,
+    id: &str,
+) -> Result<ApiLinkColorizeSummary> {
     std::fs::create_dir_all(&payload.output_dir)
         .with_context(|| format!("failed to create {}", payload.output_dir.display()))?;
     let downloads_root = payload
@@ -2358,12 +2581,30 @@ fn run_link_colorize_payload(payload: ApiLinkColorizeRequest) -> Result<ApiLinkC
         min_request_interval: std::time::Duration::from_millis(500),
         selectors: mangahue_ingest::default_selectors(),
     })?;
+    if cancel_token.load(Ordering::Relaxed) {
+        anyhow::bail!("job cancelled");
+    }
     let engine = MangaHueEngine::new();
     let mut processed = 0usize;
     let mut failed = 0usize;
     let mut pages = Vec::new();
 
-    for page in &ingest.pages {
+    let total = ingest.pages.len();
+    let _ = event_tx.send(
+        serde_json::json!({
+            "status": "running",
+            "stage": "colorizing",
+            "progress": 5,
+            "completed": 0,
+            "total": total,
+        })
+        .to_string(),
+    );
+
+    for (page_index, page) in ingest.pages.iter().enumerate() {
+        if cancel_token.load(Ordering::Relaxed) {
+            anyhow::bail!("job cancelled");
+        }
         let stem = page
             .local_path
             .file_stem()
@@ -2373,6 +2614,7 @@ fn run_link_colorize_payload(payload: ApiLinkColorizeRequest) -> Result<ApiLinkC
         let mut request = payload.template.clone();
         request.input_path = page.local_path.clone();
         request.output_path = output_path.clone();
+        request.cancel_token = Some(cancel_token.clone());
         match engine.colorize(request) {
             Ok(result) => {
                 processed += 1;
@@ -2400,12 +2642,45 @@ fn run_link_colorize_payload(payload: ApiLinkColorizeRequest) -> Result<ApiLinkC
                 }
             }
         }
+        let completed = page_index + 1;
+        let percent = 5.0 + (completed as f32 / total.max(1) as f32) * 90.0;
+        let progress = ApiJobProgress {
+            stage: "colorizing".to_string(),
+            completed,
+            total,
+            percent,
+        };
+        update_job_progress_blocking(runtime, jobs, id, progress.clone());
+        let _ = event_tx.send(
+            serde_json::json!({
+                "status": "progress",
+                "stage": progress.stage,
+                "progress": progress.percent,
+                "completed": progress.completed,
+                "total": progress.total,
+                "page": completed,
+            })
+            .to_string(),
+        );
     }
+
+    let archive_path = if processed > 0 {
+        let archive_path = payload
+            .output_dir
+            .parent()
+            .unwrap_or(&payload.output_dir)
+            .join("mangahue-colored.cbz");
+        export_chapter_archive(&payload.output_dir, &archive_path)?;
+        Some(archive_path)
+    } else {
+        None
+    };
 
     Ok(ApiLinkColorizeSummary {
         source_url: payload.source_url,
         downloads_dir,
         output_dir: payload.output_dir,
+        archive_path,
         ingest,
         processed,
         failed,
@@ -2482,7 +2757,7 @@ fn default_jobs_dir() -> PathBuf {
 }
 
 fn default_studio_dir() -> PathBuf {
-    PathBuf::from("web/studio")
+    PathBuf::from("web/app/out")
 }
 
 fn default_sample_input_path() -> PathBuf {
@@ -2786,19 +3061,13 @@ fn content_type_for(path: &std::path::Path) -> &'static str {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("cbz" | "zip") => "application/zip",
         Some("json") => "application/json",
         Some("html") => "text/html; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("js") => "application/javascript; charset=utf-8",
         _ => "application/octet-stream",
     }
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    ctrl_c.await;
 }
 
 pub fn planned_routes() -> &'static [&'static str] {
@@ -2859,11 +3128,27 @@ async fn cancel_job(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let token = state.cancel_tokens.write().await.remove(&id);
+    let token = state.cancel_tokens.read().await.get(&id).cloned();
     match token {
         Some(toggle) => {
             toggle.store(true, Ordering::Relaxed);
-            let _ = state.event_channels.write().await.remove(&id);
+            if let Some(sender) = state.event_channels.read().await.get(&id) {
+                let _ = sender.send(
+                    r#"{"status":"cancelled","stage":"cancelled","progress":100}"#.to_string(),
+                );
+            }
+            let snapshot = {
+                let mut jobs = state.jobs.write().await;
+                jobs.get_mut(&id).map(|job| {
+                    job.status = ApiJobStatus::Cancelled;
+                    job.progress.stage = "cancelled".to_string();
+                    job.updated_at = chrono::Utc::now().to_rfc3339();
+                    job.clone()
+                })
+            };
+            if let Some(job) = snapshot {
+                persist_job(&state.jobs_dir, &job)?;
+            }
             Ok(Json(serde_json::json!({ "status": "cancelled", "id": id })))
         }
         None => Ok(Json(serde_json::json!({ "status": "not_found", "id": id }))),
@@ -2880,15 +3165,14 @@ mod tests {
     #[test]
     fn job_manifest_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let job = ApiJob {
-            id: "job_1".to_string(),
-            status: ApiJobStatus::Complete,
-            result_url: Some("/api/jobs/job_1/result".to_string()),
-            report_url: Some("/api/jobs/job_1/result".to_string()),
-            output_path: Some(PathBuf::from("out.png")),
-            error: None,
-            result: Some(serde_json::json!({ "ok": true })),
-        };
+        let mut job = ApiJob::new(
+            "job_1".to_string(),
+            ApiJobKind::Page,
+            Some(PathBuf::from("out.png")),
+        );
+        job.status = ApiJobStatus::Complete;
+        job.report_url = Some("/api/jobs/job_1/result".to_string());
+        job.result = Some(serde_json::json!({ "ok": true }));
         persist_job(dir.path(), &job).unwrap();
         let loaded = read_job(dir.path(), "job_1").unwrap();
         assert_eq!(loaded.id, job.id);

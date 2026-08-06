@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 ///
 /// Unlike sparse dot hints, these are large flat regions with strong mask
 /// values so the hint-U-Net (stride-8 bottleneck) can actually see them.
-
 const SKIN: [u8; 3] = [244, 196, 166];
 const SKIN_SHA: [u8; 3] = [194, 134, 104];
 const HAIR_D: [u8; 3] = [42, 28, 36];
@@ -38,7 +37,6 @@ pub fn detect_semantic_regions(
 ) -> SemanticMasks {
     let (width, height) = gray.dimensions();
     let len = (width * height) as usize;
-    let page_area = len.max(1) as u64;
 
     // Per-pixel candidate predicates (scipy thresholds from onnx_worker).
     let mut skin_cand = vec![false; len];
@@ -62,10 +60,13 @@ pub fn detect_semantic_regions(
     }
 
     // Connected components with area pruning (flood fill).
-    let mut masks = SemanticMasks::default();
-    masks.skin = vec![false; len];
-    masks.hair = vec![false; len];
-    masks.bubble = vec![false; len];
+    let mut masks = SemanticMasks {
+        skin: vec![false; len],
+        hair: vec![false; len],
+        clothing: vec![false; len],
+        background: vec![false; len],
+        bubble: vec![false; len],
+    };
     let skin_min = 60usize;
     let hair_min = 50usize;
 
@@ -86,7 +87,7 @@ pub fn detect_semantic_regions(
             let mut queue = VecDeque::from([(x, y)]);
             visited[idx] = true;
             let mut component = Vec::new();
-            let mut class = if is_skin { 1u8 } else { 2u8 };
+            let class = if is_skin { 1u8 } else { 2u8 };
             while let Some((cx, cy)) = queue.pop_front() {
                 let cidx = (cy * width + cx) as usize;
                 component.push(cidx);
@@ -124,7 +125,6 @@ pub fn detect_semantic_regions(
     }
 
     // Clothing = mid gray minus skin/hair/ink/bubble.
-    masks.clothing = vec![false; len];
     for (i, p) in gray.pixels().enumerate() {
         let g = p[0] as u32;
         if (31..=191).contains(&g)
@@ -138,8 +138,7 @@ pub fn detect_semantic_regions(
     }
 
     // Background = complement.
-    masks.background = vec![false; len];
-    for (i, p) in gray.pixels().enumerate() {
+    for (i, _) in gray.pixels().enumerate() {
         let bubble = bubble_mask.get_pixel(i as u32 % width, i as u32 / width)[0] > 72;
         if !ink[i] && !masks.skin[i] && !masks.hair[i] && !masks.clothing[i] && !bubble {
             masks.background[i] = true;
@@ -150,7 +149,6 @@ pub fn detect_semantic_regions(
     for (i, p) in gray.pixels().enumerate() {
         let g = p[0] as u32;
         let b = bubble_mask.get_pixel(i as u32 % width, i as u32 / width)[0] > 72;
-        let _ = page_area;
         if b && g > 0 {
             masks.bubble[i] = true;
         }

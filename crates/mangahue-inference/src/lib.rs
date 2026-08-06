@@ -538,7 +538,6 @@ impl ReferenceCganBackend {
 /// Keeps the shared-worker key stable for identical content while changing
 /// when the file is replaced with different pixels.
 fn reference_content_fingerprint(path: &Path) -> Result<u64> {
-    use std::io::Read;
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read reference image {}", path.display()))?;
     let mut hash = 0xcbf29ce484222325u64;

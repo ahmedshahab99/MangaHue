@@ -300,7 +300,7 @@ struct DoctorArgs {
     metadata: PathBuf,
     #[arg(long, default_value = ".mangahue/jobs")]
     jobs_dir: PathBuf,
-    #[arg(long, default_value = "web/studio")]
+    #[arg(long, default_value = "web/app/out")]
     studio_dir: PathBuf,
     #[arg(long, default_value = "examples/input/smoke_page.png")]
     sample_input: PathBuf,
@@ -629,7 +629,7 @@ struct ServeArgs {
     jobs_dir: PathBuf,
     #[arg(long, default_value = "configs/styles")]
     styles_dir: PathBuf,
-    #[arg(long, default_value = "web/studio")]
+    #[arg(long, default_value = "web/app/out")]
     studio_dir: PathBuf,
     #[arg(long, default_value = ".mangahue/production.db")]
     production_db: PathBuf,

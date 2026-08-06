@@ -3,6 +3,9 @@ target
 .mangahue
 .venv
 __pycache__
+web/app/node_modules
+web/app/.next
+web/app/out
 examples/output
 *.pt
 *.pth

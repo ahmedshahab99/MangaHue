@@ -1,4 +1,11 @@
 # syntax=docker/dockerfile:1
+FROM node:22-bookworm-slim AS web-builder
+WORKDIR /web
+COPY web/app/package.json web/app/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web/app .
+RUN npm run build
+
 # ── Rust build stage ──────────────────────────────────────────────────────
 FROM rust:1.96-bookworm AS rust-builder
 WORKDIR /src
@@ -42,7 +49,9 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 COPY configs /app/configs
 COPY models /app/models
-COPY web /app/web
+COPY web/studio /app/web/studio
+COPY web/gpu /app/web/gpu
+COPY --from=web-builder /web/out /app/web/app/out
 
 RUN mkdir -p /data/jobs /data/objects \
     && chown -R mangahue:mangahue /app /data \
@@ -56,7 +65,7 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles", "--public-api"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/app/out", "--styles-dir", "/app/configs/styles", "--public-api"]
 
 # ── Compact ONNX CPU runtime (models mounted at runtime) ─────────────────
 FROM python:3.12-slim-bookworm AS runtime-small
@@ -83,7 +92,9 @@ COPY python /app/python
 RUN pip install --no-cache-dir numpy pillow onnxruntime
 
 COPY configs /app/configs
-COPY web /app/web
+COPY web/studio /app/web/studio
+COPY web/gpu /app/web/gpu
+COPY --from=web-builder /web/out /app/web/app/out
 
 RUN mkdir -p /data/jobs /data/objects \
     && chown -R mangahue:mangahue /app /data \
@@ -97,4 +108,4 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/studio", "--styles-dir", "/app/configs/styles", "--public-api"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/app/out", "--styles-dir", "/app/configs/styles", "--public-api"]

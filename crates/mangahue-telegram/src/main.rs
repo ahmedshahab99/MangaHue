@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
@@ -142,17 +142,20 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct Document {
     file_id: String,
-    file_name: Option<String>,
+    #[serde(rename = "file_name")]
+    _file_name: Option<String>,
     mime_type: Option<String>,
-    #[serde(default)]
-    file_size: Option<i64>,
+    #[serde(default, rename = "file_size")]
+    _file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PhotoSize {
     file_id: String,
-    width: i32,
-    height: i32,
+    #[serde(rename = "width")]
+    _width: i32,
+    #[serde(rename = "height")]
+    _height: i32,
     #[serde(default)]
     file_size: Option<i64>,
 }
@@ -1022,6 +1025,12 @@ fn fetch_telegram_file(client: &Client, token: &str, file_id: &str) -> Result<Ve
         .context("Telegram getFile failed")?
         .json()
         .context("failed to parse getFile response")?;
+    if !envelope.ok {
+        anyhow::bail!(
+            "Telegram getFile failed: {}",
+            envelope.description.as_deref().unwrap_or("unknown error")
+        );
+    }
     let remote_path = envelope
         .result
         .and_then(|r| r.file_path)
@@ -1030,7 +1039,7 @@ fn fetch_telegram_file(client: &Client, token: &str, file_id: &str) -> Result<Ve
     let url = format!("https://api.telegram.org/file/bot{token}/{remote_path}");
     // Cap the body: an unbounded read lets a huge upload fill RAM before
     // any size check runs.
-    let mut response = client
+    let response = client
         .get(&url)
         .send()
         .context("failed to download Telegram file")?
@@ -1812,6 +1821,7 @@ fn is_direct_image_url(url: &url::Url) -> bool {
         .any(|ext| path.ends_with(&format!(".{ext}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_link(
     client: &Client,
     fetch_client: &Client,
@@ -2783,6 +2793,7 @@ mod tests {
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
             styles_dir: None,
+            palettes_dir: PathBuf::from("configs/palettes"),
         };
         let first = state.try_start(10, 1).unwrap();
         assert!(state.try_start(10, 1).is_none());
@@ -2806,6 +2817,7 @@ mod tests {
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
             styles_dir: None,
+            palettes_dir: PathBuf::from("configs/palettes"),
         };
 
         state.record_pages(42, 250);
@@ -2838,6 +2850,7 @@ mod tests {
             usage_path: dir.path().join("usage.json"),
             daily_limit: 100,
             styles_dir: Some(dir.path().to_path_buf()),
+            palettes_dir: dir.path().to_path_buf(),
         });
 
         assert_eq!(load_style_name(&style).as_deref(), Some("Natural Manga"));

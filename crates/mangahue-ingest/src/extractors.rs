@@ -109,7 +109,7 @@ fn extract_nhentai(
     // `"body":"{...}"` field; parse the `pages` array paths directly.
     if urls.is_empty() {
         if let Some(gid) = extract_nhentai_gallery_id(base) {
-            if let Some(parsed) = parse_nhentai_embedded_json(&html, &gid) {
+            if let Some(parsed) = parse_nhentai_embedded_json(html, &gid) {
                 for img in parsed.into_iter().take(max_pages) {
                     if seen.insert(img.clone()) {
                         urls.push(img);

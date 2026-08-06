@@ -398,7 +398,7 @@ impl MangaHueEngine {
                             // semantic slots; fall back to natural defaults.
                             let skin = style
                                 .palette
-                                .get(0)
+                                .first()
                                 .map(|c| [c.r, c.g, c.b])
                                 .unwrap_or([242, 208, 182]);
                             let hair = style
@@ -463,9 +463,7 @@ impl MangaHueEngine {
         } else {
             preprocess.bubble_mask.clone()
         };
-        if let (Some(ref mask), Some(debug_dir)) =
-            (face_mask.as_ref(), request.debug_dir.as_deref())
-        {
+        if let (Some(mask), Some(debug_dir)) = (face_mask.as_ref(), request.debug_dir.as_deref()) {
             let painted = mask.pixels().filter(|p| p[0] > 0).count();
             report.warn(format!(
                 "face mask rasterized: {painted} pixels, box={:?}",

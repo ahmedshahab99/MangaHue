@@ -72,7 +72,7 @@ pub fn analyze_scene(gray: &GrayImage) -> SceneProfile {
         SceneLighting::Overcast
     } else if mean > 160.0 && contrast >= 45.0 {
         SceneLighting::Day
-    } else if mean >= 105.0 && mean <= 160.0 && contrast >= 55.0 {
+    } else if (105.0..=160.0).contains(&mean) && contrast >= 55.0 {
         SceneLighting::Sunset
     } else if bright_ratio < 0.18 && mean <= 160.0 {
         SceneLighting::Night
@@ -104,7 +104,7 @@ pub fn scene_palette(palette: &[ColorRgb], scene: &SceneProfile, keep: usize) ->
     if palette.is_empty() {
         return Vec::new();
     }
-    let keep = keep.max(4).min(20);
+    let keep = keep.clamp(4, 20);
     let target_luma = scene.brightness * 255.0;
     let mut warm: Option<(f32, ColorRgb)> = None;
     let mut cool: Option<(f32, ColorRgb)> = None;
@@ -167,11 +167,12 @@ pub fn scene_palette(palette: &[ColorRgb], scene: &SceneProfile, keep: usize) ->
         }
     }
     // Guarantee hue-family diversity for the region director.
-    for family in [warm, cool, light_neutral, dark_neutral] {
-        if let Some((_, color)) = family {
-            if chosen.len() < keep && !chosen.contains(&color) {
-                chosen.push(color);
-            }
+    for (_, color) in [warm, cool, light_neutral, dark_neutral]
+        .into_iter()
+        .flatten()
+    {
+        if chosen.len() < keep && !chosen.contains(&color) {
+            chosen.push(color);
         }
     }
     chosen

@@ -7,6 +7,7 @@ use image::{GrayImage, Rgb, RgbImage};
 /// - desaturation of oversaturated (plastic/neon) colors
 /// - deeper, warmer shadows in dark midtones
 /// - gentle warmth in highlights
+///
 /// Ink and paper pixels are preserved untouched.
 pub(crate) fn natural_grade(
     image: &mut RgbImage,
@@ -97,6 +98,7 @@ const PEACH_HUE: f32 = 0.055;
 /// deep shadows ~0.21, midtones ~0.28, brights ~0.22, paper ~0.035). Hue
 /// and value are preserved; only saturation is pulled toward the target so
 /// the whole page reads as one coherent muted grade instead of neon colors.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn muted_target_grade(
     image: &mut RgbImage,
     original_gray: &GrayImage,
@@ -280,7 +282,7 @@ mod tests {
         assert!(s < 0.55, "expected desaturation, got s={s:.2}");
         assert!(s > 0.20, "expected not fully gray, got s={s:.2}");
         // Hue stays orange (0.02-0.1 range).
-        assert!(h < 0.12 || h > 0.9);
+        assert!(!(0.12..=0.9).contains(&h));
         // Value preserved.
         assert!(v > 0.6);
     }

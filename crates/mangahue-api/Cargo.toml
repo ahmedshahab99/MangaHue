@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 clap.workspace = true
 mangahue-brain = { path = "../mangahue-brain" }
 mangahue-orchestrator = { path = "../mangahue-orchestrator" }
