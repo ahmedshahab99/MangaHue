@@ -3,6 +3,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{REFERER, USER_AGENT};
 use scraper::{Html, Selector};
 use std::collections::HashSet;
+use std::io::Read;
 use std::time::Duration;
 use url::Url;
 
@@ -103,46 +104,15 @@ fn extract_nhentai(
         }
     }
 
-    // Method 3: Build URLs from gallery data in JSON/script
+    // Method 3: Build URLs from gallery data in JSON/script.
+    // nhentai embeds the gallery JSON as an escaped string inside a
+    // `"body":"{...}"` field; parse the `pages` array paths directly.
     if urls.is_empty() {
-        if let Ok(script_sel) = Selector::parse("script") {
-            for script in document.select(&script_sel) {
-                let text = script.inner_html();
-                if text.contains("media_id") && text.contains("num_pages") {
-                    if let (Some(mid_start), Some(np_start)) = (
-                        text.find("\"media_id\":").map(|i| i + 12),
-                        text.find("\"num_pages\":").map(|i| i + 13),
-                    ) {
-                        let media_id: String = text[mid_start..]
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect();
-                        let num_pages: usize = text[np_start..]
-                            .chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect::<String>()
-                            .parse()
-                            .unwrap_or(0);
-
-                        if !media_id.is_empty() && num_pages > 0 {
-                            let ext = if html.contains(".webp") || html.contains("image/webp") {
-                                "webp"
-                            } else {
-                                "jpg"
-                            };
-                            for page in 1..=num_pages.min(max_pages) {
-                                let img_url = format!(
-                                    "https://i.nhentai.net/galleries/{}/{}.{}",
-                                    media_id, page, ext
-                                );
-                                if seen.insert(img_url.clone()) {
-                                    urls.push(img_url);
-                                }
-                            }
-                        }
-                    }
-                    if !urls.is_empty() {
-                        break;
+        if let Some(gid) = extract_nhentai_gallery_id(base) {
+            if let Some(parsed) = parse_nhentai_embedded_json(&html, &gid) {
+                for img in parsed.into_iter().take(max_pages) {
+                    if seen.insert(img.clone()) {
+                        urls.push(img);
                     }
                 }
             }
@@ -159,8 +129,10 @@ fn extract_nhentai(
                 .timeout(Duration::from_secs(15))
                 .send()
             {
-                if let Ok(body) = resp.text() {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                let mut reader = resp.take(16 * 1024 * 1024);
+                let mut body = Vec::new();
+                if reader.read_to_end(&mut body).is_ok() {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
                         if let (Some(mid), Some(images)) = (
                             json["media_id"].as_str().map(|s| s.to_string()),
                             json["images"]["pages"].as_array(),
@@ -236,6 +208,60 @@ fn extract_nhentai_gallery_id(url: &Url) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse the gallery JSON that nhentai embeds as an escaped string inside
+/// `"body":"{...}"`. The main gallery's media_id and page paths are used to
+/// build full image URLs; related-gallery entries are ignored.
+fn parse_nhentai_embedded_json(html: &str, gid: &str) -> Option<Vec<String>> {
+    // Find the media_id that belongs to THIS gallery. The embedded JSON has
+    // the pattern `"id":<gid>,"media_id":"<mid>"`. We scan for the gid first,
+    // then capture the following media_id.
+    let gid_needle = format!("\"id\":{},", gid);
+    let gid_pos = html.find(&gid_needle)?;
+    let after_gid = &html[gid_pos..];
+    let mid_needle = "\"media_id\":\"";
+    let mid_pos = after_gid.find(mid_needle)? + mid_needle.len();
+    let media_id: String = after_gid[mid_pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if media_id.is_empty() {
+        return None;
+    }
+
+    // Collect page paths scoped to THIS media_id: galleries/{media_id}/{n}.{ext}
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let path_prefix = format!("galleries/{}/", media_id);
+    let mut search_from = 0usize;
+    while let Some(rel) = html[search_from..].find(&path_prefix) {
+        let start = search_from + rel + path_prefix.len();
+        let rest = &html[start..];
+        let mut end = 0usize;
+        for (i, c) in rest.char_indices() {
+            if !c.is_ascii_alphanumeric() && c != '.' {
+                end = i;
+                break;
+            }
+            end = i + c.len_utf8();
+        }
+        let file = &rest[..end];
+        if let Some(ext) = file.rsplit('.').next() {
+            if matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif") {
+                let img = format!("https://i.nhentai.net/galleries/{}/{}", media_id, file);
+                if seen.insert(img.clone()) {
+                    urls.push(img);
+                }
+            }
+        }
+        search_from = start + end;
+    }
+    if urls.len() < 2 {
+        return None;
+    }
+    let _ = gid;
+    Some(urls)
 }
 
 // ── mangadex.org ─────────────────────────────────────────────────────────
@@ -400,7 +426,15 @@ fn extract_ehentai(
             .timeout(Duration::from_secs(10))
             .send()
         {
-            if let Ok(page_html) = page_resp.text() {
+            // Cap the body: an unbounded .text() lets a server stream
+            // gigabytes into RAM for every sub-page fetched.
+            let mut reader = page_resp.take(16 * 1024 * 1024);
+            let mut buffer = Vec::new();
+            let page_html = match reader.read_to_end(&mut buffer) {
+                Ok(_) => String::from_utf8_lossy(&buffer).into_owned(),
+                Err(_) => continue,
+            };
+            if !page_html.is_empty() {
                 let page_doc = Html::parse_document(&page_html);
                 let img_sel = Selector::parse("#img").unwrap();
                 if let Some(img) = page_doc.select(&img_sel).next() {

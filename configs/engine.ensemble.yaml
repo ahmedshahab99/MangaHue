@@ -1,8 +1,13 @@
 engine:
   mode: quality
-  parallel_jobs: 0
+  parallel_jobs: 1
   pyramid_enabled: true
   hint_propagation_enabled: true
+
+pyramid:
+  enabled: true
+  levels: [768]
+  blend_weights: [1.0]
 
 preprocess:
   denoise_strength: 2
@@ -29,7 +34,16 @@ ensemble:
   cielab_distance: true
 
 postprocess:
-  final_sharpening: 0.25
+  final_sharpening: 0.2
+  palette_correction: true
+  reference_finishing: true
+  semantic_relighting: true
+  relighting_strength: 0.35
+  midtone_depth: 0.26
+  local_contrast: 0.1
+  target_colorfulness: 2.0
+  natural_grading: true
+  reference_transfer: false
 
 eval:
   line_preservation_threshold: 0.96

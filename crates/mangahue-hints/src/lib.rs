@@ -9,6 +9,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 
+mod semantic_hints;
+
+pub use semantic_hints::{
+    detect_semantic_regions, rasterize_face_hints, rasterize_face_mask, rasterize_semantic_hints,
+    SemanticMasks,
+};
+
 const MAX_REGION_LOCKS: usize = 4096;
 const MAX_POLYGON_POINTS: usize = 16_384;
 
@@ -31,7 +38,18 @@ pub fn load_user_hints(path: impl AsRef<Path>) -> Result<UserHintFile> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read hints {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("failed to parse hints {}", path.display()))
+    match serde_json::from_str(&text) {
+        Ok(hints) => Ok(hints),
+        Err(_) => {
+            // A corrupt memory file must not brick colorization: fall back to
+            // an empty hint set so the job proceeds with default hints.
+            eprintln!(
+                "mangahue-hints: corrupt user hints file {}; ignoring",
+                path.display()
+            );
+            Ok(UserHintFile::default())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,7 +460,10 @@ pub fn apply_region_style_hints(
             radius,
             color,
             label: Some("region_style".to_string()),
-            strength: (0.16 * config.hint_strength).clamp(0.0, 0.28),
+            // Stronger hints so the hint-U-Net actually listens to the
+            // rich material palette (weak 0.28 hints were dominated by the
+            // global grid hints and produced flat warm pages).
+            strength: (0.28 * config.hint_strength).clamp(0.0, 0.55),
             source: HintSource::PaletteRule,
         };
         rasterize_hint(&mut result.hint_map, &mut result.hint_mask, &hint, 1.0);
@@ -606,12 +627,27 @@ pub fn rasterize_hint(
     hint: &ColorHint,
     global_strength: f32,
 ) {
-    let radius = hint.radius.max(1);
-    let radius_sq = (radius as i64) * (radius as i64);
+    // The model has a stride-8 bottleneck (3x MaxPool2d), so sub-stride
+    // hints are invisible to it. Enforce a minimum useful radius and use a
+    // flat plateau with a feathered rim (training used flat mask=255 disks,
+    // not linear-falloff dots which halved the effective strength).
+    // The radius is capped so a corrupt hint cannot paint a whole-image disk
+    // or overflow u32 arithmetic on the bounds.
+    let radius = hint.radius.clamp(16, 2048);
+    let radius_sq = (radius as u64) * (radius as u64);
+    let rim = (radius as f32 * 0.25).max(3.0);
     let min_x = hint.x.saturating_sub(radius);
     let min_y = hint.y.saturating_sub(radius);
-    let max_x = (hint.x + radius + 1).min(hint_map.width());
-    let max_y = (hint.y + radius + 1).min(hint_map.height());
+    let max_x = hint
+        .x
+        .saturating_add(radius)
+        .saturating_add(1)
+        .min(hint_map.width());
+    let max_y = hint
+        .y
+        .saturating_add(radius)
+        .saturating_add(1)
+        .min(hint_map.height());
     let strength = (hint.strength * global_strength).clamp(0.0, 1.0);
     let color = Rgb([hint.color.r, hint.color.g, hint.color.b]);
 
@@ -619,11 +655,14 @@ pub fn rasterize_hint(
         for x in min_x..max_x {
             let dx = x as i64 - hint.x as i64;
             let dy = y as i64 - hint.y as i64;
-            let distance_sq = dx * dx + dy * dy;
+            let distance_sq = (dx * dx + dy * dy) as u64;
             if distance_sq > radius_sq {
                 continue;
             }
-            let falloff = 1.0 - (distance_sq as f32 / radius_sq as f32).sqrt();
+            let distance = (distance_sq as f32).sqrt();
+            // Flat plateau inside (radius - rim), smoothstep feather on the rim.
+            let rim_t = ((distance - (radius as f32 - rim)) / rim).clamp(0.0, 1.0);
+            let falloff = 1.0 - rim_t * rim_t * (3.0 - 2.0 * rim_t);
             let alpha = (falloff * strength).clamp(0.0, 1.0);
             let old = hint_map.get_pixel(x, y);
             let blended = [
@@ -778,11 +817,7 @@ fn apply_adaptive_style_hints(
             let palette_idx = ((row * grid_cols + col) as usize) % palette.len();
             let color = palette[palette_idx];
 
-            let strength = if (row + col) % 2 == 0 {
-                0.22
-            } else {
-                0.14
-            };
+            let strength = if (row + col) % 2 == 0 { 0.22 } else { 0.14 };
 
             let hint = ColorHint {
                 x: cx,
@@ -1110,9 +1145,13 @@ fn rasterize_region_shape(file: &RegionLockFile, lock: &RegionLock, size: ImageS
 
 fn scale_region_point(file: &RegionLockFile, point: RegionPoint, size: ImageSize) -> RegionPoint {
     match file.coordinate_space {
+        // Normalized coordinates must NOT be clamped here: ellipse edge
+        // points legitimately exceed 1.0 (center 0.9 + radius 0.25 reaches
+        // 1.15). Clamping silently squished and shifted such ellipses.
+        // Iteration is clipped to the canvas by `bounds()` instead.
         RegionCoordinateSpace::Normalized => RegionPoint {
-            x: point.x.clamp(0.0, 1.0) * size.width as f32,
-            y: point.y.clamp(0.0, 1.0) * size.height as f32,
+            x: point.x * size.width as f32,
+            y: point.y * size.height as f32,
         },
         RegionCoordinateSpace::Pixels => RegionPoint {
             x: point.x * size.width as f32 / file.source_width.unwrap_or(size.width).max(1) as f32,

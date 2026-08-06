@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -46,7 +47,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -183,6 +183,13 @@ pub struct ApiState {
     pub cancel_tokens: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
     pub production: ProductionStore,
+    /// Root directory that /api/file and sandboxed job paths resolve under.
+    pub file_root: PathBuf,
+    /// Public mode: job inputs/outputs are confined to the jobs workspace
+    /// and user-supplied model paths are rejected.
+    pub sandbox_jobs: bool,
+    /// Extra origins (besides loopback) allowed to call the API.
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,6 +200,10 @@ pub struct ApiServerConfig {
     pub studio_dir: PathBuf,
     pub production_db: PathBuf,
     pub public_api: bool,
+    /// Root directory that /api/file and sandboxed job paths resolve under.
+    pub file_root: PathBuf,
+    /// Extra origins (besides loopback) allowed to call the API.
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +489,9 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.jobs_dir)
         .with_context(|| format!("failed to create {}", config.jobs_dir.display()))?;
     let production = ProductionStore::open(&config.production_db)?;
+    let file_root = config.file_root.clone();
+    let allowed_origins = config.allowed_origins.clone();
+    let sandbox_jobs = config.public_api;
     let state = ApiState {
         jobs: Arc::new(RwLock::new(HashMap::new())),
         jobs_dir: config.jobs_dir,
@@ -486,13 +500,14 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
         event_channels: Arc::new(RwLock::new(HashMap::new())),
         production,
+        file_root,
+        sandbox_jobs,
+        allowed_origins,
     };
     let app = router_with_mode(state, config.public_api);
     let listener = TcpListener::bind(config.addr).await?;
     info!("MangaHue API listening on http://{}", config.addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -511,67 +526,258 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
         .route("/api/v1/jobs/:id", get(get_durable_job))
         .route("/api/v1/jobs/:id/cancel", post(cancel_durable_job))
         .route("/api/v1/quota", get(get_quota));
+
+    // End-user webapp surfaces. In public mode every path field is sandboxed
+    // under the jobs workspace (see the sandbox_* helpers), so an
+    // authenticated caller can neither read nor write files outside the job
+    // workspace and can never make the engine load arbitrary checkpoints.
+    let user_routes = Router::new()
+        .route("/api/styles", get(list_styles))
+        .route("/api/file", get(get_local_file))
+        .route(
+            "/api/upload",
+            post(upload_file).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route("/api/colorize", post(create_colorize_job))
+        .route(
+            "/api/gpu/colorize",
+            post(gpu_colorize).layer(DefaultBodyLimit::max(96 * 1024 * 1024)),
+        )
+        .route("/api/batch", post(create_batch_job))
+        .route("/api/link/ingest", post(ingest_link))
+        .route("/api/link/colorize", post(create_link_colorize_job))
+        .route("/api/chapter/import", post(import_chapter))
+        .route("/api/chapter/export", post(export_chapter))
+        .route("/api/chapter/colorize", post(create_chapter_colorize_job))
+        .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/:id", get(get_job))
+        .route("/api/jobs/:id/cancel", post(cancel_job))
+        .route("/api/jobs/:id/result", get(get_job_result))
+        .route("/api/jobs/:id/events", get(job_events_sse));
+
+    // Operator-only surfaces: engine internals, brain, projects and
+    // corrections take host paths by design and are trusted-admin tools.
+    let admin_routes = Router::new()
+        .route("/metrics", get(metrics))
+        .route(
+            "/api/doctor",
+            get(run_doctor_default).post(run_doctor_custom),
+        )
+        .route("/api/inspect", post(inspect_page))
+        .route(
+            "/api/brain/palette-memory",
+            post(create_palette_memory_from_report),
+        )
+        .route("/api/brain/palette-memory/edit", post(edit_palette_memory))
+        .route(
+            "/api/brain/region-locks/preview",
+            post(preview_region_locks),
+        )
+        .route("/api/brain/region-locks/save", post(save_region_locks))
+        .route("/api/brain/semantics", post(analyze_page_semantics))
+        .route("/api/brain/characters/track", post(track_page_characters))
+        .route("/api/brain/dataset/curate", post(curate_training_dataset))
+        .route("/api/projects", post(create_project))
+        .route("/api/projects/status", post(project_status))
+        .route("/api/projects/export-corrections", post(export_corrections))
+        .route(
+            "/api/projects/export-hints",
+            post(export_correction_hints_file),
+        )
+        .route(
+            "/api/projects/export-training-manifest",
+            post(export_training_manifest),
+        )
+        .route("/api/projects/characters", post(create_character_profile))
+        .route(
+            "/api/projects/:project_id/characters",
+            post(create_character_profile_for_project),
+        )
+        .route("/api/corrections", post(add_project_correction));
+
+    // Public static assets: the user webapp, the WebGPU studio and models.
+    let static_routes = Router::new()
+        .nest_service(
+            "/app",
+            ServeDir::new("web/app").not_found_service(ServeFile::new("web/app/index.html")),
+        )
+        .nest_service(
+            "/gpu",
+            ServeDir::new("web/gpu").not_found_service(ServeFile::new("web/gpu/index.html")),
+        )
+        .nest_service("/models", ServeDir::new("models"));
+
     let app = if public_api {
+        // Public mode: everything except /health and static assets requires
+        // a Bearer token; operator surfaces additionally require an admin
+        // token. CORS admits loopback plus any configured origins.
+        let user_authed = user_routes.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_user,
+        ));
+        let admin_authed = admin_routes.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
         public_routes
+            .merge(static_routes)
+            .merge(user_authed)
+            .merge(admin_authed)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                loopback_cors,
+            ))
     } else {
+        // Local operator mode. The Studio is served from the same origin and
+        // automatically attaches the guard header to every API call; foreign
+        // web pages cannot send it (a custom header forces a CORS preflight,
+        // which the loopback-only CORS policy rejects). This closes the
+        // "any website you browse can drive the local API" and DNS-rebinding
+        // windows while keeping the operator UX unchanged.
+        let guarded_user = user_routes.route_layer(axum::middleware::from_fn(local_guard));
+        let guarded_admin = admin_routes.route_layer(axum::middleware::from_fn(local_guard));
         public_routes
-            .route("/metrics", get(metrics))
-            .route(
-                "/api/doctor",
-                get(run_doctor_default).post(run_doctor_custom),
-            )
-            .route("/api/styles", get(list_styles))
-            .route("/api/file", get(get_local_file))
-            .route("/api/inspect", post(inspect_page))
-            .route("/api/colorize", post(create_colorize_job))
-            .route("/api/batch", post(create_batch_job))
-            .route("/api/link/ingest", post(ingest_link))
-            .route("/api/link/colorize", post(create_link_colorize_job))
-            .route("/api/chapter/import", post(import_chapter))
-            .route("/api/chapter/export", post(export_chapter))
-            .route("/api/chapter/colorize", post(create_chapter_colorize_job))
-            .route(
-                "/api/brain/palette-memory",
-                post(create_palette_memory_from_report),
-            )
-            .route("/api/brain/palette-memory/edit", post(edit_palette_memory))
-            .route(
-                "/api/brain/region-locks/preview",
-                post(preview_region_locks),
-            )
-            .route("/api/brain/region-locks/save", post(save_region_locks))
-            .route("/api/brain/semantics", post(analyze_page_semantics))
-            .route("/api/brain/characters/track", post(track_page_characters))
-            .route("/api/brain/dataset/curate", post(curate_training_dataset))
-            .route("/api/jobs", get(list_jobs))
-            .route("/api/jobs/:id", get(get_job))
-            .route("/api/jobs/:id/events", get(job_events_sse))
-            .route("/api/jobs/:id/cancel", post(cancel_job))
-            .route("/api/jobs/:id/result", get(get_job_result))
-            .route("/api/projects", post(create_project))
-            .route("/api/projects/status", post(project_status))
-            .route("/api/projects/export-corrections", post(export_corrections))
-            .route(
-                "/api/projects/export-hints",
-                post(export_correction_hints_file),
-            )
-            .route(
-                "/api/projects/export-training-manifest",
-                post(export_training_manifest),
-            )
-            .route("/api/projects/characters", post(create_character_profile))
-            .route(
-                "/api/projects/:project_id/characters",
-                post(create_character_profile_for_project),
-            )
-            .route("/api/corrections", post(add_project_correction))
+            .merge(guarded_user)
+            .merge(guarded_admin)
+            .merge(static_routes)
             .fallback_service(
                 ServeDir::new(&studio_dir)
                     .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
             )
-            .layer(CorsLayer::permissive())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                loopback_cors,
+            ))
     };
     app.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// Rejects local-mode API calls that do not carry the guard header the
+/// Studio attaches automatically. Custom headers force a CORS preflight,
+/// which `loopback_cors` only grants to loopback origins — so cross-site
+/// pages and DNS-rebinding hosts cannot drive the local API.
+async fn local_guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let guarded = request
+        .headers()
+        .get("x-mangahue-local")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    if !guarded {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "local API requires the studio guard header"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Public-mode gate: any valid Bearer token is enough for the end-user
+/// webapp surfaces.
+async fn require_user(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Err(error) = authenticated_user(&state, request.headers()) {
+        return error.into_response();
+    }
+    next.run(request).await
+}
+
+/// Public-mode gate: operator surfaces additionally require an admin token.
+async fn require_admin(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let user = match authenticated_user(&state, request.headers()) {
+        Ok(user) => user,
+        Err(error) => return error.into_response(),
+    };
+    if user.tier != mangahue_production::UserTier::Admin {
+        return ApiError::with_status(StatusCode::FORBIDDEN, anyhow!("admin token required"))
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// CORS that only ever grants access to loopback origins (plus any origins
+/// explicitly allowed by configuration), and OPTIONS preflight handling.
+/// The Studio uses relative URLs, so its own origin is always the loopback
+/// host that the operator is browsing.
+async fn loopback_cors(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let allowed = origin
+        .as_deref()
+        .map(|origin| {
+            origin_is_loopback(origin)
+                || state
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed == origin)
+        })
+        .unwrap_or(false);
+
+    if request.method() == axum::http::Method::OPTIONS {
+        if allowed {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            apply_cors_headers(response.headers_mut(), origin.as_deref());
+            return response;
+        }
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let mut response = next.run(request).await;
+    if allowed {
+        apply_cors_headers(response.headers_mut(), origin.as_deref());
+    }
+    response
+}
+
+fn apply_cors_headers(headers: &mut HeaderMap, origin: Option<&str>) {
+    if let Some(origin) = origin {
+        if let Ok(value) = HeaderValue::from_str(origin) {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+        }
+    }
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type, x-mangahue-local, authorization"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("600"),
+    );
+}
+
+fn origin_is_loopback(origin: &str) -> bool {
+    let Ok(url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(host, "localhost" | "localhost.localdomain") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_canonical().is_loopback())
+        .unwrap_or(false)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -613,9 +819,20 @@ async fn metrics(State(state): State<ApiState>) -> Result<Response, ApiError> {
 async fn create_durable_job(
     State(state): State<ApiState>,
     headers: HeaderMap,
-    Json(payload): Json<ApiDurableJobRequest>,
+    Json(mut payload): Json<ApiDurableJobRequest>,
 ) -> Result<Json<DurableJob>, ApiError> {
     let user = authenticated_user(&state, &headers)?;
+    // Non-admin users cannot make the worker read/write arbitrary paths on
+    // the host: every path field must stay relative (inside the worker's
+    // working directory) and free of parent traversal. Admin tokens are
+    // trusted operator credentials.
+    if user.tier != mangahue_production::UserTier::Admin {
+        if let Err(error) = sanitize_job_payload(&mut payload.payload) {
+            return Err(ApiError::with_status(StatusCode::BAD_REQUEST, error));
+        }
+        payload.priority = payload.priority.clamp(0, 100);
+        payload.max_attempts = payload.max_attempts.clamp(1, 5);
+    }
     let job = state.production.enqueue(NewJob {
         user_id: user.id,
         kind: payload.kind,
@@ -624,6 +841,204 @@ async fn create_durable_job(
         max_attempts: payload.max_attempts,
     })?;
     Ok(Json(job))
+}
+
+const PAYLOAD_PATH_FIELDS: &[&str] = &[
+    "input_path",
+    "output_path",
+    "reference_image_path",
+    "model_path",
+    "cache_dir",
+    "export_path",
+    "downloads_dir",
+    "input_dir",
+    "output_dir",
+    "manifest_path",
+    "project_path",
+    "config_path",
+    "preset_path",
+    "style_path",
+    "user_hints_path",
+    "debug_dir",
+];
+
+/// Rejects payloads whose path fields are absolute or escape the working
+/// directory, so an authenticated non-admin caller cannot make the worker
+/// read or write files outside the sandbox.
+fn sanitize_job_payload(payload: &mut serde_json::Value) -> Result<()> {
+    fn walk(value: &mut serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, field) in map.iter_mut() {
+                    if PAYLOAD_PATH_FIELDS.contains(&key.as_str()) {
+                        if let Some(path) = field.as_str() {
+                            if path.is_empty() {
+                                continue;
+                            }
+                            let cleaned = path.replace('\\', "/");
+                            if std::path::Path::new(path).is_absolute() || cleaned.contains("../") {
+                                anyhow::bail!(
+                                    "path field {key} must be relative to the job sandbox and must not contain '..': {path}"
+                                );
+                            }
+                        }
+                    } else {
+                        walk(field)?;
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    walk(payload)
+}
+
+/// Reject URLs that resolve to private, loopback or link-local space so the
+/// API can never be used as a proxy into the host network or cloud metadata.
+fn validate_public_source_url(source_url: &str) -> Result<()> {
+    let url = url::Url::parse(source_url).with_context(|| "invalid source URL")?;
+    mangahue_ingest::validate_public_url(&url)
+}
+
+/// Strip optional host-path knobs that only an operator should control.
+/// Model/checkpoint paths are dropped outright: a remote caller must never
+/// be able to make the engine torch.load an arbitrary file (pickle RCE).
+/// Style and palette YAMLs stay because the webapp legitimately selects
+/// them and they contain no executable code.
+fn sandbox_engine_paths(request: &mut ColorizeRequest) {
+    request.model_path = None;
+    request.reference_image_path = None;
+    request.ensemble_model_paths.clear();
+    request.cache_dir = None;
+    request.debug_dir = None;
+    request.user_hints_path = None;
+    request.project_path = None;
+    request.region_locks_path = None;
+    request.character_ids.clear();
+}
+
+/// Public-mode sandbox for a single-page colorize request: the input must
+/// live inside the jobs workspace, the output is forced into it, and
+/// user-supplied model/checkpoint paths are dropped.
+fn sandbox_colorize_request(
+    request: &mut ColorizeRequest,
+    jobs_dir: &Path,
+    id: &str,
+) -> Result<()> {
+    let input = request.input_path.clone();
+    request.input_path = resolve_local_file(jobs_dir, &input).with_context(|| {
+        format!(
+            "input_path must live under the job workspace: {}",
+            input.display()
+        )
+    })?;
+    let out_dir = jobs_dir.join("out");
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    request.output_path = out_dir.join(format!("{id}.png"));
+    sandbox_engine_paths(request);
+    Ok(())
+}
+
+fn sandbox_batch_request(request: &mut ApiBatchRequest, jobs_dir: &Path, id: &str) -> Result<()> {
+    let base = jobs_dir.join("batch").join(id);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
+    request.input_dir = resolve_local_file(jobs_dir, &request.input_dir).with_context(|| {
+        format!(
+            "input_dir must live under the job workspace: {}",
+            request.input_dir.display()
+        )
+    })?;
+    request.output_dir = base.join("out");
+    sandbox_engine_paths(&mut request.template);
+    Ok(())
+}
+
+fn sandbox_link_request(
+    request: &mut ApiLinkColorizeRequest,
+    jobs_dir: &Path,
+    id: &str,
+) -> Result<()> {
+    let base = jobs_dir.join("link").join(id);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
+    request.output_dir = base.join("out");
+    request.downloads_dir = Some(base.join("downloads"));
+    sandbox_engine_paths(&mut request.template);
+    Ok(())
+}
+
+fn sandbox_chapter_import(
+    request: &mut ApiChapterImportRequest,
+    jobs_dir: &Path,
+    id: &str,
+) -> Result<()> {
+    let base = jobs_dir.join("chapter_import").join(id);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
+    request.input_path = resolve_local_file(jobs_dir, &request.input_path).with_context(|| {
+        format!(
+            "input_path must live under the job workspace: {}",
+            request.input_path.display()
+        )
+    })?;
+    request.output_dir = base.join("out");
+    request.manifest_path = Some(base.join("manifest.json"));
+    Ok(())
+}
+
+fn sandbox_chapter_export(
+    request: &mut ApiChapterExportRequest,
+    jobs_dir: &Path,
+    id: &str,
+) -> Result<()> {
+    let base = jobs_dir.join("chapter_export").join(id);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
+    request.input_dir = resolve_local_file(jobs_dir, &request.input_dir).with_context(|| {
+        format!(
+            "input_dir must live under the job workspace: {}",
+            request.input_dir.display()
+        )
+    })?;
+    request.output_file = base.join("chapter.cbz");
+    request.manifest_path = Some(base.join("manifest.json"));
+    Ok(())
+}
+
+fn sandbox_chapter_request(
+    request: &mut ApiChapterColorizeRequest,
+    jobs_dir: &Path,
+    id: &str,
+) -> Result<()> {
+    let base = jobs_dir.join("chapter").join(id);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("failed to create {}", base.display()))?;
+    request.input_path = resolve_local_file(jobs_dir, &request.input_path).with_context(|| {
+        format!(
+            "input_path must live under the job workspace: {}",
+            request.input_path.display()
+        )
+    })?;
+    request.work_dir = base.join("work");
+    request.output_dir = base.join("out");
+    request.export_path = Some(base.join("chapter.cbz"));
+    request.gallery_path = Some(base.join("gallery.html"));
+    request.manifest_path = Some(base.join("manifest.json"));
+    request.brain_report_path = Some(base.join("brain.json"));
+    request.locked_style_path = Some(base.join("locked_style.json"));
+    request.palette_memory_path = Some(base.join("palette_memory.json"));
+    request.palette_memory_style_path = Some(base.join("palette_memory_style.json"));
+    request.safety_report_path = Some(base.join("safety_gate.json"));
+    sandbox_engine_paths(&mut request.template);
+    Ok(())
 }
 
 async fn list_durable_jobs(
@@ -722,7 +1137,26 @@ async fn run_doctor_default(State(state): State<ApiState>) -> Json<DoctorReport>
 }
 
 async fn run_doctor_custom(Json(payload): Json<DoctorRequest>) -> Json<DoctorReport> {
-    Json(run_doctor_report(payload))
+    // The `python` field is argv[0] of a spawned process: only accept known
+    // Python interpreters so the endpoint can never launch arbitrary
+    // binaries (and exfiltrate their stderr) from an unauthenticated call.
+    let mut sanitized = payload;
+    if !python_command_is_safe(&sanitized.python) {
+        sanitized.python = default_python_command();
+    }
+    Json(run_doctor_report(sanitized))
+}
+
+fn python_command_is_safe(python: &str) -> bool {
+    let python = python.trim();
+    if python.is_empty() || python.contains(['/', '\\']) {
+        return false;
+    }
+    // Plain interpreter names only (python, python3, python3.11, python.exe):
+    // never accept a path, so argv[0] can only be a Python binary.
+    let name = python.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    name.starts_with("python")
 }
 
 pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
@@ -748,6 +1182,119 @@ pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
     }
 }
 
+/// WebGPU flow: the client runs the model on ITS GPU (onnxruntime-web) and
+/// uploads the colorized draft + the original page. The server finishes the
+/// draft with the full protected-layer, region director and grading
+/// postprocess, then returns the result file.
+async fn gpu_colorize(
+    State(state): State<ApiState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = Uuid::new_v4().to_string();
+    let dir = state.jobs_dir.join(format!("gpu_{id}"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let mut page_path: Option<PathBuf> = None;
+    let mut draft_path: Option<PathBuf> = None;
+    let mut preset_path: Option<PathBuf> = None;
+    let mut style_path: Option<PathBuf> = None;
+    let mut palette_path: Option<PathBuf> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?
+    {
+        match field.name() {
+            Some("page") => {
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
+                if data.len() > 50 * 1024 * 1024 {
+                    return Err(ApiError::with_status(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        anyhow!("page upload exceeds 50 MB"),
+                    ));
+                }
+                let path = dir.join("page.jpg");
+                std::fs::write(&path, &data)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                page_path = Some(path);
+            }
+            Some("draft") => {
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
+                if data.len() > 50 * 1024 * 1024 {
+                    return Err(ApiError::with_status(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        anyhow!("draft upload exceeds 50 MB"),
+                    ));
+                }
+                let path = dir.join("draft.png");
+                std::fs::write(&path, &data)
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+                draft_path = Some(path);
+            }
+            Some("preset") => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
+                if !text.trim().is_empty() {
+                    preset_path = Some(PathBuf::from(text.trim()));
+                }
+            }
+            Some("style") => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
+                if !text.trim().is_empty() {
+                    style_path = Some(PathBuf::from(text.trim()));
+                }
+            }
+            Some("palette") => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
+                if !text.trim().is_empty() {
+                    palette_path = Some(PathBuf::from(text.trim()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let (Some(page_path), Some(draft_path)) = (page_path, draft_path) else {
+        return Err(ApiError::with_status(
+            StatusCode::BAD_REQUEST,
+            anyhow!("multipart requires 'page' and 'draft' image fields"),
+        ));
+    };
+    let output_path = dir.join("result.png");
+    let request = ColorizeRequest {
+        input_path: page_path,
+        output_path: output_path.clone(),
+        draft_path: Some(draft_path),
+        preset_path,
+        style_path,
+        palette_path,
+        cache_dir: Some(state.jobs_dir.clone()),
+        ..ColorizeRequest::default()
+    };
+    let result = MangaHueEngine::new().colorize(request)?;
+    let file_root = state.file_root.clone();
+    let relative = |path: &Path| path.strip_prefix(&file_root).unwrap_or(path).to_path_buf();
+    let report_path = mangahue_image::sibling_with_suffix(&output_path, ".report", "json");
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "result_url": format!("/api/file?path={}", relative(&output_path).display()),
+        "report_url": format!("/api/file?path={}", relative(&report_path).display()),
+        "verdict": result.report.director_verdict,
+    })))
+}
+
 async fn create_colorize_job(
     State(state): State<ApiState>,
     Json(mut payload): Json<ApiColorizeRequest>,
@@ -768,6 +1315,10 @@ async fn create_colorize_job(
 
     payload.request.cancel_token = Some(cancel_token);
     payload.request.cache_dir = Some(state.jobs_dir.clone());
+
+    if state.sandbox_jobs {
+        sandbox_colorize_request(&mut payload.request, &state.jobs_dir, &id)?;
+    }
 
     // Progressive rendering: create an unbounded mpsc channel so the
     // orchestrator's blocking task can push per-tile progress updates
@@ -872,9 +1423,12 @@ async fn create_colorize_job(
 
 async fn create_batch_job(
     State(state): State<ApiState>,
-    Json(payload): Json<ApiBatchRequest>,
+    Json(mut payload): Json<ApiBatchRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
     let id = Uuid::new_v4().to_string();
+    if state.sandbox_jobs {
+        sandbox_batch_request(&mut payload, &state.jobs_dir, &id)?;
+    }
     let job = ApiJob {
         id: id.clone(),
         status: ApiJobStatus::Queued,
@@ -941,8 +1495,20 @@ async fn create_batch_job(
 }
 
 async fn ingest_link(
-    Json(payload): Json<ApiLinkIngestRequest>,
+    State(state): State<ApiState>,
+    Json(mut payload): Json<ApiLinkIngestRequest>,
 ) -> Result<Json<IngestReport>, ApiError> {
+    validate_public_source_url(&payload.source_url)?;
+    clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
+    if state.sandbox_jobs {
+        let base = state
+            .jobs_dir
+            .join("ingest")
+            .join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&base)
+            .with_context(|| format!("failed to create {}", base.display()))?;
+        payload.output_dir = base.join("pages");
+    }
     let report = tokio::task::spawn_blocking(move || {
         ingest_url(IngestRequest {
             source_url: payload.source_url,
@@ -959,11 +1525,24 @@ async fn ingest_link(
     Ok(Json(report))
 }
 
+/// Server-side ceilings for caller-supplied download limits. The values
+/// also flow to `response.take(max_bytes)` in the ingest crate, where an
+/// unbounded value would allow multi-GB downloads.
+fn clamp_link_limits(max_pages: &mut usize, max_bytes_per_page: &mut u64) {
+    *max_pages = (*max_pages).clamp(1, 500);
+    *max_bytes_per_page = (*max_bytes_per_page).clamp(1, 64 * 1024 * 1024);
+}
+
 async fn create_link_colorize_job(
     State(state): State<ApiState>,
-    Json(payload): Json<ApiLinkColorizeRequest>,
+    Json(mut payload): Json<ApiLinkColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
+    validate_public_source_url(&payload.source_url)?;
+    clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
     let id = Uuid::new_v4().to_string();
+    if state.sandbox_jobs {
+        sandbox_link_request(&mut payload, &state.jobs_dir, &id)?;
+    }
     let job = ApiJob {
         id: id.clone(),
         status: ApiJobStatus::Queued,
@@ -1030,8 +1609,13 @@ async fn create_link_colorize_job(
 }
 
 async fn import_chapter(
-    Json(payload): Json<ApiChapterImportRequest>,
+    State(state): State<ApiState>,
+    Json(mut payload): Json<ApiChapterImportRequest>,
 ) -> Result<Json<ChapterManifest>, ApiError> {
+    clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
+    if state.sandbox_jobs {
+        sandbox_chapter_import(&mut payload, &state.jobs_dir, &Uuid::new_v4().to_string())?;
+    }
     let manifest = tokio::task::spawn_blocking(move || {
         let manifest = import_chapter_to_dir(
             &payload.input_path,
@@ -1054,8 +1638,12 @@ async fn import_chapter(
 }
 
 async fn export_chapter(
-    Json(payload): Json<ApiChapterExportRequest>,
+    State(state): State<ApiState>,
+    Json(mut payload): Json<ApiChapterExportRequest>,
 ) -> Result<Json<ChapterManifest>, ApiError> {
+    if state.sandbox_jobs {
+        sandbox_chapter_export(&mut payload, &state.jobs_dir, &Uuid::new_v4().to_string())?;
+    }
     let manifest = tokio::task::spawn_blocking(move || {
         let manifest = export_chapter_archive(&payload.input_dir, &payload.output_file)?;
         if let Some(manifest_path) = payload.manifest_path {
@@ -1070,9 +1658,12 @@ async fn export_chapter(
 
 async fn create_chapter_colorize_job(
     State(state): State<ApiState>,
-    Json(payload): Json<ApiChapterColorizeRequest>,
+    Json(mut payload): Json<ApiChapterColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
     let id = Uuid::new_v4().to_string();
+    if state.sandbox_jobs {
+        sandbox_chapter_request(&mut payload, &state.jobs_dir, &id)?;
+    }
     let job = ApiJob {
         id: id.clone(),
         status: ApiJobStatus::Queued,
@@ -1129,6 +1720,7 @@ async fn create_chapter_colorize_job(
                 palette_drift_threshold: payload.retry_drift_threshold,
                 tone_drift_threshold: payload.retry_tone_threshold,
                 max_pages: payload.retry_max_pages,
+                max_rounds: mangahue_chapter::default_retry_max_rounds(),
             },
             resume: payload.resume,
         });
@@ -1209,8 +1801,29 @@ async fn list_jobs(State(state): State<ApiState>) -> Result<Json<Vec<ApiJob>>, A
     Ok(Json(jobs))
 }
 
-async fn get_local_file(Query(query): Query<ApiFileQuery>) -> Result<Response, ApiError> {
-    let path = resolve_local_file(&query.path)?;
+const FILE_EXT_WHITELIST: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "json", "html", "cbz",
+];
+
+/// Serve a file from the API's file root (the jobs workspace in public
+/// mode). Only image/report/archive types are served, so the endpoint can
+/// never be used to exfiltrate credentials or other host files.
+async fn get_local_file(
+    State(state): State<ApiState>,
+    Query(query): Query<ApiFileQuery>,
+) -> Result<Response, ApiError> {
+    let path = resolve_local_file(&state.file_root, &query.path)?;
+    let allowed = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|ext| FILE_EXT_WHITELIST.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !allowed {
+        return Err(ApiError::with_status(
+            StatusCode::FORBIDDEN,
+            anyhow!("file type not served by the API"),
+        ));
+    }
     let data = tokio::fs::read(&path)
         .await
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -1220,6 +1833,63 @@ async fn get_local_file(Query(query): Query<ApiFileQuery>) -> Result<Response, A
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     Ok(response)
+}
+
+/// Upload a page image into the job workspace. Returns the absolute path to
+/// pass back as `input_path` on /api/colorize (public mode confines inputs
+/// to this workspace, so the returned path is always acceptable).
+async fn upload_file(
+    State(state): State<ApiState>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let field = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(error)))?
+        .ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::BAD_REQUEST,
+                anyhow!("multipart field 'file' is required"),
+            )
+        })?;
+    let file_name = field.file_name().map(|name| name.to_string());
+    let data = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(error)))?;
+    if data.is_empty() {
+        return Err(ApiError::with_status(
+            StatusCode::BAD_REQUEST,
+            anyhow!("empty upload"),
+        ));
+    }
+    if data.len() > 50 * 1024 * 1024 {
+        return Err(ApiError::with_status(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            anyhow!("upload exceeds 50 MB"),
+        ));
+    }
+    let ext = file_name
+        .as_deref()
+        .and_then(|name| Path::new(name).extension().and_then(|value| value.to_str()))
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif"
+            )
+        })
+        .unwrap_or_else(|| "png".to_string());
+    let dir = state.jobs_dir.join("uploads");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let name = format!("{}.{}", Uuid::new_v4(), ext);
+    let path = dir.join(&name);
+    std::fs::write(&path, &data).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(Json(serde_json::json!({
+        "id": name,
+        "path": path,
+        "size": data.len(),
+    })))
 }
 
 async fn get_job_result(
@@ -1577,7 +2247,18 @@ async fn get_job_by_id(state: &ApiState, id: &str) -> Result<ApiJob> {
     Ok(job)
 }
 
+fn safe_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 fn persist_job(jobs_dir: &std::path::Path, job: &ApiJob) -> Result<()> {
+    if !safe_job_id(&job.id) {
+        anyhow::bail!("refusing to persist job with unsafe id {:?}", job.id);
+    }
     std::fs::create_dir_all(jobs_dir)
         .with_context(|| format!("failed to create {}", jobs_dir.display()))?;
     let path = jobs_dir.join(format!("{}.json", job.id));
@@ -1586,6 +2267,11 @@ fn persist_job(jobs_dir: &std::path::Path, job: &ApiJob) -> Result<()> {
 }
 
 fn read_job(jobs_dir: &std::path::Path, id: &str) -> Result<ApiJob> {
+    // The id arrives URL-decoded from the path segment; an id like
+    // "..%2F..%2Fsecret" must never reach the filesystem join.
+    if !safe_job_id(id) {
+        anyhow::bail!("invalid job id {:?}", id);
+    }
     let path = jobs_dir.join(format!("{id}.json"));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("unknown job id {id}; no manifest at {}", path.display()))?;
@@ -2038,8 +2724,8 @@ fn aggregate_doctor_status(checks: &[DoctorCheck]) -> DoctorStatus {
     }
 }
 
-fn resolve_local_file(path: &Path) -> Result<PathBuf> {
-    let root = std::env::current_dir()?.canonicalize()?;
+fn resolve_local_file(root: &Path, path: &Path) -> Result<PathBuf> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2237,6 +2923,9 @@ mod tests {
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
+            file_root: dir.path().join("jobs"),
+            sandbox_jobs: true,
+            allowed_origins: vec![],
         };
         let app = router_with_mode(state, true);
 
@@ -2264,7 +2953,16 @@ mod tests {
             .unwrap();
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
 
-        for path in ["/api/file?path=Cargo.toml", "/api/doctor", "/metrics", "/"] {
+        // Operator and webapp surfaces exist in public mode but demand a
+        // Bearer token; an anonymous caller gets 401 (or 404 for paths that
+        // do not exist at all).
+        for path in [
+            "/api/file?path=Cargo.toml",
+            "/api/doctor",
+            "/api/colorize",
+            "/metrics",
+            "/api/jobs",
+        ] {
             let response = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -2272,9 +2970,16 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 response.status(),
-                StatusCode::NOT_FOUND,
-                "{path} must not be exposed in public mode"
+                StatusCode::UNAUTHORIZED,
+                "{path} must not be anonymously accessible in public mode"
             );
         }
+
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(root.status(), StatusCode::NOT_FOUND);
     }
 }

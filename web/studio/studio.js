@@ -1,6 +1,12 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
+// The local API requires this guard header on every call. A foreign web
+// page cannot send it (custom headers force a CORS preflight that the
+// server only grants to loopback origins), so the Studio is the only
+// caller that can drive the local API.
+const LOCAL_GUARD_HEADER = { "x-mangahue-local": "1" };
+
 function formData(form) {
   const data = new FormData(form);
   const out = {};
@@ -23,7 +29,7 @@ function fileUrl(path) {
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...LOCAL_GUARD_HEADER },
     ...options,
   });
   const data = await response.json();
@@ -380,7 +386,9 @@ async function saveRegionDocument() {
 }
 
 async function loadConsistencyDashboard() {
-  const response = await fetch(`${fileUrl(editorValue("consistency-report"))}&t=${Date.now()}`);
+  const response = await fetch(`${fileUrl(editorValue("consistency-report"))}&t=${Date.now()}`, {
+    headers: LOCAL_GUARD_HEADER,
+  });
   if (!response.ok) throw new Error("Could not load brain report");
   const report = await response.json();
   document.getElementById("consistency-summary").innerHTML = [

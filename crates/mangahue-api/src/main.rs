@@ -22,6 +22,16 @@ struct Args {
         help = "Expose only authenticated v1 routes; disable local file, Studio, and operator APIs"
     )]
     public_api: bool,
+    #[arg(
+        long,
+        help = "Root directory served by /api/file (default: current dir, or jobs dir in public mode)"
+    )]
+    file_root: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Additional CORS origin allowed to call the API (repeatable)"
+    )]
+    cors_origin: Vec<String>,
 }
 
 #[tokio::main]
@@ -30,6 +40,13 @@ async fn main() -> Result<()> {
         .with_env_filter("mangahue=info,tower_http=info")
         .init();
     let args = Args::parse();
+    let file_root = args.file_root.unwrap_or_else(|| {
+        if args.public_api {
+            args.jobs_dir.clone()
+        } else {
+            PathBuf::from(".")
+        }
+    });
     serve(ApiServerConfig {
         addr: args.addr,
         jobs_dir: args.jobs_dir,
@@ -37,6 +54,8 @@ async fn main() -> Result<()> {
         studio_dir: args.studio_dir,
         production_db: args.production_db,
         public_api: args.public_api,
+        file_root,
+        allowed_origins: args.cors_origin,
     })
     .await
 }

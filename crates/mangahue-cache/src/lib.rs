@@ -91,6 +91,25 @@ impl ArtifactCache {
         Ok(artifact)
     }
 
+    /// Store a file under an explicit caller-supplied key (e.g. a user
+    /// idempotency key) instead of the content hash. The file is still
+    /// materialized as a single blob in the cache root.
+    pub fn put_file_as(
+        &self,
+        source: impl AsRef<Path>,
+        key: &CacheKey,
+        kind: ArtifactKind,
+        media_type: Option<String>,
+    ) -> Result<CachedArtifact> {
+        let source = source.as_ref();
+        let mut file = fs::File::open(source)
+            .with_context(|| format!("failed to open {}", source.display()))?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)
+            .with_context(|| format!("failed to read {}", source.display()))?;
+        self.put_bytes_as(&data, key, kind, extension_for(source), media_type)
+    }
+
     pub fn put_bytes(
         &self,
         bytes: &[u8],
@@ -98,9 +117,20 @@ impl ArtifactCache {
         extension: Option<&str>,
         media_type: Option<String>,
     ) -> Result<CachedArtifact> {
+        let key = CacheKey::from_bytes(bytes);
+        self.put_bytes_as(bytes, &key, kind, extension, media_type)
+    }
+
+    pub fn put_bytes_as(
+        &self,
+        bytes: &[u8],
+        key: &CacheKey,
+        kind: ArtifactKind,
+        extension: Option<&str>,
+        media_type: Option<String>,
+    ) -> Result<CachedArtifact> {
         fs::create_dir_all(&self.root)
             .with_context(|| format!("failed to create {}", self.root.display()))?;
-        let key = CacheKey::from_bytes(bytes);
         let ext = extension.unwrap_or("bin").trim_start_matches('.');
         let path = self.root.join(format!("{}.{}", key.0, ext));
         if !path.exists() {
@@ -108,7 +138,7 @@ impl ArtifactCache {
                 .with_context(|| format!("failed to write {}", path.display()))?;
         }
         let artifact = CachedArtifact {
-            key,
+            key: key.clone(),
             kind,
             path,
             bytes: bytes.len() as u64,
@@ -126,6 +156,19 @@ impl ArtifactCache {
             .artifacts
             .into_iter()
             .find(|artifact| &artifact.key == key && artifact.path.exists()))
+    }
+
+    /// Look up an artifact by key and kind. Multiple artifacts can share one
+    /// key (e.g. a colored page and its report under the same idempotency
+    /// key); the kind disambiguates.
+    pub fn get_kind(&self, key: &CacheKey, kind: ArtifactKind) -> Result<Option<CachedArtifact>> {
+        Ok(self
+            .load_manifest()?
+            .artifacts
+            .into_iter()
+            .find(|artifact| {
+                &artifact.key == key && artifact.kind == kind && artifact.path.exists()
+            }))
     }
 
     pub fn contains(&self, key: &CacheKey) -> Result<bool> {

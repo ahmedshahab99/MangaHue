@@ -12,8 +12,10 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+image.workspace = true
+mangahue-core = { path = "../mangahue-core" }
 mangahue-ingest = { path = "../mangahue-ingest" }
-mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+mangahue-orchestrator = { path = "../mangahue-orchestrator", features = ["native-onnx"] }
 mangahue-export = { path = "../mangahue-export" }
 reqwest.workspace = true
 serde.workspace = true

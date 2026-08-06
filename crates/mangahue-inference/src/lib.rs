@@ -127,6 +127,14 @@ pub struct ModelInput {
 pub trait ColorizationBackend: Send + Sync {
     fn name(&self) -> &str;
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError>;
+
+    /// Whether this backend should receive the original grayscale page
+    /// (with screentones/shading preserved) instead of the whitened
+    /// `clean_lineart`. DDColor-style models colorize from real tone values
+    /// and produce near-zero chroma on flattened white tiles.
+    fn prefers_original_grayscale(&self) -> bool {
+        false
+    }
 }
 
 impl<T: ColorizationBackend + ?Sized> ColorizationBackend for Arc<T> {
@@ -137,11 +145,18 @@ impl<T: ColorizationBackend + ?Sized> ColorizationBackend for Arc<T> {
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
         self.as_ref().colorize(input)
     }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        self.as_ref().prefers_original_grayscale()
+    }
 }
 
 pub fn is_ddcolor_model_dir(path: impl AsRef<Path>) -> bool {
     let path = path.as_ref();
-    path.join("pytorch_model.pt").is_file() || path.join("models").is_dir()
+    // Accept both checkpoint naming conventions (.pt official, .bin HF-style).
+    path.join("pytorch_model.pt").is_file()
+        || path.join("pytorch_model.bin").is_file()
+        || path.join("models").is_dir()
 }
 
 pub fn is_ddcolor_onnx_model(path: impl AsRef<Path>) -> bool {
@@ -171,7 +186,8 @@ struct AnimeFaceWorkerLaunch {
 
 impl AnimeFaceWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.anime_face_worker")
@@ -180,7 +196,9 @@ impl AnimeFaceWorkerLaunch {
             .arg("--threads")
             .arg(self.worker_threads.to_string())
             .env("OMP_NUM_THREADS", self.worker_threads.to_string())
-            .env("MALLOC_ARENA_MAX", "2")
+            .env("MALLOC_ARENA_MAX", "2");
+        apply_worker_pythonpath(&mut command, &self.python);
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -210,7 +228,9 @@ impl AnimeFaceBackend {
         if !is_anime_face_model_dir(&model_dir) {
             anyhow::bail!("anime face cascade missing in {}", model_dir.display());
         }
-        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let python = std::env::var("MANGAHUE_FACE_PYTHON")
+            .or_else(|_| std::env::var("MANGAHUE_PYTHON"))
+            .unwrap_or_else(|_| "python".to_string());
         let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -246,7 +266,73 @@ impl AnimeFaceBackend {
         }
         let worker = Arc::new(Self::new(&canonical)?);
         workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 4);
         Ok(worker)
+    }
+
+    /// Detect anime faces in a grayscale page. Returns (x, y, w, h) boxes
+    /// in full-page coordinates, largest first.
+    pub fn detect_faces(
+        &self,
+        lineart: &GrayImage,
+    ) -> std::result::Result<Vec<[u32; 4]>, EngineError> {
+        let temp = tempfile::tempdir()
+            .map_err(|error| EngineError::Inference(format!("anime face temp dir: {error}")))?;
+        let lineart_path = temp.path().join("lineart.png");
+        let output_path = temp.path().join("output.png");
+        lineart
+            .save(&lineart_path)
+            .map_err(|error| EngineError::Inference(format!("anime face save: {error}")))?;
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "output": output_path,
+        });
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|error| EngineError::Inference(format!("anime face lock: {error}")))?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "anime face worker failed ({first_error}) and restart failed: {restart_error}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "anime face worker failed after restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!(
+                "anime face worker failed: {}",
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+            )));
+        }
+        let mut faces = Vec::new();
+        if let Some(list) = response.get("faces").and_then(|value| value.as_array()) {
+            for entry in list {
+                if let Some(arr) = entry.as_array() {
+                    if arr.len() == 4 {
+                        let box4 = [
+                            arr[0].as_u64().unwrap_or(0) as u32,
+                            arr[1].as_u64().unwrap_or(0) as u32,
+                            arr[2].as_u64().unwrap_or(0) as u32,
+                            arr[3].as_u64().unwrap_or(0) as u32,
+                        ];
+                        faces.push(box4);
+                    }
+                }
+            }
+        }
+        Ok(faces)
     }
 }
 
@@ -345,6 +431,18 @@ impl ReferenceCganWorkerLaunch {
     }
 }
 
+/// Bound the shared-worker registries: when a registry grows past the cap,
+/// evict workers referenced ONLY by the registry (strong_count == 1). A
+/// worker in active use has strong_count >= 2 (registry + caller), so live
+/// workers are never evicted. Each evicted worker releases its subprocess
+/// and its ~1-2GB working set — without this, repeated configuration or
+/// reference changes accumulated processes until OOM.
+fn evict_idle_workers<T>(workers: &mut HashMap<String, Arc<T>>, cap: usize) {
+    if workers.len() >= cap {
+        workers.retain(|_, worker| Arc::strong_count(worker) > 1);
+    }
+}
+
 #[derive(Debug)]
 pub struct ReferenceCganBackend {
     launch: ReferenceCganWorkerLaunch,
@@ -412,10 +510,15 @@ impl ReferenceCganBackend {
                 reference_path.as_ref().display()
             )
         })?;
+        // The reference CONTENT is part of the key: replacing the reference
+        // file at the same path used to be ignored (stale-reference bug) and
+        // each distinct key spawned a never-evicted 1-2GB worker process.
+        let reference_fingerprint = reference_content_fingerprint(&canonical_reference)?;
         let key = format!(
-            "{}\x00{}",
+            "{}\x00{}\x00{}",
             canonical_model.display(),
-            canonical_reference.display()
+            canonical_reference.display(),
+            reference_fingerprint
         );
         let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
         let mut workers = workers
@@ -426,8 +529,24 @@ impl ReferenceCganBackend {
         }
         let worker = Arc::new(Self::new(&canonical_model, &canonical_reference)?);
         workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 4);
         Ok(worker)
     }
+}
+
+/// Dependency-free content fingerprint (FNV-1a 64) of the reference image.
+/// Keeps the shared-worker key stable for identical content while changing
+/// when the file is replaced with different pixels.
+fn reference_content_fingerprint(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read reference image {}", path.display()))?;
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(hash)
 }
 
 impl ColorizationBackend for ReferenceCganBackend {
@@ -492,7 +611,8 @@ struct DdColorOnnxWorkerLaunch {
 
 impl DdColorOnnxWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.ddcolor_onnx_worker")
@@ -505,14 +625,14 @@ impl DdColorOnnxWorkerLaunch {
             .env("MALLOC_ARENA_MAX", "2")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to launch DDColor ONNX worker with '{}'",
-                    self.python
-                )
-            })?;
+            .stderr(Stdio::inherit());
+        apply_worker_pythonpath(&mut command, &self.python);
+        let child = command.spawn().with_context(|| {
+            format!(
+                "failed to launch DDColor ONNX worker with '{}'",
+                self.python
+            )
+        })?;
         let mut process =
             attach_worker_process(child, "ddcolor-onnx-worker", configured_worker_timeout())?;
         wait_for_worker_ready(&mut process, "DDColor ONNX worker")?;
@@ -577,6 +697,7 @@ impl DdColorOnnxBackend {
         }
         let worker = Arc::new(Self::new(&canonical)?);
         workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 4);
         Ok(worker)
     }
 }
@@ -584,6 +705,10 @@ impl DdColorOnnxBackend {
 impl ColorizationBackend for DdColorOnnxBackend {
     fn name(&self) -> &str {
         "ddcolor-tiny-onnx"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        true
     }
 
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
@@ -646,7 +771,8 @@ struct DdColorWorkerLaunch {
 
 impl DdColorWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.ddcolor_worker")
@@ -662,7 +788,9 @@ impl DdColorWorkerLaunch {
             .arg(self.worker_threads.to_string())
             .env("OMP_NUM_THREADS", self.worker_threads.to_string())
             .env("MKL_NUM_THREADS", self.worker_threads.to_string())
-            .env("MALLOC_ARENA_MAX", "2")
+            .env("MALLOC_ARENA_MAX", "2");
+        apply_worker_pythonpath(&mut command, &self.python);
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -672,6 +800,29 @@ impl DdColorWorkerLaunch {
             attach_worker_process(child, "ddcolor-worker", configured_worker_timeout())?;
         wait_for_worker_ready(&mut process, "ddcolor worker")?;
         Ok(process)
+    }
+}
+
+/// Extend PYTHONPATH for worker subprocesses so mangahue_train and model
+/// source repos (e.g. ddcolor_repo) resolve regardless of the current dir
+/// or the interpreter's site-packages. Set MANGAHUE_PYTHONPATH (colon
+/// separated) to add extra roots.
+fn apply_worker_pythonpath(command: &mut Command, _python: &str) {
+    let mut entries: Vec<String> = Vec::new();
+    if let Ok(extra) = std::env::var("MANGAHUE_PYTHONPATH") {
+        for part in extra.split(':') {
+            if !part.is_empty() {
+                entries.push(part.to_string());
+            }
+        }
+    }
+    if !entries.is_empty() {
+        if let Ok(existing) = std::env::var("PYTHONPATH") {
+            if !existing.is_empty() {
+                entries.push(existing);
+            }
+        }
+        command.env("PYTHONPATH", entries.join(":"));
     }
 }
 
@@ -767,6 +918,7 @@ impl DdColorBackend {
         }
         let worker = Arc::new(Self::new(&canonical, device, input_size, model_size)?);
         w.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut w, 4);
         Ok(worker)
     }
 }
@@ -774,6 +926,10 @@ impl DdColorBackend {
 impl ColorizationBackend for DdColorBackend {
     fn name(&self) -> &str {
         "ddcolor"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        true
     }
 
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
@@ -1089,6 +1245,7 @@ impl PretrainedWorkerBackend {
         }
         let worker = Arc::new(Self::new(&canonical, device, input_size)?);
         workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 4);
         Ok(worker)
     }
 }
@@ -1286,6 +1443,7 @@ impl MangaNinjaBackend {
         }
         let worker = Arc::new(Self::new(&canonical, device, denoise_steps)?);
         workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 4);
         Ok(worker)
     }
 }
@@ -1456,7 +1614,8 @@ struct OnnxWorkerLaunch {
 
 impl OnnxWorkerLaunch {
     fn spawn(&self) -> Result<PretrainedWorkerProcess> {
-        let child = Command::new(&self.python)
+        let mut command = Command::new(&self.python);
+        command
             .arg("-u")
             .arg("-m")
             .arg("mangahue_train.onnx_worker")
@@ -1468,7 +1627,11 @@ impl OnnxWorkerLaunch {
             .arg(self.worker_threads.to_string())
             .env("OMP_NUM_THREADS", self.worker_threads.to_string())
             .env("MKL_NUM_THREADS", self.worker_threads.to_string())
-            .env("MALLOC_ARENA_MAX", "2")
+            .env("MALLOC_ARENA_MAX", "2");
+        // CRITICAL: without this, mangahue_train is never importable and the
+        // hint-U-Net ONNX backend always failed to spawn its worker.
+        apply_worker_pythonpath(&mut command, &self.python);
+        let child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -1550,6 +1713,7 @@ impl OnnxColorizationBackend {
                 process: Mutex::new(process),
             });
             workers.insert(key, Arc::clone(&worker));
+            evict_idle_workers(&mut workers, 4);
             worker
         };
         if metadata.input_channels != 1 && metadata.input_channels != 5 {
@@ -1648,6 +1812,50 @@ pub struct RustOnnxBackend {
 }
 
 #[cfg(feature = "native-onnx")]
+fn apply_purple_correction(image: &mut RgbImage, lineart: &GrayImage) {
+    let (width, height) = image.dimensions();
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = image.get_pixel(x, y);
+            let r = pixel[0] as f32 / 255.0;
+            let g = pixel[1] as f32 / 255.0;
+            let b = pixel[2] as f32 / 255.0;
+
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let purple = ((r + b) / 2.0 - g).clamp(0.0, 1.0);
+            let midtone: f32 = if (luma > 0.15) && (luma < 0.85) {
+                1.0
+            } else {
+                0.0
+            };
+            let kill = purple * midtone * 0.3;
+
+            let mut new_r: f32 = r - kill * 0.5;
+            let mut new_g: f32 = g;
+            let mut new_b: f32 = b - kill;
+
+            let gray = lineart.get_pixel(x, y)[0] as f32 / 255.0;
+            if gray > 0.92 {
+                new_r = 1.0;
+                new_g = 1.0;
+                new_b = 1.0;
+            } else if gray < 0.08 {
+                new_r = 0.0;
+                new_g = 0.0;
+                new_b = 0.0;
+            }
+
+            let p = Rgb([
+                (new_r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (new_g.clamp(0.0, 1.0) * 255.0).round() as u8,
+                (new_b.clamp(0.0, 1.0) * 255.0).round() as u8,
+            ]);
+            *image.get_pixel_mut(x, y) = p;
+        }
+    }
+}
+
+#[cfg(feature = "native-onnx")]
 impl RustOnnxBackend {
     pub fn new(model_path: impl AsRef<Path>, metadata_path: impl AsRef<Path>) -> Result<Self> {
         let metadata = ModelMetadata::load(metadata_path)?;
@@ -1736,6 +1944,7 @@ impl ColorizationBackend for RustOnnxBackend {
                 image.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
             }
         }
+        apply_purple_correction(&mut image, &input.lineart);
         Ok(image)
     }
 }

@@ -1,0 +1,18 @@
+{
+  "name": "DDColor Full FP16 ONNX",
+  "role": "studio_chroma_expert",
+  "source_repository": "https://github.com/piddnad/DDColor",
+  "download_url": "https://huggingface.co/Diogo122333/ddcolor-512-fp16/resolve/main/ddcolor-512-fp16.onnx",
+  "license": "Apache-2.0",
+  "input": {
+    "name": "input",
+    "shape": [1, 3, 512, 512],
+    "color_space": "grayscale_srgb"
+  },
+  "output": {
+    "name": "output",
+    "shape": [1, 2, 512, 512],
+    "color_space": "cie_lab_ab"
+  },
+  "notes": "Studio tier: the full DDColor model (transformer color decoder). ~1.5-3x slower than tiny, richer hue diversity and more accurate midtone saturation. Enable with --model models/ddcolor-full-fp16.onnx; rollback = switch back to ddcolor-tiny."
+}

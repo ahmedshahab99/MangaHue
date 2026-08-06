@@ -95,8 +95,14 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
     fs::create_dir_all(&request.output_dir)
         .with_context(|| format!("failed to create {}", request.output_dir.display()))?;
 
+    // DNS-rebinding guard: the custom resolver validates EVERY resolution
+    // (initial request, extracted image URLs, redirect hops) and the
+    // connection uses exactly the validated addresses. Validation and
+    // connection can no longer disagree, so "public IP for the check,
+    // private IP for the fetch" attacks are impossible.
     let client = Client::builder()
         .timeout(Duration::from_secs(45))
+        .dns_resolver(std::sync::Arc::new(SafePublicResolver))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 10 {
                 return attempt.error("too many redirects");
@@ -143,9 +149,16 @@ pub fn ingest_url(request: IngestRequest) -> Result<IngestReport> {
             }),
         }
     } else {
-        let html = response
-            .text()
-            .with_context(|| format!("failed to read HTML from {source_url}"))?;
+        // Cap the HTML body: an unbounded .text() lets a malicious server
+        // stream gigabytes into RAM within the 45s timeout.
+        let html = {
+            let mut reader = response.take(16 * 1024 * 1024);
+            let mut buffer = Vec::new();
+            reader
+                .read_to_end(&mut buffer)
+                .with_context(|| format!("failed to read HTML from {source_url}"))?;
+            String::from_utf8_lossy(&buffer).into_owned()
+        };
         let image_urls = extract_manga_urls(&client, &source_url, &html, &source_url, max_pages)?;
         for image_url in image_urls.into_iter().take(max_pages) {
             let parsed = Url::parse(&image_url)?;
@@ -226,24 +239,84 @@ pub fn validate_public_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
+/// reqwest DNS resolver that rejects any hostname resolving to private,
+/// reserved, or otherwise unsafe addresses. Because reqwest connects to the
+/// addresses this resolver returns, the check and the connection share a
+/// single resolution — closing the DNS-rebinding window.
+///
+/// Attach to any client that fetches user-supplied URLs:
+/// `Client::builder().dns_resolver(Arc::new(SafePublicResolver))`.
+#[derive(Debug, Clone)]
+pub struct SafePublicResolver;
+
+impl reqwest::dns::Resolve for SafePublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(resolve_public(host))
+    }
+}
+
+async fn resolve_public(
+    host: String,
+) -> std::result::Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    let addresses = (host.as_str(), 0u16)
+        .to_socket_addrs()
+        .map_err(|error| format!("could not resolve URL host {host}: {error}"))?;
+    let mut validated: Vec<std::net::SocketAddr> = Vec::new();
+    for address in addresses {
+        let ip = address.ip();
+        if !is_public_ip(ip) {
+            return Err(
+                format!("URL host {host} resolved to non-public address {ip}; blocked").into(),
+            );
+        }
+        validated.push(address);
+    }
+    if validated.is_empty() {
+        return Err(format!("URL host {host} resolved to no addresses").into());
+    }
+    Ok(Box::new(validated.into_iter()))
+}
+
 fn is_public_ip(ip: IpAddr) -> bool {
+    // Canonicalize first: maps IPv4-in-IPv6 (::ffff:a.b.c.d, ::a.b.c.d) to
+    // IPv4 so those cannot bypass the v4 checks.
+    let ip = ip.to_canonical();
     match ip {
         IpAddr::V4(ip) => {
+            let octets = ip.octets();
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_broadcast()
                 || ip.is_documentation()
                 || ip.is_unspecified()
-                || ip.octets()[0] == 0
-                || ip.octets()[0] >= 224)
+                || octets[0] == 0
+                || octets[0] >= 224
+                // 100.64.0.0/10 (CGNAT): carrier-grade NAT, not public.
+                || (octets[0] == 100 && octets[1] >= 64 && octets[1] <= 127)
+                // 192.0.0.0/24 (IETF protocol assignments) and
+                // 192.88.99.0/24 (6to4 relay anycast).
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                // 198.18.0.0/15 (benchmarking).
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)))
         }
         IpAddr::V6(ip) => {
+            let segments = ip.segments();
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
-                || ip.is_multicast())
+                || ip.is_multicast()
+                // 2001::/32: Teredo tunneling (can embed any IPv4 target) and
+                // special-purpose ranges.
+                || segments[0] == 0x2001
+                // NAT64 well-known prefix 64:ff9b::/96 (embeds IPv4),
+                // including the RFC 8215 local-use 64:ff9b:1::/48.
+                || segments[0] == 0x0064 && segments[1] == 0xff9b
+                // 6to4 2002::/16 (embeds IPv4).
+                || segments[0] == 0x2002)
         }
     }
 }
@@ -487,15 +560,46 @@ mod tests {
     fn rejects_private_and_unsafe_ingest_destinations() {
         for value in [
             "http://127.0.0.1/page.png",
+            "http://127.0.0.2/page.png",
             "http://10.0.0.1/page.png",
+            "http://172.16.0.1/page.png",
+            "http://172.31.255.255/page.png",
+            "http://192.168.1.1/page.png",
+            "http://100.64.0.1/page.png",
+            "http://100.127.255.254/page.png",
             "http://169.254.169.254/latest/meta-data",
             "http://[::1]/page.png",
+            "http://[::ffff:7f00:1]/page.png",
+            "http://[::ffff:169.254.169.254]/page.png",
+            "http://[2001:db8::1]/page.png",
+            "http://[2001::1]/page.png",
+            "http://[64:ff9b:0:0:0:0:a00:1]/page.png",
+            "http://[64:ff9b:1::a00:1]/page.png",
+            "http://[2002:0:0:0:0:0:7f00:1]/page.png",
+            "http://0.0.0.0/page.png",
+            "http://localhost/page.png",
+            "http://localhost.localdomain/page.png",
             "file:///etc/passwd",
         ] {
             let url = Url::parse(value).unwrap();
             assert!(
                 validate_public_url(&url).is_err(),
                 "accepted unsafe URL {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_ingest_destinations() {
+        for value in [
+            "https://example.com/page.png",
+            "http://example.org/chapter/1",
+            "https://mangadex.org/chapter/abc-123",
+        ] {
+            let url = Url::parse(value).unwrap();
+            assert!(
+                validate_public_url(&url).is_ok(),
+                "rejected public URL {value}"
             );
         }
     }

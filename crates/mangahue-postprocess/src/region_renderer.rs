@@ -26,6 +26,7 @@ struct RegionStats {
     blue_chroma_sum: f64,
     existing_red_sum: f64,
     existing_blue_sum: f64,
+    bubble_count: u32,
     touches_border: bool,
 }
 
@@ -44,6 +45,7 @@ impl RegionStats {
             blue_chroma_sum: 0.0,
             existing_red_sum: 0.0,
             existing_blue_sum: 0.0,
+            bubble_count: 0,
             touches_border: false,
         }
     }
@@ -108,13 +110,20 @@ pub(crate) fn render_region_graph(
     image: &mut RgbImage,
     original_gray: &GrayImage,
     line_mask: &GrayImage,
+    bubble_mask: Option<&GrayImage>,
     style: &StyleProfile,
+    soft_coverage: bool,
+    soft_strength: f32,
+    soft_confidence: f32,
 ) -> RegionRenderReport {
     let (width, height) = image.dimensions();
     if width < 3
         || height < 3
         || original_gray.dimensions() != (width, height)
         || line_mask.dimensions() != (width, height)
+        || bubble_mask
+            .map(|mask| mask.dimensions() != (width, height))
+            .unwrap_or(false)
     {
         return RegionRenderReport::default();
     }
@@ -173,6 +182,7 @@ pub(crate) fn render_region_graph(
                 source[index],
                 original_gray.get_pixel(x, y)[0],
                 smooth_gray.get_pixel(x, y)[0],
+                bubble_mask.map(|mask| mask.get_pixel(x, y)[0]).unwrap_or(0),
                 x,
                 y,
                 (width, height),
@@ -194,8 +204,20 @@ pub(crate) fn render_region_graph(
 
     let mut colors = stats
         .iter()
-        .map(|region| infer_region_color(region, &palette))
+        .map(|region| {
+            infer_region_color(
+                region,
+                &palette,
+                soft_coverage,
+                soft_strength,
+                soft_confidence,
+            )
+        })
         .collect::<Vec<_>>();
+    // Count seed-derived regions BEFORE the diversity director runs: the
+    // director marks non-locked seeded regions as unseeded (blend gating),
+    // which made the report always show zero seeded regions.
+    let seed_derived = colors.iter().filter(|color| color.seeded).count() as u64;
     let adjacency = build_adjacency(&roots, &root_to_region, &stats, line_mask, width, height);
     propagate_graph_colors(&mut colors, &stats, &adjacency);
     let semantic_adjacency =
@@ -203,12 +225,20 @@ pub(crate) fn render_region_graph(
     let mut semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
     propagate_region_semantics(&mut semantics, &stats, &semantic_adjacency);
 
+    // Chroma Diversity Director: after propagation, ensure adjacent regions
+    // hold perceptually distinct hues (kills the flat single-hue collapse).
+    chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette);
+    // Re-evaluate semantics with the FINAL region hues: skin classification
+    // must not force the render's skin treatment onto regions the director
+    // deliberately moved away from the warm sector (backgrounds, clothing).
+    let mut semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
+
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
     let face_cavity = detect_face_cavity_field(original_gray, line_mask);
     let mut report = RegionRenderReport {
         regions: stats.iter().filter(|region| region.count >= 20).count() as u64,
-        seeded_regions: colors.iter().filter(|color| color.seeded).count() as u64,
+        seeded_regions: seed_derived,
         inferred_regions: colors
             .iter()
             .filter(|color| !color.seeded && color.confidence > 0.08)
@@ -439,8 +469,21 @@ fn infer_region_semantics(
             let count = region.count as f64;
             let luma = (region.luma_sum / count) as f32;
             let texture = (region.texture_sum / count) as f32;
-            let red = (region.existing_red_sum / count) as f32;
-            let blue = (region.existing_blue_sum / count) as f32;
+            // Strong seed pixels carry the region's true chroma; the
+            // existing-color MEAN is diluted by neutral pixels and can turn
+            // a region with a few vivid seed pixels (faces, accents) into
+            // "neutral fabric". Prefer seed-weighted chroma when present.
+            let (red, blue) = if region.seed_weight >= 1.8 {
+                (
+                    (region.red_chroma_sum / region.seed_weight) as f32,
+                    (region.blue_chroma_sum / region.seed_weight) as f32,
+                )
+            } else {
+                (
+                    (region.existing_red_sum / count) as f32,
+                    (region.existing_blue_sum / count) as f32,
+                )
+            };
             let width = (region.max_x - region.min_x + 1).max(1) as f32;
             let height = (region.max_y - region.min_y + 1).max(1) as f32;
             let fill = region.count as f32 / (width * height);
@@ -449,9 +492,23 @@ fn infer_region_semantics(
             let graph_warmth = ((color.red - 7.0) / 20.0).clamp(0.0, 1.0)
                 * ((2.0 - color.blue) / 18.0).clamp(0.0, 1.0);
             let texture_limit = 9.5 + warm_evidence.max(graph_warmth) * 7.5;
-            let plausible_skin =
-                !region.touches_border && luma > 72.0 && texture < texture_limit && fill > 0.2;
-            let mut skin = if plausible_skin {
+            // Border-touching regions are usually background/fabric, BUT a
+            // region with strong warm SEED evidence (faces/accents that
+            // reach the page edge) must not be excluded by that heuristic.
+            let plausible_skin = (warm_evidence > 0.5 || !region.touches_border)
+                && luma > 72.0
+                && texture < texture_limit
+                && fill > 0.2;
+            let elongated = width > height * 1.42 || height > width * 1.42;
+            // Warm chroma alone must NOT label a region as skin: the model's
+            // warm casts turn backgrounds, clothing and whole pages warm
+            // too. Skin requires a body-like shape — compact, not elongated,
+            // not page-scale (faces are typically 2k-30k pixels) — AND the
+            // region's FINAL hue must still be warm (the diversity director
+            // moves backgrounds/clothing away from the warm sector).
+            let warm_sector = color.red > 2.0 && color.blue < 2.0;
+            let skin_shape = !elongated && region.count <= 40_000 && luma < 251.0 && warm_sector;
+            let mut skin = if plausible_skin && skin_shape {
                 warm_evidence.max(graph_warmth * color.confidence) * 0.94
             } else {
                 0.0
@@ -460,7 +517,6 @@ fn infer_region_semantics(
             if face_topology > 0.34 {
                 skin = skin.max(0.48 + face_topology * 0.42);
             }
-            let elongated = width > height * 1.42 || height > width * 1.42;
             let large_bright_region = region.count > 900 && luma > 172.0 && elongated;
             let neutral = red.abs() + blue.abs() < 12.0;
             let fabric =
@@ -664,6 +720,7 @@ fn accumulate_region(
     pixel: Rgb<u8>,
     original: u8,
     smooth: u8,
+    bubble: u8,
     x: u32,
     y: u32,
     dimensions: (u32, u32),
@@ -687,10 +744,17 @@ fn accumulate_region(
     stats.seed_weight += seed_weight;
     stats.red_chroma_sum += red as f64 * seed_weight;
     stats.blue_chroma_sum += blue as f64 * seed_weight;
+    stats.bubble_count += u32::from(bubble > 128);
     stats.touches_border |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
 }
 
-fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> RegionColor {
+fn infer_region_color(
+    region: &RegionStats,
+    palette: &[(f32, f32, f32)],
+    soft_coverage: bool,
+    soft_strength: f32,
+    soft_confidence: f32,
+) -> RegionColor {
     if region.count < 20 {
         return RegionColor::default();
     }
@@ -700,6 +764,16 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
     let existing_blue = (region.existing_blue_sum / count) as f32;
     let seed_ratio = (region.seed_weight / count) as f32;
     let existing_magnitude = existing_red.abs() + existing_blue.abs();
+    let bubble_fraction = region.bubble_count as f32 / count as f32;
+    // Bright regions (paper, white clothing, bright backgrounds) need
+    // STRONG chroma to read as "colored": a washed-out cast of 20-40 on
+    // white paper still looks uncolored, so bright regions with weaker
+    // chroma fall through to the soft-coverage tier and get a deliberate
+    // palette hue. Midtone regions keep model color only when it is
+    // clearly visible too.
+    let bright_region = mean_luma > 230.0;
+    let seed_chroma_bar = if bright_region { 48.0 } else { 24.0 };
+    let chroma_bar = if bright_region { 40.0 } else { 20.0 };
     if region.touches_border && mean_luma > 150.0 && existing_blue > 1.0 {
         if let Some((_, red, blue)) = palette
             .iter()
@@ -720,17 +794,27 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
         }
     }
     if region.seed_weight >= 1.8 && seed_ratio >= 0.008 {
-        return RegionColor {
-            red: (region.red_chroma_sum / region.seed_weight) as f32,
-            blue: (region.blue_chroma_sum / region.seed_weight) as f32,
-            confidence: (0.38 + seed_ratio * 5.5).clamp(0.38, 0.94),
-            seeded: true,
-        };
+        let seed_red = (region.red_chroma_sum / region.seed_weight) as f32;
+        let seed_blue = (region.blue_chroma_sum / region.seed_weight) as f32;
+        // Only CONFIDENT seed chroma counts as a seed. The model tints
+        // nearly every region with a faint cast, which is exactly the
+        // "uncolored" look the soft-coverage tier must fix; weak seeds
+        // (below the luma-aware bar) fall through to the palette hue.
+        if seed_red.abs() + seed_blue.abs() >= seed_chroma_bar {
+            return RegionColor {
+                red: seed_red,
+                blue: seed_blue,
+                confidence: (0.38 + seed_ratio * 5.5).clamp(0.38, 0.94),
+                seeded: true,
+            };
+        }
     }
-    if mean_luma > 218.0 && existing_magnitude < 5.0 {
-        return RegionColor::default();
-    }
-    if existing_magnitude >= 3.5 {
+    // Only CONFIDENT model chroma takes the chroma path. Weak chroma reads
+    // as "uncolored" on the page — those regions fall through to the
+    // soft-coverage tier and receive a deliberate palette hue instead of
+    // the model's near-gray cast. The bar is luma-aware: bright regions
+    // need clearly visible chroma to count as colored.
+    if existing_magnitude >= chroma_bar {
         return RegionColor {
             red: existing_red * 1.3,
             blue: existing_blue * 1.3,
@@ -739,10 +823,18 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
         };
     }
 
-    if mean_luma > 244.0 || palette.is_empty() {
+    // ── Soft-coverage tier ────────────────────────────────────────────────
+    // The model leaves bright backgrounds, white clothing, page margins and
+    // blank paper neutral, which reads as "only some of the page colored".
+    // Give those regions a gentle palette-matched tint at low confidence.
+    // Speech bubbles (bubble-heavy regions) stay pure white and ink is
+    // excluded by the caller, so protected content never tints.
+    if !soft_coverage || palette.is_empty() {
         return RegionColor::default();
     }
-
+    if bubble_fraction > 0.5 {
+        return RegionColor::default();
+    }
     let texture = (region.texture_sum / count) as f32;
     let target =
         palette.iter().min_by(|left, right| {
@@ -753,6 +845,30 @@ fn infer_region_color(region: &RegionStats, palette: &[(f32, f32, f32)]) -> Regi
     let Some((_, red, blue)) = target.copied() else {
         return RegionColor::default();
     };
+    let bright = mean_luma > 248.0;
+    if bright || region.touches_border {
+        // Very bright regions (paper, white clothes) get a soft but VISIBLE
+        // cast so the page reads fully colored; darker backgrounds get a
+        // clearer hue. The net applied chroma is soft×blend (~0.3 of the
+        // palette hue) — enough to kill the flat-gray look while staying
+        // gentle on paper.
+        let (soft, confidence) = if mean_luma > 240.0 {
+            (0.9, 0.3)
+        } else if mean_luma > 200.0 {
+            (0.8, 0.28)
+        } else {
+            (0.75, 0.28)
+        };
+        return RegionColor {
+            red: red * soft * soft_strength.clamp(0.5, 1.6),
+            blue: blue * soft * soft_strength.clamp(0.5, 1.6),
+            confidence: (confidence * soft_confidence.clamp(0.5, 1.6)).clamp(0.1, 0.6),
+            seeded: false,
+        };
+    }
+
+    // Midtone neutral regions get the full palette color (objects, clothes,
+    // panels) so their hue is deliberate and strong.
     let area_confidence = ((region.count as f32).ln_1p() / 12.0).clamp(0.12, 0.5);
     RegionColor {
         red: red * 0.72,
@@ -871,6 +987,228 @@ fn propagate_graph_colors(
     }
 }
 
+/// Chroma Diversity Director.
+///
+/// Enforces that adjacent regions receive perceptually distinct hues, the
+/// way a colorist works: neighboring shapes differ in color so the page
+/// reads as varied, not a single flat tint. Only low-confidence (collapsed)
+/// regions are re-assigned; confident seeded regions are left alone, and
+/// skin regions stay inside the warm skin sector.
+fn chroma_diversity_director(
+    colors: &mut Vec<RegionColor>,
+    stats: &[RegionStats],
+    adjacency: &[Vec<(usize, f32)>],
+    semantics: &[RegionSemantic],
+    palette: &[(f32, f32, f32)],
+) {
+    let n = colors.len();
+    if n < 2 {
+        return;
+    }
+    // Min perceptual separation in opponent-space chroma distance.
+    const SEPARATION: f32 = 34.0;
+    const SWEEPS: usize = 12;
+
+    // Ordered processing: largest regions first (colorists fill big shapes
+    // first); locked (confident seeded) regions are never re-assigned.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| stats[*b].count.cmp(&stats[*a].count).then_with(|| b.cmp(a)));
+
+    // Candidate hues per region: current + palette + golden-angle rotations
+    // of the current hue (137.5 deg steps give maximal perceptual spread).
+    let golden_angle = 137.5077_f32.to_radians();
+    let mut candidates: Vec<Vec<(f32, f32)>> = Vec::with_capacity(n);
+    for index in 0..n {
+        let current = (colors[index].red, colors[index].blue);
+        let mut set: Vec<(f32, f32)> = vec![current];
+        for &(_, pr, pb) in palette {
+            set.push((pr, pb));
+        }
+        let base = current;
+        for k in 1..=5 {
+            let angle = golden_angle * k as f32;
+            let (s, c) = angle.sin_cos();
+            set.push((base.0 * c - base.1 * s, base.0 * s + base.1 * c));
+        }
+        // De-duplicate near-identical candidates.
+        let mut unique: Vec<(f32, f32)> = Vec::with_capacity(set.len());
+        for cand in set {
+            if unique
+                .iter()
+                .all(|u| ((u.0 - cand.0).powi(2) + (u.1 - cand.1).powi(2)).sqrt() > 6.0)
+            {
+                unique.push(cand);
+            }
+        }
+        candidates.push(unique);
+    }
+
+    // Score a candidate for region i: luma fit + semantic prior +
+    // perceptual separation from already-assigned neighbors.
+    let score = |index: usize, cand: (f32, f32), assigned: &[RegionColor]| -> f32 {
+        let region = &stats[index];
+        let mean_luma = (region.luma_sum / region.count.max(1) as f64) as f32;
+        let semantic = &semantics[index];
+        let cand_luma = rgb_luma_from_opponent(cand.0, cand.1, mean_luma);
+        let luma_cost = ((mean_luma - cand_luma) / 40.0).abs();
+
+        // Skin regions must stay in the warm sector (red > 0, blue < 0).
+        let skin_sector = cand.0 > 2.0 && cand.1 < 2.0;
+        let semantic_cost = if semantic.skin > 0.42 {
+            if skin_sector {
+                0.0
+            } else {
+                0.6
+            }
+        } else if skin_sector {
+            // Non-skin region should not steal the skin hue.
+            0.18
+        } else {
+            0.0
+        };
+
+        // Separation from neighbors: penalize hue collisions.
+        let mut separation_penalty = 0.0;
+        for &(neighbor, weight) in &adjacency[index] {
+            let nc = assigned[neighbor];
+            let d = ((cand.0 - nc.red).powi(2) + (cand.1 - nc.blue).powi(2)).sqrt();
+            if d < SEPARATION {
+                let gap = SEPARATION - d;
+                separation_penalty += gap * weight * 3.0;
+            }
+        }
+        luma_cost * 0.8 + semantic_cost * 0.35 + separation_penalty
+    };
+
+    let mut assigned = colors.clone();
+    let mut locked = vec![false; n];
+    for index in 0..n {
+        // Only SKIN regions with confident seeds are locked. The model's
+        // seed "confidence" is really chroma coverage — DDColor tints
+        // nearly every pixel, so most regions reach conf 0.9+ and would
+        // otherwise freeze the page into the model's single warm cast.
+        // Faces stay warm; everything else is free for the director.
+        if colors[index].seeded && colors[index].confidence >= 0.7 && semantics[index].skin > 0.42 {
+            locked[index] = true;
+        }
+    }
+
+    // Greedy pass: assign each free region its best candidate given the
+    // current assignments (locked regions already fixed).
+    for &index in &order {
+        if locked[index] {
+            continue;
+        }
+        // Only truly-neutral regions (no chroma at all) are protected from
+        // the diversity pass. Soft-coverage tints SHOULD participate: the
+        // director rotates them (preserving luma) so adjacent backgrounds
+        // get varied hues instead of a single dominant cast.
+        if colors[index].red.abs() + colors[index].blue.abs() < 12.0 {
+            continue;
+        }
+        let mut best = colors[index];
+        let mut best_score = f32::MAX;
+        for &cand in &candidates[index] {
+            assigned[index] = RegionColor {
+                red: cand.0,
+                blue: cand.1,
+                confidence: best.confidence,
+                seeded: false,
+            };
+            let s = score(index, cand, &assigned);
+            if s < best_score {
+                best_score = s;
+                best = RegionColor {
+                    red: cand.0,
+                    blue: cand.1,
+                    confidence: best.confidence,
+                    seeded: false,
+                };
+            }
+        }
+        assigned[index] = best;
+    }
+
+    // Min-conflict sweeps: repeatedly fix the worst remaining collision.
+    for _ in 0..SWEEPS {
+        let mut worst = None;
+        let mut worst_score = 0.0f32;
+        for index in 0..n {
+            if locked[index] {
+                continue;
+            }
+            // Soft-coverage tints are deliberate background hues, not
+            // collisions to fix: leave low-chroma regions alone.
+            if colors[index].red.abs() + colors[index].blue.abs() < 25.0 {
+                continue;
+            }
+            let mut penalty = 0.0;
+            for &(neighbor, weight) in &adjacency[index] {
+                let d = ((assigned[index].red - assigned[neighbor].red).powi(2)
+                    + (assigned[index].blue - assigned[neighbor].blue).powi(2))
+                .sqrt();
+                if d < SEPARATION {
+                    penalty += (SEPARATION - d) * weight;
+                }
+            }
+            if penalty > worst_score {
+                worst_score = penalty;
+                worst = Some(index);
+            }
+        }
+        let Some(index) = worst else { break };
+        if worst_score < 1.0 {
+            break;
+        }
+        let mut best = assigned[index];
+        let mut best_score = f32::MAX;
+        for &cand in &candidates[index] {
+            assigned[index] = RegionColor {
+                red: cand.0,
+                blue: cand.1,
+                confidence: best.confidence,
+                seeded: false,
+            };
+            let s = score(index, cand, &assigned);
+            if s < best_score {
+                best_score = s;
+                best = RegionColor {
+                    red: cand.0,
+                    blue: cand.1,
+                    confidence: best.confidence,
+                    seeded: false,
+                };
+            }
+        }
+        assigned[index] = best;
+    }
+
+    // Blend gating: the director's assigned hue DOMINATES (>= 55%) so the
+    // diversity decision actually reaches the pixels. The model's original
+    // hue stays as a tint, not as the page's dominant cast. Only locked
+    // (skin) regions are untouched.
+    for index in 0..n {
+        if locked[index] {
+            continue;
+        }
+        let conf = colors[index].confidence;
+        let blend = (0.55 + (1.0 - conf) * 0.4).clamp(0.55, 0.95);
+        colors[index].red += (assigned[index].red - colors[index].red) * blend;
+        colors[index].blue += (assigned[index].blue - colors[index].blue) * blend;
+        colors[index].seeded = false;
+    }
+}
+
+fn rgb_luma_from_opponent(red: f32, blue: f32, luma: f32) -> f32 {
+    // Approximate luma of an opponent-chroma color at the given gray luma:
+    // red/blue are (R - L) / (B - L) type offsets; reconstruct R and B.
+    let r = (luma + red).clamp(0.0, 255.0);
+    let b = (luma + blue).clamp(0.0, 255.0);
+    // G keeps luma roughly: L = 0.2126R + 0.7152G + 0.0722B.
+    let g = ((luma - 0.2126 * r - 0.0722 * b) / 0.7152).clamp(0.0, 255.0);
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_material_pixel(
     pixel: &mut Rgb<u8>,
@@ -894,18 +1232,38 @@ fn render_material_pixel(
     let region_height = (region.max_y - region.min_y + 1).max(1) as f32;
     let local_x = (x - region.min_x) as f32 / region_width;
     let local_y = (y - region.min_y) as f32 / region_height;
-    let directional_light =
-        ((1.0 - local_x) * 0.55 + (1.0 - local_y) * 0.45 - 0.5) * style.highlight_strength * 10.0;
+    // Smooth radial light falloff from the region center (soft cel shading)
+    // instead of a linear ramp that banded inside large regions.
+    let cx = (local_x - 0.5) * 2.0;
+    let cy = (local_y - 0.5) * 2.0;
+    let radius = (cx * cx + cy * cy).sqrt().min(1.0);
+    let directional_light = (1.0 - radius) * style.highlight_strength * 8.0;
 
     let mut red = color.red;
     let mut blue = color.blue;
+    // Shadows naturally desaturate: modulate chroma by illumination so the
+    // shaded side of a region goes softer, not a flat cel band.
+    let illumination_norm = (illumination as f32 / 255.0).clamp(0.3, 1.0);
+    let chroma_scale = 0.72 + 0.28 * illumination_norm;
+    red *= chroma_scale;
+    blue *= chroma_scale;
     let region_area =
         ((region.max_x - region.min_x + 1) * (region.max_y - region.min_y + 1)).max(1) as f32;
     let fill_ratio = region.count as f32 / region_area;
     let texture = (region.texture_sum / region.count.max(1) as f64) as f32;
     let region_red = (region.existing_red_sum / region.count.max(1) as f64) as f32;
     let region_blue = (region.existing_blue_sum / region.count.max(1) as f64) as f32;
-    let observed_skin = region_red > 5.0 && region_blue < -3.0;
+    // Observed skin requires body-like shape too (same rationale as the
+    // semantic gate) AND the region's final hue must still be warm — a
+    // region the diversity director moved to blue is not skin.
+    let region_elongated =
+        region_width > region_height * 1.42 || region_height > region_width * 1.42;
+    let observed_skin = region_red > 5.0
+        && region_blue < -3.0
+        && region.count <= 40_000
+        && !region_elongated
+        && red > 2.0
+        && blue < 2.0;
     let warm_candidate = ((red > 9.0 && blue < 1.0) || observed_skin) && base_luma > 72.0;
     let face_skin = face_cavity > 0.12;
     let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
@@ -914,8 +1272,13 @@ fn render_material_pixel(
     } else {
         9.5
     };
+    // Skin requires real evidence (semantics, face cavity, or observed warm
+    // chroma). warm_candidate ALONE must not qualify a region: the palette
+    // assigns warm hues to bright neutral fabric too, and forcing those
+    // through the skin path added boosts that tinted them peach â€” the
+    // "bright non-skin stays neutral" guarantee.
     let skin = face_skin
-        || ((warm_candidate || semantic_skin)
+        || ((semantic_skin || observed_skin)
             && !region.touches_border
             && fill_ratio > 0.2
             && texture < texture_limit);
@@ -938,10 +1301,11 @@ fn render_material_pixel(
             blue = blue.min(-8.0 - strength * 10.0);
         }
     }
-    if warm_candidate && !skin && base_luma > 164.0 {
-        red *= 0.18;
-        blue *= 0.18;
-    }
+    // NOTE: the old warm-hue suppression (red*=0.18 for bright non-skin
+    // regions) was removed: it crushed the region renderer's deliberate
+    // colors on bright backgrounds and paper back to white. Hue decisions
+    // belong to the diversity director and the scene palette, not to a
+    // post-hoc attenuation.
     let pale_material = base_luma > 178.0 && red.abs() + blue.abs() < 20.0;
     let shadow = ((150.0 - original as f32) / 120.0).clamp(0.0, 1.0);
     let highlight = ((original as f32 - 205.0) / 50.0).clamp(0.0, 1.0);
@@ -1095,11 +1459,14 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        let report = render_region_graph(&mut image, &original, &lines, &style);
+        let report =
+            render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
 
         let left = image.get_pixel(8, 5);
         let right = image.get_pixel(18, 5);
         assert!(left[0] > left[1] && left[1] > left[2]);
+        // No palette: the unseeded side has nothing to tint with and stays
+        // neutral — the ink barrier was respected.
         assert!((right[0] as i16 - right[2] as i16).abs() < 5);
         assert!(report.seeded_regions >= 1);
     }
@@ -1120,7 +1487,8 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        let report = render_region_graph(&mut image, &original, &lines, &style);
+        let report =
+            render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
 
         let pixel = image.get_pixel(10, 10);
         assert!(pixel[0] > pixel[2]);
@@ -1129,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn bright_neutral_fabric_is_not_forced_into_skin_palette() {
+    fn bright_neutral_fabric_receives_gentle_tint_not_full_skin_hue() {
         let mut image = RgbImage::from_pixel(20, 20, Rgb([232, 232, 232]));
         let original = GrayImage::from_pixel(20, 20, Luma([232]));
         let lines = GrayImage::from_pixel(20, 20, Luma([0]));
@@ -1138,10 +1506,56 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        render_region_graph(&mut image, &original, &lines, &style);
+        render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
 
         let pixel = image.get_pixel(10, 10);
-        assert!((pixel[0] as i16 - pixel[2] as i16).abs() < 5);
+        let warm = pixel[0] as i16 - pixel[2] as i16;
+        // Soft-coverage tier: the neutral background is clearly tinted (no
+        // gray leftover) but not with the FULL skin-palette hue.
+        assert!(warm >= 6, "expected a visible background tint, got {warm}");
+        assert!(warm <= 45, "expected a gentle tint, got full hue {warm}");
+    }
+
+    #[test]
+    fn speech_bubble_regions_stay_white() {
+        let mut image = RgbImage::from_pixel(24, 24, Rgb([240, 240, 240]));
+        let original = GrayImage::from_pixel(24, 24, Luma([250]));
+        let mut lines = GrayImage::from_pixel(24, 24, Luma([0]));
+        let mut bubbles = GrayImage::from_pixel(24, 24, Luma([0]));
+        // A bubble blob with a real INK outline (as in manga): the outline
+        // separates the bubble interior into its own region.
+        for y in 6..18 {
+            for x in 6..18 {
+                bubbles.put_pixel(x, y, Luma([255]));
+                if x == 6 || x == 17 || y == 6 || y == 17 {
+                    lines.put_pixel(x, y, Luma([255]));
+                }
+            }
+        }
+        let style = StyleProfile {
+            palette: vec![ColorRgb::new(200, 120, 90)],
+            ..StyleProfile::default()
+        };
+
+        render_region_graph(
+            &mut image,
+            &original,
+            &lines,
+            Some(&bubbles),
+            &style,
+            true,
+            1.0,
+            1.0,
+        );
+
+        let bubble = image.get_pixel(12, 12);
+        let chroma = bubble[0]
+            .abs_diff(bubble[1])
+            .max(bubble[1].abs_diff(bubble[2]));
+        assert!(
+            chroma < 8,
+            "bubble interior must stay white, got chroma {chroma}"
+        );
     }
 
     #[test]
@@ -1169,6 +1583,7 @@ mod tests {
             blue_chroma_sum: 0.0,
             existing_red_sum: 0.0,
             existing_blue_sum: 0.0,
+            bubble_count: 0,
             touches_border: false,
         };
         let stats = vec![region; 3];
@@ -1208,6 +1623,7 @@ mod tests {
             blue_chroma_sum: 0.0,
             existing_red_sum: 0.0,
             existing_blue_sum: 0.0,
+            bubble_count: 0,
             touches_border: false,
         };
 
@@ -1238,6 +1654,7 @@ mod tests {
             blue_chroma_sum: 0.0,
             existing_red_sum: 0.0,
             existing_blue_sum: 0.0,
+            bubble_count: 0,
             touches_border: false,
         };
         let original = GrayImage::from_pixel(100, 100, Luma([220]));
@@ -1296,6 +1713,7 @@ mod tests {
             blue_chroma_sum: 0.0,
             existing_red_sum: 0.0,
             existing_blue_sum: 0.0,
+            bubble_count: 0,
             touches_border: false,
         };
 
@@ -1338,6 +1756,7 @@ mod tests {
             blue_chroma_sum: 0.0,
             existing_red_sum: 8_000.0,
             existing_blue_sum: -5_000.0,
+            bubble_count: 0,
             touches_border: false,
         };
 

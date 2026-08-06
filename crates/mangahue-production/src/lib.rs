@@ -429,11 +429,22 @@ impl ProductionStore {
     }
 
     pub fn enqueue(&self, new_job: NewJob) -> Result<DurableJob> {
+        // Charge the quota for the REAL page bound of the job, not the
+        // advisory requested_pages field (a caller could declare 1 page and
+        // process hundreds via max_pages). Hard ceiling prevents overflow of
+        // tier comparisons.
         let requested_pages = new_job
             .payload
             .get("requested_pages")
             .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1);
+            .or_else(|| {
+                new_job
+                    .payload
+                    .get("max_pages")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(1)
+            .clamp(1, 100_000);
         self.enforce_job_quota(&new_job.user_id, requested_pages)?;
         let timestamp = now();
         let job = DurableJob {

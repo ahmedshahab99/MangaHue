@@ -330,8 +330,12 @@ pub fn estimate_background_level(gray: &GrayImage) -> u8 {
     }
     total_var /= total as f64;
 
+    // Otsu's between-class variance is max_between / total² (the normalized
+    // form divides the class-separation sum by the squared pixel count).
+    // Using total once inflated the ratio by a factor of total (~10^6 on a
+    // real page), which made the washed-out/unimodal fallback dead code.
     let variance_ratio = if total_var > 0.0 {
-        max_between / ((total as f64) * total_var)
+        max_between / ((total as f64) * (total as f64) * total_var)
     } else {
         0.0
     };
@@ -358,10 +362,10 @@ pub fn estimate_background_level(gray: &GrayImage) -> u8 {
 }
 
 fn percentile_background(histogram: &[u64; 256], total: u64, pct: u64) -> u8 {
-    let target = (total * pct / 100) as u32;
-    let mut cumulative = 0u32;
+    let target = total * pct / 100;
+    let mut cumulative = 0u64;
     for (value, &count) in histogram.iter().enumerate() {
-        cumulative += count as u32;
+        cumulative += count;
         if cumulative >= target {
             return value as u8;
         }
@@ -376,12 +380,22 @@ fn percentile_background(histogram: &[u64; 256], total: u64, pct: u64) -> u8 {
 pub fn whiten_background(gray: &GrayImage, background_level: u8, margin: u8) -> GrayImage {
     let cutoff = background_level.saturating_sub(margin);
     let mut output = gray.clone();
+    if cutoff == 0 {
+        // Background darker than the margin: the white-cliff would lift
+        // EVERY pixel to 255 and destroy the page. Fall back to a plain
+        // contrast stretch toward the measured background instead.
+        let scale = 255.0 / background_level.max(1) as f32;
+        for pixel in output.pixels_mut() {
+            *pixel = Luma([(pixel[0] as f32 * scale).round().clamp(0.0, 255.0) as u8]);
+        }
+        return output;
+    }
     for pixel in output.pixels_mut() {
         let value = pixel[0];
         let lifted = if value >= cutoff {
             255
         } else {
-            let scale = 255.0 / cutoff.max(1) as f32;
+            let scale = 255.0 / cutoff as f32;
             (value as f32 * scale).round().clamp(0.0, 255.0) as u8
         };
         *pixel = Luma([lifted]);

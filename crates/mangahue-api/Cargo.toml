@@ -30,6 +30,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+url.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]

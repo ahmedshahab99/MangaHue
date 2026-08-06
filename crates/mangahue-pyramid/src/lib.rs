@@ -3,6 +3,7 @@ use image::{imageops::FilterType, DynamicImage, GrayImage, Rgb, RgbImage};
 use mangahue_core::EngineError;
 use mangahue_inference::{ColorizationBackend, ModelInput};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
@@ -44,11 +45,21 @@ pub struct PyramidReport {
 pub struct PyramidColorizer {
     backend: Arc<dyn ColorizationBackend>,
     config: PyramidConfig,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl PyramidColorizer {
     pub fn new(backend: Arc<dyn ColorizationBackend>, config: PyramidConfig) -> Self {
-        Self { backend, config }
+        Self {
+            backend,
+            config,
+            cancel: None,
+        }
+    }
+
+    pub fn with_cancel(mut self, cancel: Option<Arc<AtomicBool>>) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     pub fn colorize_with_report(
@@ -64,8 +75,19 @@ impl PyramidColorizer {
 
         let mut accumulated = RgbImage::new(0, 0);
         let mut per_level_ms = Vec::new();
+        // Index of the previous APPLIED level (levels larger than the tile
+        // are skipped and must not consume a blend weight).
+        let mut applied_count = 0usize;
 
         for (i, &level) in self.config.levels.iter().enumerate() {
+            if let Some(cancel) = &self.cancel {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(anyhow!(
+                        "colorization cancelled before pyramid level {i} ({level}px)"
+                    ));
+                }
+            }
+
             let level_start = Instant::now();
 
             if level > target_dim {
@@ -113,11 +135,12 @@ impl PyramidColorizer {
                 let weight = self
                     .config
                     .blend_weights
-                    .get(i)
+                    .get(applied_count)
                     .copied()
-                    .unwrap_or(1.0 / (i + 1) as f32);
+                    .unwrap_or(1.0 / (applied_count + 1) as f32);
                 accumulated = blend_images(&accumulated, &upsampled, weight);
             }
+            applied_count += 1;
 
             per_level_ms.push(level_start.elapsed().as_millis());
             info!(
@@ -140,7 +163,7 @@ impl PyramidColorizer {
         Ok((
             accumulated,
             PyramidReport {
-                levels_used: self.config.levels.len(),
+                levels_used: applied_count,
                 per_level_ms,
                 total_ms,
                 blend_weights: self.config.blend_weights.clone(),
@@ -152,6 +175,14 @@ impl PyramidColorizer {
 impl ColorizationBackend for PyramidColorizer {
     fn name(&self) -> &str {
         "pyramid"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        // DDColor-family models must receive the ORIGINAL grayscale (not the
+        // whitened clean lineart) to produce chroma; the pyramid wrapper must
+        // forward the underlying backend's requirement or the orchestrator
+        // feeds it lineart that produces near-zero chroma.
+        self.backend.prefers_original_grayscale()
     }
 
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
@@ -171,7 +202,8 @@ fn filter_for(filter: &UpsampleFilter) -> FilterType {
 
 fn blend_images(base: &RgbImage, overlay: &RgbImage, overlay_weight: f32) -> RgbImage {
     let mut out = RgbImage::new(base.width(), base.height());
-    let base_w = 1.0 - overlay_weight;
+    let weight = overlay_weight.clamp(0.0, 1.0);
+    let base_w = 1.0 - weight;
     for y in 0..base.height() {
         for x in 0..base.width() {
             let b = base.get_pixel(x, y);
@@ -180,13 +212,13 @@ fn blend_images(base: &RgbImage, overlay: &RgbImage, overlay_weight: f32) -> Rgb
                 x,
                 y,
                 Rgb([
-                    (b[0] as f32 * base_w + o[0] as f32 * overlay_weight)
+                    (b[0] as f32 * base_w + o[0] as f32 * weight)
                         .round()
                         .clamp(0.0, 255.0) as u8,
-                    (b[1] as f32 * base_w + o[1] as f32 * overlay_weight)
+                    (b[1] as f32 * base_w + o[1] as f32 * weight)
                         .round()
                         .clamp(0.0, 255.0) as u8,
-                    (b[2] as f32 * base_w + o[2] as f32 * overlay_weight)
+                    (b[2] as f32 * base_w + o[2] as f32 * weight)
                         .round()
                         .clamp(0.0, 255.0) as u8,
                 ]),

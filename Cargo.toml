@@ -54,7 +54,7 @@ tempfile = "3.10"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 sha2 = "0.10"
 base64 = "0.22"
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"

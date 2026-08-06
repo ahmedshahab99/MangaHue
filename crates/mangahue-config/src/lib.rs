@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
-use mangahue_core::StyleProfile;
+use mangahue_core::{ColorRgb, StyleProfile};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +119,87 @@ pub struct PostprocessSection {
     pub semantic_relighting: bool,
     #[serde(default = "default_relighting_strength")]
     pub relighting_strength: f32,
+    #[serde(default = "default_natural_grading")]
+    pub natural_grading: bool,
+    #[serde(default = "default_reference_transfer")]
+    pub reference_transfer: bool,
+    /// Full-coverage mode: regions the model leaves neutral (bright
+    /// backgrounds, white clothing, page margins, blank paper) receive a
+    /// gentle palette-matched tint instead of staying gray. Speech bubbles
+    /// and ink remain protected.
+    #[serde(default = "default_soft_coverage")]
+    pub soft_coverage: bool,
+    /// Muted target grade: reshapes every pixel's saturation toward the
+    /// measured profile of the reference style (low-key warm look) instead
+    /// of the default saturation boost.
+    #[serde(default)]
+    pub muted_target_grade: bool,
+    #[serde(default = "default_muted_strength")]
+    pub muted_strength: f32,
+    #[serde(default = "default_muted_hue_shift_deg")]
+    pub muted_hue_shift_deg: f32,
+    #[serde(default = "default_muted_dark_pull")]
+    pub muted_dark_pull: f32,
+    #[serde(default = "default_soft_strength")]
+    pub soft_strength: f32,
+    #[serde(default = "default_soft_confidence")]
+    pub soft_confidence: f32,
+    #[serde(default = "default_muted_dark_sat")]
+    pub muted_dark_sat: f32,
+    #[serde(default = "default_muted_mid_sat")]
+    pub muted_mid_sat: f32,
+    #[serde(default = "default_muted_bright_sat")]
+    pub muted_bright_sat: f32,
+    #[serde(default = "default_muted_paper_sat")]
+    pub muted_paper_sat: f32,
+}
+
+fn default_muted_dark_sat() -> f32 {
+    0.19
+}
+
+fn default_muted_mid_sat() -> f32 {
+    0.27
+}
+
+fn default_muted_bright_sat() -> f32 {
+    0.22
+}
+
+fn default_muted_paper_sat() -> f32 {
+    0.034
+}
+
+fn default_soft_coverage() -> bool {
+    true
+}
+
+fn default_muted_strength() -> f32 {
+    0.95
+}
+
+fn default_muted_hue_shift_deg() -> f32 {
+    16.0
+}
+
+fn default_muted_dark_pull() -> f32 {
+    0.92
+}
+
+fn default_soft_strength() -> f32 {
+    1.0
+}
+
+fn default_soft_confidence() -> f32 {
+    1.0
+}
+
+fn default_reference_transfer() -> bool {
+    true
+}
+
+fn default_natural_grading() -> bool {
+    true
 }
 
 fn default_target_colorfulness() -> f32 {
@@ -202,6 +284,34 @@ impl Default for EvalSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PyramidSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_pyramid_levels")]
+    pub levels: Vec<u32>,
+    #[serde(default = "default_pyramid_weights")]
+    pub blend_weights: Vec<f32>,
+}
+
+fn default_pyramid_levels() -> Vec<u32> {
+    vec![512, 768]
+}
+
+fn default_pyramid_weights() -> Vec<f32> {
+    vec![0.35, 0.65]
+}
+
+impl Default for PyramidSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            levels: default_pyramid_levels(),
+            blend_weights: default_pyramid_weights(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub engine: EngineSection,
     pub preprocess: PreprocessSection,
@@ -213,6 +323,8 @@ pub struct EngineConfig {
     pub eval: EvalSection,
     #[serde(default)]
     pub ensemble: EnsembleSection,
+    #[serde(default)]
+    pub pyramid: PyramidSection,
 }
 
 impl Default for EngineConfig {
@@ -279,6 +391,19 @@ impl Default for EngineConfig {
                 local_contrast: default_local_contrast(),
                 semantic_relighting: false,
                 relighting_strength: default_relighting_strength(),
+                natural_grading: default_natural_grading(),
+                reference_transfer: default_reference_transfer(),
+                soft_coverage: default_soft_coverage(),
+                muted_target_grade: false,
+                muted_strength: default_muted_strength(),
+                muted_hue_shift_deg: default_muted_hue_shift_deg(),
+                muted_dark_pull: default_muted_dark_pull(),
+                soft_strength: default_soft_strength(),
+                soft_confidence: default_soft_confidence(),
+                muted_dark_sat: default_muted_dark_sat(),
+                muted_mid_sat: default_muted_mid_sat(),
+                muted_bright_sat: default_muted_bright_sat(),
+                muted_paper_sat: default_muted_paper_sat(),
             },
             output: OutputSection {
                 format: "png".to_string(),
@@ -295,6 +420,7 @@ impl Default for EngineConfig {
                 divergence_reject_threshold: default_ensemble_divergence_threshold(),
                 cielab_distance: false,
             },
+            pyramid: PyramidSection::default(),
         }
     }
 }
@@ -356,6 +482,11 @@ impl EngineConfig {
         if self.hints.region_style_hint_budget > 128 {
             return Err(anyhow!("hints.region_style_hint_budget must be <= 128"));
         }
+        // The blur is an O(W·H·r²) filter: an unbounded radius turns a page
+        // into a multi-minute hang.
+        if self.hints.hint_blur_radius > 64.0 {
+            return Err(anyhow!("hints.hint_blur_radius must be <= 64"));
+        }
         if self.hints.propagation_radius > 256 {
             return Err(anyhow!("hints.propagation_radius must be <= 256"));
         }
@@ -382,6 +513,63 @@ pub fn load_style_profile(path: impl AsRef<Path>) -> Result<StyleProfile> {
         .with_context(|| format!("failed to read style profile {}", path.display()))?;
     serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse style profile {}", path.display()))
+}
+
+// ── Artist palette files (configs/palettes/*.yaml) ──────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaletteFile {
+    pub name: String,
+    pub colors: Vec<String>,
+}
+
+/// Load a palette YAML (e.g. configs/palettes/seinen.yaml) into colors.
+pub fn load_palette(path: impl AsRef<Path>) -> Result<Vec<ColorRgb>> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read palette {}", path.display()))?;
+    let file: PaletteFile = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse palette {}", path.display()))?;
+    file.colors
+        .iter()
+        .map(|hex| {
+            ColorRgb::from_str(hex)
+                .map_err(|_| anyhow!("invalid palette color {hex} in {}", path.display()))
+        })
+        .collect()
+}
+
+/// The scene palettes eligible for automatic selection (skin_tones and
+/// hair_defaults are material palettes, not scene palettes).
+pub const AUTO_PALETTES: &[&str] = &["fantasy", "seinen", "shojo", "shonen", "webtoon"];
+
+/// Pick the artist palette that best fits the page's fingerprint.
+/// brightness: 0..1 mean luma; contrast: gray std-dev (0..~80).
+pub fn select_palette_name(brightness: f32, contrast: f32) -> &'static str {
+    // Each scene palette has a target profile (brightness, contrast).
+    let candidates: &[(&str, f32, f32)] = &[
+        ("seinen", 0.42, 55.0),  // dark, dramatic, muted
+        ("fantasy", 0.55, 45.0), // mid, saturated
+        ("shonen", 0.60, 60.0),  // mid-bright, punchy
+        ("shojo", 0.68, 35.0),   // bright, soft
+        ("webtoon", 0.72, 58.0), // bright, high contrast
+    ];
+    let mut best = "shonen";
+    let mut best_score = f32::MAX;
+    for (name, b_target, c_target) in candidates {
+        let score = (brightness - b_target).abs() * 3.0 + (contrast - c_target).abs() / 20.0;
+        if score < best_score {
+            best_score = score;
+            best = name;
+        }
+    }
+    best
+}
+
+/// Default palette directory (relative to the working directory, matching
+/// the repo layout used by the bot service).
+pub fn default_palettes_dir() -> PathBuf {
+    PathBuf::from("configs/palettes")
 }
 
 fn merge_yaml(base: &mut Value, overlay: Value) {
@@ -428,5 +616,27 @@ mod tests {
         assert_eq!(config.layout.tile_size, 512);
         assert_eq!(config.layout.tile_overlap, 64);
         assert!((config.postprocess.line_strength - 1.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn loads_real_palette_files() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/palettes");
+        for name in AUTO_PALETTES {
+            let colors = load_palette(dir.join(format!("{name}.yaml"))).unwrap();
+            assert!(!colors.is_empty(), "{name} palette empty");
+            for color in &colors {
+                assert!(color.r <= 255 && color.g <= 255 && color.b <= 255);
+            }
+        }
+    }
+
+    #[test]
+    fn selects_palette_by_page_fingerprint() {
+        // Dark dramatic page -> seinen; bright soft page -> shojo.
+        assert_eq!(select_palette_name(0.40, 58.0), "seinen");
+        assert_eq!(select_palette_name(0.70, 30.0), "shojo");
+        assert_eq!(select_palette_name(0.60, 62.0), "shonen");
+        assert_eq!(select_palette_name(0.75, 60.0), "webtoon");
+        assert_eq!(select_palette_name(0.55, 45.0), "fantasy");
     }
 }

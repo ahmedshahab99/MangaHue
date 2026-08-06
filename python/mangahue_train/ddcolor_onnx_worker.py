@@ -13,6 +13,29 @@ from PIL import Image
 
 MODEL_SIZE = 512
 
+# Set once per process by _calibrate_ab_scale; applies the convention of the
+# deployed graph to every request.
+AB_SCALE: float = 110.0
+
+
+def _calibrate_ab_scale(session: ort.InferenceSession) -> float:
+    """Detect the ab output convention of the deployed graph.
+
+    Official DDColor graphs export ab in tanh space [-1, 1], which the
+    PyTorch workers scale by 110 (see ddcolor_worker.py). Some community
+    exports bake that scale into the graph. A saturated warmup input forces
+    large ab values, making the two conventions distinguishable: a scaled
+    graph reports |ab| far above 2.0, raw tanh stays within ~1.0.
+    """
+    pattern = np.zeros((1, 3, MODEL_SIZE, MODEL_SIZE), dtype=np.float32)
+    pattern[:, 0, : MODEL_SIZE // 2, :] = 1.0  # top half: red
+    pattern[:, 1, MODEL_SIZE // 2 :, :] = 1.0  # bottom half: green
+    output = session.run(None, {session.get_inputs()[0].name: pattern})[0][0]
+    peak = float(np.max(np.abs(output)))
+    if peak <= 2.0:
+        return 110.0
+    return 1.0
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent DDColor ONNX worker")
@@ -129,6 +152,7 @@ def colorize(
     output_ab = session.run(None, {session.get_inputs()[0].name: tensor})[0][0]
     if output_ab.shape != (2, MODEL_SIZE, MODEL_SIZE):
         raise ValueError(f"unexpected DDColor output shape: {output_ab.shape}")
+    output_ab = output_ab * AB_SCALE
 
     width, height = original_size
     a_channel = _resize_float_channel(output_ab[0], (width, height))
@@ -155,12 +179,15 @@ def main() -> None:
     os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(args.threads))
     session = _session(args.model.resolve(), args.threads)
+    global AB_SCALE
+    AB_SCALE = _calibrate_ab_scale(session)
     print(
         json.dumps(
             {
                 "status": "ready",
                 "backend": "ddcolor-tiny-onnx",
                 "size": MODEL_SIZE,
+                "ab_scale": AB_SCALE,
             }
         ),
         flush=True,

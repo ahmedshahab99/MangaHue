@@ -61,14 +61,16 @@ pub struct ChapterPage {
 
 pub fn load_image(path: impl AsRef<Path>) -> Result<MangaImage> {
     let path = path.as_ref();
+    // Validate dimensions from the header BEFORE decoding: a crafted image
+    // with a huge IHDR would otherwise allocate gigabytes at decode time.
+    if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+        if let Ok((width, height)) = image::image_dimensions(path) {
+            validate_image_dimensions(width, height, name)?;
+        }
+    }
     let image = image::open(path).with_context(|| format!("failed to load {}", path.display()))?;
     let (width, height) = image.dimensions();
-    if width == 0 || height == 0 {
-        return Err(anyhow!(
-            "image has zero width or height: {}",
-            path.display()
-        ));
-    }
+    validate_image_dimensions(width, height, "image")?;
     let size = ImageSize::new(width, height);
     let format = format_from_path(path);
     let id = path

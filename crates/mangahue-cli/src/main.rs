@@ -11,6 +11,7 @@ use mangahue_chapter::{
 };
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{BoundingBox, ColorRgb, ImageSize, StyleProfile};
+use mangahue_eval::reference_match_score;
 use mangahue_hints::{generate_hints, load_region_locks, load_user_hints, rasterize_region_locks};
 use mangahue_image::{
     collect_image_paths, export_chapter_archive, import_chapter_to_dir, is_supported_image_path,
@@ -100,6 +101,7 @@ enum Commands {
     Serve(ServeArgs),
     Debug(ColorizeArgs),
     Platform(PlatformArgs),
+    Score(ScoreArgs),
     Production {
         #[command(subcommand)]
         command: ProductionCommand,
@@ -196,6 +198,32 @@ struct ColorizeArgs {
     pyramid: bool,
     #[arg(long, help = "Propagate user hints to similar line-art regions")]
     hint_propagate: bool,
+    #[arg(
+        long = "palette",
+        help = "Artist palette file (configs/palettes/*.yaml) overriding the style palette"
+    )]
+    palette: Option<PathBuf>,
+    #[arg(
+        long = "auto-palette",
+        help = "Automatically select the artist palette matching the page fingerprint"
+    )]
+    auto_palette: bool,
+    #[arg(
+        long = "from-draft",
+        help = "Client-side draft: skip model inference and finish this colorized draft with the full postprocess"
+    )]
+    from_draft: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ScoreArgs {
+    /// Colorized output image to score.
+    output: PathBuf,
+    /// Reference photo (the target look).
+    reference: PathBuf,
+    /// Optional line mask image; regions on ink are excluded from tint delta.
+    #[arg(long)]
+    line_mask: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -610,6 +638,16 @@ struct ServeArgs {
         help = "Expose only authenticated v1 routes; disable local operator APIs"
     )]
     public_api: bool,
+    #[arg(
+        long,
+        help = "Additional CORS origin allowed to call the API (repeatable; loopback is always allowed)"
+    )]
+    cors_origin: Vec<String>,
+    #[arg(
+        long,
+        help = "Root directory served by /api/file and job sandboxes (default: current dir, or the jobs dir in public mode)"
+    )]
+    file_root: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -658,6 +696,7 @@ fn main() -> Result<()> {
         Commands::Model { command } => run_model(command),
         Commands::Serve(args) => run_serve(args),
         Commands::Platform(args) => run_platform(args),
+        Commands::Score(args) => run_score(args),
         Commands::Production { command } => run_production(command),
     }
 }
@@ -755,6 +794,9 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         use_mock_backend: args.mock,
         pyramid_enabled: args.pyramid,
         hint_propagation_enabled: args.hint_propagate,
+        palette_path: args.palette,
+        auto_palette: args.auto_palette,
+        draft_path: args.from_draft,
         ..ColorizeRequest::default()
     })?;
 
@@ -1501,6 +1543,7 @@ fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
             palette_drift_threshold: args.retry_drift_threshold,
             tone_drift_threshold: args.retry_tone_threshold,
             max_pages: args.retry_max_pages,
+            max_rounds: mangahue_chapter::default_retry_max_rounds(),
         },
         resume: args.resume,
     })?;
@@ -1768,7 +1811,72 @@ fn run_model(command: ModelCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_score(args: ScoreArgs) -> Result<()> {
+    let output = load_image(&args.output)
+        .with_context(|| format!("failed to load output {}", args.output.display()))?
+        .image
+        .to_rgb8();
+    let reference = load_image(&args.reference)
+        .with_context(|| format!("failed to load reference {}", args.reference.display()))?
+        .image
+        .to_rgb8();
+
+    // Resize reference to the output size (or vice versa) for comparable stats.
+    let (w, h) = (output.width(), output.height());
+    let reference = if reference.dimensions() != (w, h) {
+        image::imageops::resize(&reference, w, h, image::imageops::FilterType::Lanczos3)
+    } else {
+        reference
+    };
+
+    let line_mask = match args.line_mask {
+        Some(path) => {
+            let gray = load_image(&path)
+                .with_context(|| format!("failed to load line mask {}", path.display()))?
+                .image
+                .to_luma8();
+            Some(gray)
+        }
+        None => None,
+    };
+
+    let report = match &line_mask {
+        Some(mask) => reference_match_score(&output, &reference, mask),
+        None => {
+            // No mask: synthesize one from output luminance (ink lines are dark).
+            let mask = image::GrayImage::from_fn(w, h, |x, y| {
+                let p = output.get_pixel(x, y);
+                let luma = (p[0] as u32 + p[1] as u32 + p[2] as u32) / 3;
+                if luma < 40 {
+                    image::Luma([255])
+                } else {
+                    image::Luma([0])
+                }
+            });
+            reference_match_score(&output, &reference, &mask)
+        }
+    };
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    println!(
+        "reference match: {:.1}/100 (lightness {:.3}, chroma {:.3}, palette {:.3}, region {:.1})",
+        report.match_score,
+        report.lab_lightness_distance,
+        report.lab_chroma_distance,
+        report.palette_distance,
+        report.region_tint_delta
+    );
+    Ok(())
+}
+
 fn run_serve(args: ServeArgs) -> Result<()> {
+    let file_root = args.file_root.clone().unwrap_or_else(|| {
+        if args.public_api {
+            args.jobs_dir.clone()
+        } else {
+            PathBuf::from(".")
+        }
+    });
     tokio::runtime::Runtime::new()?.block_on(serve(ApiServerConfig {
         addr: args.addr,
         jobs_dir: args.jobs_dir,
@@ -1776,6 +1884,8 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         studio_dir: args.studio_dir,
         production_db: args.production_db,
         public_api: args.public_api,
+        file_root,
+        allowed_origins: args.cors_origin,
     }))
 }
 

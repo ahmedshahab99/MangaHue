@@ -138,9 +138,9 @@ impl Ensembler {
             return Err(anyhow!("ensemble requires at least one ONNX model"));
         }
         let primary = backends.remove(0);
-        let model_weights = weights.map(|w| w.to_vec()).unwrap_or_else(|| {
-            vec![1.0; backends.len() + 1]
-        });
+        let model_weights = weights
+            .map(|w| w.to_vec())
+            .unwrap_or_else(|| vec![1.0; backends.len() + 1]);
         let config = EnsembleConfig {
             enabled: true,
             fallback_mock_count: 0,
@@ -199,6 +199,17 @@ impl Ensembler {
             "ensemble concluded"
         );
         Ok((merged, confidence, report))
+    }
+
+    /// Whether ANY variant requires the original grayscale input (DDColor
+    /// family) rather than the whitened clean lineart. The ensemble feeds
+    /// every variant the same tile, so the most demanding variant decides.
+    pub fn prefers_original_grayscale(&self) -> bool {
+        self.primary.prefers_original_grayscale()
+            || self
+                .auxiliaries
+                .iter()
+                .any(|backend| backend.prefers_original_grayscale())
     }
 
     fn run_all(&self, input: &ModelInput) -> Result<Vec<BackendVariant>> {
@@ -278,14 +289,20 @@ impl Ensembler {
                     ConsensusStrategy::MajorityWeighted => {
                         let blended = weighted_average_pixel(&votes, pixel_weights);
                         let conf = 1.0 - disagreement.min(1.0);
-                        let line_strength = input.lineart.get_pixel(x, y)[0] as f32 / 255.0;
-                        let weight = if line_strength > 0.55 {
+                        // lineart is DARK on ink: high luma = paper, low luma
+                        // = ink. Ink pixels take the primary model's output
+                        // raw (line protection); everything else blends.
+                        let paper = input.lineart.get_pixel(x, y)[0] as f32 / 255.0;
+                        let ink_strength = 1.0 - paper;
+                        let weight = if ink_strength > 0.55 {
                             votes[0]
                         } else {
                             blended
                         };
                         merged.put_pixel(x, y, Rgb(weight));
-                        let final_conf = conf * (1.0 - line_strength * 0.6);
+                        // Where the primary was forced without consensus the
+                        // confidence is reduced; blended regions keep it.
+                        let final_conf = conf * (0.4 + paper * 0.6);
                         confidence.placed(
                             x,
                             y,
@@ -576,24 +593,6 @@ fn weighted_average_pixel(votes: &[[u8; 3]], weights: &[f32]) -> [u8; 3] {
         (sums[0] / total_weight).round().clamp(0.0, 255.0) as u8,
         (sums[1] / total_weight).round().clamp(0.0, 255.0) as u8,
         (sums[2] / total_weight).round().clamp(0.0, 255.0) as u8,
-    ]
-}
-
-fn average_pixel(votes: &[[u8; 3]]) -> [u8; 3] {
-    let n = votes.len() as u32;
-    if n == 0 {
-        return [128, 128, 128];
-    }
-    let mut sums = [0u32; 3];
-    for vote in votes {
-        for c in 0..3 {
-            sums[c] = sums[c].saturating_add(vote[c] as u32);
-        }
-    }
-    [
-        (sums[0] / n).min(255) as u8,
-        (sums[1] / n).min(255) as u8,
-        (sums[2] / n).min(255) as u8,
     ]
 }
 

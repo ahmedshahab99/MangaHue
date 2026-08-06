@@ -13,7 +13,7 @@ pub struct LayoutResult {
 
 pub fn analyze_layout(lineart: &GrayImage, config: &LayoutSection) -> Result<LayoutResult> {
     let size = ImageSize::new(lineart.width(), lineart.height());
-    let is_webtoon_like = lineart.height() > lineart.width().saturating_mul(3);
+    let is_webtoon_like = webtoon_like(lineart.height(), lineart.width(), &config.webtoon_mode);
     let panels = if config.panel_detection {
         detect_panels_basic(lineart, config.reading_direction)
     } else {
@@ -31,6 +31,18 @@ pub fn analyze_layout(lineart: &GrayImage, config: &LayoutSection) -> Result<Lay
         tiles,
         is_webtoon_like,
     })
+}
+
+/// Whether the page should be treated as a webtoon (long vertical strip).
+/// Honors the `layout.webtoon_mode` config: "force"/"always"/"webtoon"
+/// always returns true, "off"/"disabled"/"false"/"no" never, and anything
+/// else ("auto") uses the geometric heuristic.
+pub fn webtoon_like(height: u32, width: u32, mode: &str) -> bool {
+    match mode.to_ascii_lowercase().as_str() {
+        "force" | "always" | "webtoon" => true,
+        "off" | "disabled" | "false" | "no" => false,
+        _ => height > width.saturating_mul(3),
+    }
 }
 
 pub fn split_tiles(size: ImageSize, config: &LayoutSection) -> Vec<TileInfo> {

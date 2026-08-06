@@ -1,25 +1,59 @@
 id: studio_anime
 name: Studio Anime
-saturation: 1.15
-contrast: 1.12
+saturation: 1.25
+contrast: 1.15
 brightness: 0.0
-shadow_strength: 0.55
-highlight_strength: 0.44
+shadow_strength: 0.5
+highlight_strength: 0.42
 line_strength: 1.0
+# Rich material palette: warm skin + varied clothing/background hues so
+# the region renderer paints DISTINCT materials instead of forcing
+# everything into warm tones.
 palette:
+  # skin (warm, low chroma)
   - "#efc7ae"
-  - "#d8aa8e"
-  - "#c48e7c"
+  - "#e3b296"
+  - "#d8a086"
+  - "#c98d74"
+  - "#f2d8c4"
+  # hair (natural dark + variety)
   - "#3a3038"
-  - "#514249"
-  - "#76605a"
-  - "#eee7dd"
-  - "#fdfcf9"
-  - "#c8b8a8"
+  - "#4d4038"
+  - "#5c4a3a"
+  - "#6b5a4e"
+  - "#2e2a33"
+  - "#8a6a52"
+  # clothing — blues
+  - "#4a6fa5"
+  - "#2f5d8a"
+  - "#5b8fc0"
+  - "#1e3a5f"
+  # clothing — reds / pinks
+  - "#b34a4a"
+  - "#c25f5f"
+  - "#d4817a"
+  # clothing — greens
+  - "#4d7c5a"
+  - "#6d9a6a"
+  - "#3c6b50"
+  # clothing — purples
+  - "#7a5c8f"
+  - "#6a4d7a"
+  # clothing — yellows / oranges
+  - "#c99a3f"
+  - "#b8843f"
+  # fabric neutrals
   - "#8a7a6e"
-  - "#b99878"
-  - "#8a6058"
+  - "#a89a8e"
+  # backgrounds — cool
+  - "#9fb4c7"
+  - "#7d93a8"
+  - "#b8c4d0"
+  # backgrounds — warm
+  - "#d8c8a8"
+  - "#c4b498"
+  - "#e8ddc8"
 protected_colors:
   - "#ffffff"
   - "#000000"
-notes: "Studio anime color: warm skin, charcoal hair, neutral whites, grounded interiors, warm shadows."
+notes: "Studio anime with rich material palette: distinct skin, hair, clothing (blue/red/green/purple/yellow) and cool+warm backgrounds for natural variety."

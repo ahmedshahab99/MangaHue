@@ -1,0 +1,63 @@
+# Studio tier engine config: the measured target style (muted warm) with
+# full coverage. Use with the DDColor-FULL model for maximum quality:
+#   mangahue colorize in.png --output out.png \
+#     --model models/ddcolor-full-fp16.onnx \
+#     --preset configs/engine.studio.yaml \
+#     --style configs/styles/target_style.yaml
+# Rollback to the fast tier: --model models/ddcolor-tiny-fp16.onnx
+# (the bot's production preset is engine.ensemble.yaml — unchanged).
+engine:
+  mode: quality
+  parallel_jobs: 1
+  pyramid_enabled: true
+  hint_propagation_enabled: true
+pyramid:
+  enabled: true
+  levels: [768]
+  blend_weights: [1.0]
+preprocess:
+  denoise_strength: 2
+  line_sharpening: 0.5
+layout:
+  tile_size: 768
+  tile_overlap: 96
+hints:
+  hint_blur_radius: 6.0
+  propagation_radius: 48
+  propagation_similarity_threshold: 0.3
+  adaptive_placement_enabled: true
+  region_style_hints_enabled: true
+  region_style_hint_budget: 24
+ensemble:
+  enabled: true
+  strategy: chroma_complement
+  primary_weight: 1.0
+  parallel_variants: false
+  divergence_reject_threshold: 0.5
+  cielab_distance: true
+postprocess:
+  final_sharpening: 0.2
+  palette_correction: true
+  reference_finishing: true
+  semantic_relighting: true
+  relighting_strength: 0.35
+  midtone_depth: 0.26
+  local_contrast: 0.1
+  target_colorfulness: 1.8
+  natural_grading: true
+  reference_transfer: false
+  muted_target_grade: true
+  muted_strength: 0.95
+  muted_hue_shift_deg: 20
+  muted_dark_pull: 0.85
+  soft_strength: 1.0
+  soft_confidence: 1.0
+  muted_dark_sat: 0.17
+  muted_mid_sat: 0.27
+  muted_bright_sat: 0.22
+  muted_paper_sat: 0.03
+eval:
+  line_preservation_threshold: 0.96
+  protected_region_violation_threshold: 0.98
+  hint_adherence_threshold: 0.82
+  screen_tone_warning_threshold: 0.12

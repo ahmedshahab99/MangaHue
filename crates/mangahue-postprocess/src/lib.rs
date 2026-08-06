@@ -1,5 +1,10 @@
+mod natural_grade;
 mod reference_finish;
 mod region_renderer;
+mod reinhard_transfer;
+pub mod scene;
+
+pub use scene::{analyze_scene, scene_palette, SceneLighting, SceneProfile};
 
 use anyhow::Result;
 use image::{GrayImage, Rgb, RgbImage};
@@ -15,8 +20,10 @@ pub struct PostprocessInput<'a> {
     pub bubble_mask: &'a GrayImage,
     pub tone_mask: Option<&'a GrayImage>,
     pub protected_mask: Option<&'a GrayImage>,
+    pub face_mask: Option<&'a GrayImage>,
     pub style: &'a StyleProfile,
     pub config: &'a PostprocessSection,
+    pub reference_image: Option<&'a RgbImage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +55,8 @@ pub struct PostprocessReport {
     #[serde(default)]
     pub reference_shadow_pixels_shaped: u64,
     #[serde(default)]
+    pub face_pixels_painted: u64,
+    #[serde(default)]
     pub semantic_chroma_restored: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
@@ -72,6 +81,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         reference_pixels_finished: 0,
         reference_chroma_pixels_expanded: 0,
         reference_shadow_pixels_shaped: 0,
+        face_pixels_painted: 0,
         semantic_chroma_restored: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
@@ -102,7 +112,11 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             &mut output,
             input.original_grayscale,
             input.line_mask,
+            Some(input.bubble_mask),
             input.style,
+            input.config.soft_coverage,
+            input.config.soft_strength,
+            input.config.soft_confidence,
         );
         report.material_regions = region_report.regions;
         report.seeded_material_regions = region_report.seeded_regions;
@@ -119,20 +133,65 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.line_mask,
             input.bubble_mask,
             input.protected_mask,
+            input.face_mask,
             input.style,
             input.config,
         );
         report.reference_pixels_finished = finish_report.pixels_finished;
         report.reference_chroma_pixels_expanded = finish_report.chroma_pixels_expanded;
         report.reference_shadow_pixels_shaped = finish_report.shadow_pixels_shaped;
+        report.face_pixels_painted = finish_report.face_pixels_painted;
+    }
+
+    if input.config.reference_transfer {
+        if let Some(reference) = input.reference_image {
+            reinhard_transfer::apply_reinhard_transfer(
+                &mut output,
+                reference,
+                input.line_mask,
+                1.0,
+            );
+        }
+    }
+
+    // Natural grading AFTER reference transfer: the transfer re-normalizes
+    // the LAB stats toward the reference, which would otherwise wash out
+    // the saturation curve. Running grading last keeps the richer look.
+    if input.config.natural_grading {
+        natural_grade::natural_grade(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.bubble_mask,
+        );
     }
 
     restore_semantic_chroma(
         &mut output,
         &semantic_evidence,
         input.line_mask,
+        input.face_mask,
         &mut report.semantic_chroma_restored,
     );
+
+    // The muted target grade runs LAST of the color passes: the semantic
+    // chroma restore would otherwise re-saturate what the grade just
+    // desaturated (its washed-out gate fires after any desaturation).
+    if input.config.muted_target_grade {
+        natural_grade::muted_target_grade(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.bubble_mask,
+            input.config.muted_strength,
+            input.config.muted_hue_shift_deg,
+            input.config.muted_dark_pull,
+            input.config.muted_dark_sat,
+            input.config.muted_mid_sat,
+            input.config.muted_bright_sat,
+            input.config.muted_paper_sat,
+        );
+    }
 
     if let Some(tone_mask) = input.tone_mask {
         preserve_screentones(
@@ -247,23 +306,40 @@ fn restore_semantic_chroma(
     output: &mut RgbImage,
     evidence: &RgbImage,
     line_mask: &GrayImage,
+    face_mask: Option<&GrayImage>,
     restored: &mut u64,
 ) {
+    let (width, height) = output.dimensions();
     for (x, y, pixel) in output.enumerate_pixels_mut() {
         if line_mask.get_pixel(x, y)[0] > 172 {
             continue;
+        }
+        // Face pixels are already force-painted with deep peach by
+        // reference_finish; re-injecting the model's flat chroma here would
+        // wash them back to pale. The face paint is authoritative.
+        if let Some(mask) = face_mask {
+            if mask.dimensions() == (width, height) && mask.get_pixel(x, y)[0] > 128 {
+                continue;
+            }
         }
         let source = evidence.get_pixel(x, y);
         let source_max = source[0].max(source[1]).max(source[2]);
         let source_min = source[0].min(source[1]).min(source[2]);
         let source_chroma = (source_max - source_min) as f32;
-        if !(18.0..=112.0).contains(&source_chroma) {
+        // Only clearly visible model colors are candidates for restoration,
+        // and only when the output is genuinely washed out (below half the
+        // model's chroma): the region director's deliberate hues must not
+        // be overwritten by the model's casts.
+        if !(40.0..=112.0).contains(&source_chroma) {
             continue;
         }
         let output_max = pixel[0].max(pixel[1]).max(pixel[2]);
         let output_min = pixel[0].min(pixel[1]).min(pixel[2]);
         let output_chroma = (output_max - output_min) as f32;
-        if output_chroma >= source_chroma * 0.66 {
+        // Restore only on genuine wash-out (below HALF the model's chroma):
+        // keeps the director's deliberate hues while still re-coloring
+        // truly flat gray areas.
+        if output_chroma >= source_chroma * 0.5 {
             continue;
         }
 
@@ -271,10 +347,11 @@ fn restore_semantic_chroma(
             0.2126 * source[0] as f32 + 0.7152 * source[1] as f32 + 0.0722 * source[2] as f32;
         let output_luma =
             0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        if source_luma < 42.0 || output_luma < 35.0 {
+        // Skip very dark pixels so shadows keep their graded deep chroma.
+        if source_luma < 42.0 || output_luma < 38.0 {
             continue;
         }
-        let strength = (0.62 + (source_chroma - output_chroma) / 180.0).clamp(0.62, 0.84);
+        let strength = (0.55 + (source_chroma - output_chroma) / 220.0).clamp(0.55, 0.75);
         let red = (source[0] as f32 - source_luma) * strength;
         let blue = (source[2] as f32 - source_luma) * strength;
         *pixel = rgb_from_luma_chroma(output_luma, red, blue);
@@ -636,7 +713,7 @@ struct MangaColorLUT {
 impl MangaColorLUT {
     fn new(style: &StyleProfile) -> Self {
         let contrast = style.contrast.clamp(0.9, 1.15);
-        let sat = style.saturation.clamp(0.7, 1.15);
+        let sat = style.saturation.clamp(0.7, 1.3);
         let bright = style.brightness * 15.0;
         let mut table = vec![[[Rgb([0; 3]); LUT_SIZE]; LUT_SIZE]; LUT_SIZE];
 
@@ -1298,7 +1375,7 @@ mod tests {
         let before = rgb_luma(output.get_pixel(0, 0));
         let mut restored = 0;
 
-        restore_semantic_chroma(&mut output, &evidence, &lines, &mut restored);
+        restore_semantic_chroma(&mut output, &evidence, &lines, None, &mut restored);
 
         let pixel = output.get_pixel(0, 0);
         assert_eq!(restored, 1);
@@ -1327,6 +1404,19 @@ mod tests {
             local_contrast: 0.12,
             semantic_relighting: false,
             relighting_strength: 0.25,
+            natural_grading: true,
+            reference_transfer: true,
+            soft_coverage: true,
+            muted_target_grade: false,
+            muted_strength: 0.95,
+            muted_hue_shift_deg: 16.0,
+            muted_dark_pull: 0.92,
+            soft_strength: 1.0,
+            soft_confidence: 1.0,
+            muted_dark_sat: 0.19,
+            muted_mid_sat: 0.27,
+            muted_bright_sat: 0.22,
+            muted_paper_sat: 0.034,
         };
 
         let (output, report) = finalize(PostprocessInput {
@@ -1336,8 +1426,10 @@ mod tests {
             bubble_mask: &bubbles,
             tone_mask: None,
             protected_mask: Some(&protected),
+            face_mask: None,
             style: &style,
             config: &config,
+            reference_image: None,
         })
         .unwrap();
 

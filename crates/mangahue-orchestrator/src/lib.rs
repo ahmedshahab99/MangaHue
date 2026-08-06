@@ -3,20 +3,24 @@ use image::{GrayImage, Luma, Rgb, RgbImage};
 use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
-    CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
+    BoundingBox, CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport,
+    StyleProfile, TileInfo,
 };
-use mangahue_ensemble::{ConfidenceMap, ConsensusStrategy, EnsembleConfig, Ensembler};
+use mangahue_ensemble::{
+    ConfidenceMap, ConsensusStrategy, EnsembleConfig, EnsembleReport, Ensembler,
+};
 use mangahue_hints::{
-    apply_region_locks_to_hints, apply_region_style_hints, enforce_region_locks, generate_hints,
-    load_region_locks, load_user_hints, propagate_hints, rasterize_region_locks,
+    apply_region_locks_to_hints, apply_region_style_hints, detect_semantic_regions,
+    enforce_region_locks, generate_hints, load_region_locks, load_user_hints, propagate_hints,
+    rasterize_face_hints, rasterize_face_mask, rasterize_region_locks, rasterize_semantic_hints,
 };
 use mangahue_image::{crop_gray, crop_rgb, load_image, save_gray, save_rgb};
-use mangahue_inference::{
-    ColorizationBackend, MockColorizationBackend, ModelInput, OnnxColorizationBackend,
-};
+use mangahue_inference::{ColorizationBackend, MockColorizationBackend, ModelInput};
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
-use mangahue_postprocess::{cross_tile_coherence, finalize, reconstruct_full_resolution, PostprocessInput};
+use mangahue_postprocess::{
+    cross_tile_coherence, finalize, reconstruct_full_resolution, PostprocessInput,
+};
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
 use rayon::prelude::*;
@@ -60,6 +64,20 @@ pub struct ColorizeRequest {
     pub pyramid_enabled: bool,
     #[serde(default)]
     pub hint_propagation_enabled: bool,
+    /// Artist palette override (configs/palettes/*.yaml). Overrides
+    /// style.palette before scene re-weighting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_path: Option<PathBuf>,
+    /// Automatically select the artist palette that best fits the page
+    /// fingerprint (brightness/contrast) from the scene palettes.
+    #[serde(default)]
+    pub auto_palette: bool,
+    /// Client-side draft: a colorized image produced OUTSIDE the engine
+    /// (e.g. by the WebGPU web app). When set, the orchestrator skips model
+    /// inference and uses the draft as the model output, then runs the full
+    /// protected-layer + director + grading postprocess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_path: Option<PathBuf>,
     #[serde(skip)]
     pub progress_sender: Option<tokio::sync::mpsc::UnboundedSender<ProgressUpdate>>,
 }
@@ -144,26 +162,41 @@ impl MangaHueEngine {
         let cancel = request.cancel_token.as_ref().map(Arc::clone);
 
         if let Some(key) = request.idempotency_key.as_deref().map(|s| s.to_string()) {
-            let ck = CacheKey(key);
+            let ck = CacheKey(key.clone());
             if let Some(dir) = request.cache_dir.as_deref() {
                 let cache = ArtifactCache::new(dir);
-                if let Ok(Some(artifact)) = cache.get(&ck) {
-                    let report_path = artifact.path.clone();
-                    let report: ProcessingReport = if report_path.exists() {
-                        serde_json::from_slice(&fs::read(&report_path).with_context(|| {
-                            format!("failed to read cached report {}", report_path.display())
-                        })?)
-                        .unwrap_or_default()
-                    } else {
-                        ProcessingReport::default()
-                    };
+                // A real idempotency hit requires BOTH the colored page and
+                // its report to be cached under the caller's key; the output
+                // image is restored to the requested output path.
+                if let Ok(Some(page_artifact)) =
+                    cache.get_kind(&ck, mangahue_cache::ArtifactKind::ColoredPage)
+                {
+                    let report =
+                        match cache.get_kind(&ck, mangahue_cache::ArtifactKind::QualityReport) {
+                            Ok(Some(report_artifact)) => serde_json::from_slice(
+                                &fs::read(&report_artifact.path).with_context(|| {
+                                    format!(
+                                        "failed to read cached report {}",
+                                        report_artifact.path.display()
+                                    )
+                                })?,
+                            )
+                            .unwrap_or_default(),
+                            _ => ProcessingReport::default(),
+                        };
+                    fs::copy(&page_artifact.path, &request.output_path).with_context(|| {
+                        format!(
+                            "failed to restore cached output to {}",
+                            request.output_path.display()
+                        )
+                    })?;
                     info!(cache_key = %ck.0, "idempotency cache hit, returning cached result");
                     return Ok(ColorizeResult {
                         output_path: request.output_path,
                         report,
                         quality_report_path: None,
                         confidence_map_path: None,
-                        idempotency_key: Some(ck.0),
+                        idempotency_key: Some(key),
                         from_cache: true,
                     });
                 }
@@ -179,7 +212,9 @@ impl MangaHueEngine {
 
         // Resolve pyramid / hint propagation flags. Request explicit opt-in
         // takes precedence; otherwise fall back to the config-derived value.
-        let pyramid_enabled = request.pyramid_enabled || config.engine.pyramid_enabled;
+        let pyramid_enabled =
+            request.pyramid_enabled || config.engine.pyramid_enabled || config.pyramid.enabled;
+        let pyramid_config = config.pyramid.clone();
         let hint_propagation_enabled =
             request.hint_propagation_enabled || config.engine.hint_propagation_enabled;
         let progress = request.progress_sender.clone();
@@ -216,6 +251,56 @@ impl MangaHueEngine {
             size_from_gray(&preprocess.clean_lineart),
             &preprocess.report,
         ));
+        // Scene intelligence: every manga page has its own lighting
+        // environment (day / sunset / night / overcast / indoor). Classify
+        // it from the page's grayscale and adapt the style palette to the
+        // scene so the coloring matches the environment instead of forcing
+        // one fixed look.
+        let scene = mangahue_postprocess::analyze_scene(&preprocess.original_grayscale);
+        // Artist palette: every series has its own color vision. Either an
+        // explicit palette file (configs/palettes/*.yaml) or automatic
+        // selection from the page fingerprint overrides the style palette
+        // BEFORE the scene re-weighting applies.
+        let mut palette_style = style.clone();
+        if request.auto_palette {
+            let name = mangahue_config::select_palette_name(scene.brightness, scene.contrast);
+            let path = mangahue_config::default_palettes_dir().join(format!("{name}.yaml"));
+            if let Ok(colors) = mangahue_config::load_palette(&path) {
+                report.warn(format!("artist palette auto-selected: {name}"));
+                palette_style.palette = colors;
+            } else {
+                report.warn(format!(
+                    "auto palette {name} not found at {}; using style palette",
+                    path.display()
+                ));
+            }
+        } else if let Some(palette_path) = request.palette_path.as_deref() {
+            let colors = mangahue_config::load_palette(palette_path)?;
+            report.warn(format!(
+                "artist palette override: {}",
+                palette_path.display()
+            ));
+            palette_style.palette = colors;
+        }
+        let scene_style = {
+            let mut adapted = palette_style.clone();
+            adapted.palette =
+                mangahue_postprocess::scene_palette(&palette_style.palette, &scene, 14);
+            adapted
+        };
+        report.warn(format!(
+            "scene detected: {} (brightness {:.0}, contrast {:.0})",
+            scene.lighting.label(),
+            scene.brightness * 255.0,
+            scene.contrast
+        ));
+        report.add_stage_report(
+            StageReport::new("scene")
+                .metric("brightness", scene.brightness as f64)
+                .metric("contrast", scene.contrast as f64)
+                .metric("warmth", scene.warmth as f64)
+                .note(format!("lighting={}", scene.lighting.label())),
+        );
         report.add_stage_report(preprocess_stage_report(&preprocess.report));
         for warning in &preprocess.report.warnings {
             report.warn(warning.clone());
@@ -259,7 +344,7 @@ impl MangaHueEngine {
         let mut hints = generate_hints(
             size,
             user_hints.as_ref(),
-            &style,
+            &scene_style,
             &characters,
             &config.hints,
         );
@@ -267,9 +352,130 @@ impl MangaHueEngine {
             &mut hints,
             &preprocess.clean_lineart,
             &preprocess.bubble_mask,
-            &style,
+            &scene_style,
             &config.hints,
         );
+        // Semantic full-coverage hints: dense region painting (skin/hair/
+        // clothing/background/bubbles) so the hint-U-Net sees strong,
+        // locally-correct material hints instead of sparse dots. These
+        // override the weaker grid/dot hints inside the same regions.
+        if config.hints.region_style_hints_enabled {
+            let regions = detect_semantic_regions(
+                &preprocess.original_grayscale,
+                &preprocess.line_mask,
+                &preprocess.bubble_mask,
+            );
+            let painted = rasterize_semantic_hints(
+                &mut hints.hint_map,
+                &mut hints.hint_mask,
+                &preprocess.original_grayscale,
+                &regions,
+            );
+            if painted > 0 {
+                hints
+                    .notes
+                    .push(format!("semantic region hints painted {painted} pixels"));
+                hints.applied_hints += 1;
+                hints.region_style_hints_applied += 1;
+            }
+        }
+
+        // Face-driven hints: detect anime faces and paint precise skin/hair/
+        // eye ellipses so the model colors characters correctly. Only runs
+        // when a face cascade directory is configured (MANGAHUE_FACE_MODEL).
+        let mut face_boxes: Vec<[u32; 4]> = Vec::new();
+        if let Some(face_dir) = std::env::var("MANGAHUE_FACE_MODEL")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|dir| mangahue_inference::is_anime_face_model_dir(dir))
+        {
+            match mangahue_inference::AnimeFaceBackend::shared(face_dir) {
+                Ok(face_backend) => {
+                    match face_backend.detect_faces(&preprocess.original_grayscale) {
+                        Ok(faces) if !faces.is_empty() => {
+                            face_boxes = faces;
+                            // Skin/hair/eye colors from the style palette by
+                            // semantic slots; fall back to natural defaults.
+                            let skin = style
+                                .palette
+                                .get(0)
+                                .map(|c| [c.r, c.g, c.b])
+                                .unwrap_or([242, 208, 182]);
+                            let hair = style
+                                .palette
+                                .get(6)
+                                .map(|c| [c.r, c.g, c.b])
+                                .unwrap_or([38, 28, 34]);
+                            let eyes = [46, 40, 54];
+                            let face_painted = rasterize_face_hints(
+                                &mut hints.hint_map,
+                                &mut hints.hint_mask,
+                                &face_boxes,
+                                skin,
+                                hair,
+                                eyes,
+                            );
+                            if face_painted > 0 {
+                                hints.notes.push(format!(
+                                    "face-driven hints painted {face_painted} pixels across {} face(s)",
+                                    face_boxes.len()
+                                ));
+                                hints.applied_hints += 1;
+                                hints.region_style_hints_applied += 1;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(error = %error, "face detection failed; skipping face hints");
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "face backend failed to start; skipping face hints");
+                }
+            }
+        }
+        // Face mask for postprocess: guarantees detected faces are painted
+        // peach even where the model outputs near-white.
+        let face_mask = if face_boxes.is_empty() {
+            None
+        } else {
+            Some(rasterize_face_mask(
+                &face_boxes,
+                preprocess.original_grayscale.width(),
+                preprocess.original_grayscale.height(),
+            ))
+        };
+        // The bubble detector mistakes bright faces (large bright region
+        // bounded by dark contours) for speech bubbles. That would make every
+        // postprocess stage skip/whiten the face â€” the white-face bug. The
+        // face is authoritative skin: zero the bubble mask wherever the face
+        // mask is strong, so exclusion, grading and bubble cleanup all leave
+        // the face alone.
+        let bubble_mask = if let Some(ref mask) = face_mask {
+            let mut bm = preprocess.bubble_mask.clone();
+            for ((_, _, bpx), mpx) in bm.enumerate_pixels_mut().zip(mask.pixels()) {
+                if mpx[0] > 128 {
+                    bpx[0] = 0;
+                }
+            }
+            bm
+        } else {
+            preprocess.bubble_mask.clone()
+        };
+        if let (Some(ref mask), Some(debug_dir)) =
+            (face_mask.as_ref(), request.debug_dir.as_deref())
+        {
+            let painted = mask.pixels().filter(|p| p[0] > 0).count();
+            report.warn(format!(
+                "face mask rasterized: {painted} pixels, box={:?}",
+                face_boxes
+            ));
+            let path = debug_dir.join("face_mask.png");
+            save_gray(&path, mask)
+                .with_context(|| format!("failed to save face mask {}", path.display()))?;
+            report.debug_files.push(path);
+        }
         report.hint_ms = hint_start.elapsed().as_millis();
         report.add_stage_report(
             StageReport::new("hints")
@@ -345,7 +551,34 @@ impl MangaHueEngine {
         let mut confidence_map: Option<ConfidenceMap> = None;
         let backend_name: String;
 
-        if use_ensemble {
+        if let Some(draft_path) = request.draft_path.as_deref() {
+            // Client-side draft mode (WebGPU web app): the model output was
+            // produced on the CLIENT's GPU and uploaded here. Model
+            // inference is skipped; the full protected-layer, region
+            // director and grading postprocess still runs on the draft.
+            let draft = load_image(draft_path)?.image.to_rgb8();
+            let draft = if draft.dimensions() != (size.width, size.height) {
+                image::imageops::resize(
+                    &draft,
+                    size.width,
+                    size.height,
+                    image::imageops::FilterType::Lanczos3,
+                )
+            } else {
+                draft
+            };
+            backend_name = "client-webgpu-draft".to_string();
+            info!(draft = %draft_path.display(), "using client-side draft");
+            colored_tiles = vec![(
+                TileInfo {
+                    id: "tile_0001".to_string(),
+                    bbox: BoundingBox::new(0, 0, size.width, size.height),
+                    overlap: 0,
+                    panel_id: None,
+                },
+                draft,
+            )];
+        } else if use_ensemble {
             backend_name = "ensemble".to_string();
             let ens = build_ensembler(&request, &config, &style)?;
             info!(
@@ -355,6 +588,15 @@ impl MangaHueEngine {
                 "running ensemble inference"
             );
             let cancel = cancel.clone();
+            // DDColor-family variants need the original grayscale; the
+            // ensemble feeds every variant the same source, so the most
+            // demanding variant decides.
+            let use_original = ens.prefers_original_grayscale();
+            let source_gray = if use_original {
+                &preprocess.original_grayscale
+            } else {
+                &preprocess.clean_lineart
+            };
             if layout.tiles.len() < 2 || parallel_jobs == 1 {
                 let mut acc = Vec::with_capacity(layout.tiles.len());
                 for tile in &layout.tiles {
@@ -363,7 +605,7 @@ impl MangaHueEngine {
                     }
                     let (merged, conf, _report) = ens
                         .colorize(&ModelInput {
-                            lineart: crop_gray(&preprocess.clean_lineart, tile.bbox),
+                            lineart: crop_gray(source_gray, tile.bbox),
                             hint_map: crop_rgb(&hints.hint_map, tile.bbox),
                             hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
                         })
@@ -384,36 +626,72 @@ impl MangaHueEngine {
                 colored_tiles = acc;
             } else {
                 let pool = build_pool(parallel_jobs);
-                let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
-                    let tiles = &layout.tiles;
-                    let clean = &preprocess.clean_lineart;
-                    let hint_map = &hints.hint_map;
-                    let hint_mask = &hints.hint_mask;
-                    let cancel = cancel.clone();
-                    tiles
-                        .par_iter()
-                        .map(|tile| {
-                            if check_cancel(&cancel) {
-                                return Err(anyhow!("cancelled during ensemble tile {}", tile.id));
-                            }
-                            ens.colorize(&ModelInput {
-                                lineart: crop_gray(clean, tile.bbox),
-                                hint_map: crop_rgb(hint_map, tile.bbox),
-                                hint_mask: crop_gray(hint_mask, tile.bbox),
+                let raw: Vec<Result<(TileInfo, RgbImage, ConfidenceMap, EnsembleReport)>> = pool
+                    .install(|| {
+                        let tiles = &layout.tiles;
+                        let clean = source_gray;
+                        let hint_map = &hints.hint_map;
+                        let hint_mask = &hints.hint_mask;
+                        let cancel = cancel.clone();
+                        tiles
+                            .par_iter()
+                            .map(|tile| {
+                                if check_cancel(&cancel) {
+                                    return Err(anyhow!(
+                                        "cancelled during ensemble tile {}",
+                                        tile.id
+                                    ));
+                                }
+                                ens.colorize(&ModelInput {
+                                    lineart: crop_gray(clean, tile.bbox),
+                                    hint_map: crop_rgb(hint_map, tile.bbox),
+                                    hint_mask: crop_gray(hint_mask, tile.bbox),
+                                })
+                                .map(|(merged, conf, report)| (tile.clone(), merged, conf, report))
+                                .map_err(|err| anyhow!(err))
                             })
-                            .map(|(merged, _, _)| (tile.clone(), merged))
-                            .map_err(|err| anyhow!(err))
-                        })
-                        .collect()
-                });
-                colored_tiles = raw.into_iter().collect::<Result<Vec<_>>>()?;
+                            .collect()
+                    });
+                let mut colored: Vec<(TileInfo, RgbImage)> = Vec::with_capacity(raw.len());
+                for entry in raw {
+                    let (tile, merged, conf, report) = entry?;
+                    if ensemble_report.is_none() {
+                        ensemble_report = Some(report);
+                    }
+                    if confidence_map.is_none() {
+                        confidence_map = Some(conf);
+                    }
+                    colored.push((tile, merged));
+                }
+                colored_tiles = colored;
             }
-            emit_progress(&progress, "inference_done", tiles_total, tiles_total, None);
+            emit_progress(&progress, "inference_done", 4, 6, None);
         } else {
             let raw_backend: Arc<dyn ColorizationBackend> =
                 Arc::from(select_backend(&request, &config, &style)?);
             let backend: Arc<dyn ColorizationBackend> = if pyramid_enabled {
-                Arc::new(PyramidColorizer::new(raw_backend, PyramidConfig::default()))
+                let config = if pyramid_config.levels.is_empty() {
+                    PyramidConfig::default()
+                } else {
+                    PyramidConfig {
+                        enabled: true,
+                        levels: pyramid_config.levels.clone(),
+                        blend_weights: if pyramid_config.blend_weights.len()
+                            == pyramid_config.levels.len()
+                        {
+                            pyramid_config.blend_weights.clone()
+                        } else {
+                            // Equal weights when the count mismatches.
+                            let n = pyramid_config.levels.len() as f32;
+                            vec![1.0 / n; pyramid_config.levels.len()]
+                        },
+                        ..PyramidConfig::default()
+                    }
+                };
+                Arc::new(
+                    PyramidColorizer::new(raw_backend, config)
+                        .with_cancel(request.cancel_token.clone()),
+                )
             } else {
                 raw_backend
             };
@@ -425,15 +703,21 @@ impl MangaHueEngine {
                 "running inference"
             );
             let cancel = cancel.clone();
+            let use_original = backend.prefers_original_grayscale();
             colored_tiles = if layout.tiles.len() < 2 || parallel_jobs == 1 {
                 let mut acc = Vec::with_capacity(layout.tiles.len());
                 for tile in &layout.tiles {
                     if check_cancel(&cancel) {
                         return Err(anyhow!("colorization cancelled before tile {}", tile.id));
                     }
+                    let source_gray = if use_original {
+                        &preprocess.original_grayscale
+                    } else {
+                        &preprocess.clean_lineart
+                    };
                     let output = backend
                         .colorize(&ModelInput {
-                            lineart: crop_gray(&preprocess.clean_lineart, tile.bbox),
+                            lineart: crop_gray(source_gray, tile.bbox),
                             hint_map: crop_rgb(&hints.hint_map, tile.bbox),
                             hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
                         })
@@ -452,7 +736,11 @@ impl MangaHueEngine {
                 let pool = build_pool(parallel_jobs);
                 let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
                     let tiles = &layout.tiles;
-                    let clean = &preprocess.clean_lineart;
+                    let source_gray = if use_original {
+                        &preprocess.original_grayscale
+                    } else {
+                        &preprocess.clean_lineart
+                    };
                     let hint_map = &hints.hint_map;
                     let hint_mask = &hints.hint_mask;
                     let backend = Arc::clone(&backend);
@@ -465,7 +753,7 @@ impl MangaHueEngine {
                             }
                             backend
                                 .colorize(&ModelInput {
-                                    lineart: crop_gray(clean, tile.bbox),
+                                    lineart: crop_gray(source_gray, tile.bbox),
                                     hint_map: crop_rgb(hint_map, tile.bbox),
                                     hint_mask: crop_gray(hint_mask, tile.bbox),
                                 })
@@ -476,7 +764,7 @@ impl MangaHueEngine {
                 });
                 raw.into_iter().collect::<Result<Vec<_>>>()?
             };
-            emit_progress(&progress, "inference_done", tiles_total, tiles_total, None);
+            emit_progress(&progress, "inference_done", 4, 6, None);
         }
 
         let mut merged = merge_rgb_tiles(size, &colored_tiles)?;
@@ -520,15 +808,46 @@ impl MangaHueEngine {
 
         let postprocess_start = Instant::now();
         emit_progress(&progress, "postprocess", 5, 6, None);
+        let reference_image = request.reference_image_path.as_deref().and_then(|path| {
+            match mangahue_image::load_image(path) {
+                Ok(m) => {
+                    let loaded = m.image.to_rgb8();
+                    // Match the reference to the WORKING page size (the size
+                    // the pipeline actually operates at). Resizing against the
+                    // original full-res size caused a second resample inside
+                    // the transfer and blurred the reference statistics.
+                    let (w, h) = preprocess.original_grayscale.dimensions();
+                    Some(if loaded.dimensions() != (w, h) {
+                        image::imageops::resize(
+                            &loaded,
+                            w,
+                            h,
+                            image::imageops::FilterType::Lanczos3,
+                        )
+                    } else {
+                        loaded
+                    })
+                }
+                Err(err) => {
+                    report.warn(format!(
+                        "reference image {} could not be loaded: {err:#}",
+                        path.display()
+                    ));
+                    None
+                }
+            }
+        });
         let (mut final_image, postprocess_report) = finalize(PostprocessInput {
             colorized: merged,
             original_grayscale: &preprocess.original_grayscale,
             line_mask: &preprocess.line_mask,
-            bubble_mask: &preprocess.bubble_mask,
+            bubble_mask: &bubble_mask,
             tone_mask: Some(&preprocess.tone_mask),
             protected_mask: Some(&preprocess.protected_mask),
-            style: &style,
+            face_mask: face_mask.as_ref(),
+            style: &scene_style,
             config: &config.postprocess,
+            reference_image: reference_image.as_ref(),
         })?;
         report.add_stage_report(
             StageReport::new("postprocess")
@@ -577,6 +896,10 @@ impl MangaHueEngine {
                     postprocess_report.reference_shadow_pixels_shaped as f64,
                 )
                 .metric(
+                    "face_pixels_painted",
+                    postprocess_report.face_pixels_painted as f64,
+                )
+                .metric(
                     "semantic_chroma_restored",
                     postprocess_report.semantic_chroma_restored as f64,
                 )
@@ -605,6 +928,21 @@ impl MangaHueEngine {
                 lock_report.colorized_pixels, lock_report.preserved_pixels
             ));
         }
+        // Evaluate quality at WORKING resolution. All guidance masks
+        // (line/bubble/protected/hint) are working-resolution; evaluating the
+        // full-res image against them produced dimension-mismatched metrics
+        // (hint adherence forced to 0.0, misaligned sampling) on every page
+        // that exceeded max_input_dimension.
+        let quality = mangahue_eval::evaluate_output_with_guidance(
+            &final_image,
+            &preprocess.line_mask,
+            &preprocess.bubble_mask,
+            Some(&preprocess.protected_mask),
+            Some(&hints.hint_map),
+            Some(&hints.hint_mask),
+        );
+        report.director_verdict = Some(director_verdict(&quality, &preprocess.report, &config));
+
         if final_image.dimensions() != manga_image.image.dimensions() {
             let original_gray = manga_image.image.to_luma8();
             final_image = reconstruct_full_resolution(&final_image, &original_gray);
@@ -640,16 +978,6 @@ impl MangaHueEngine {
             )?;
         }
 
-        let quality = mangahue_eval::evaluate_output_with_guidance(
-            &final_image,
-            &preprocess.line_mask,
-            &preprocess.bubble_mask,
-            Some(&preprocess.protected_mask),
-            Some(&hints.hint_map),
-            Some(&hints.hint_mask),
-        );
-        report.director_verdict = Some(director_verdict(&quality, &preprocess.report, &config));
-
         report.total_ms = total_start.elapsed().as_millis();
         let report_path = if config.output.write_report {
             let path = mangahue_image::sibling_with_suffix(&request.output_path, ".report", "json");
@@ -661,30 +989,55 @@ impl MangaHueEngine {
         };
 
         let quality_report_path = report_path.as_ref().map(|path| {
-            let quality_path = path.with_file_name(format!(
+            let qpath = path.with_file_name(format!(
                 "{}.quality.json",
                 path.file_stem()
                     .and_then(|value| value.to_str())
                     .unwrap_or("report")
             ));
-            let _ = fs::write(
-                &quality_path,
-                serde_json::to_string_pretty(&quality).unwrap(),
-            );
-            quality_path
+            if let Err(err) = fs::write(
+                &qpath,
+                serde_json::to_string_pretty(&quality).unwrap_or_default(),
+            ) {
+                report.warn(format!(
+                    "failed to write quality report {}: {err:#}",
+                    qpath.display()
+                ));
+            }
+            qpath
         });
 
         let idempotency_key =
             compute_idempotency_key(&request, &preprocess, &hints, &config, &style);
-        if let Some(report_path) = report_path.as_ref() {
-            if let Some(dir) = request.cache_dir.as_deref() {
-                let cache = ArtifactCache::new(dir);
-                let _ck = CacheKey(idempotency_key.clone());
+        if let Some(dir) = request.cache_dir.as_deref() {
+            let cache = ArtifactCache::new(dir);
+            // Content-addressed entries (dedup) for the report.
+            if let Some(report_path) = report_path.as_ref() {
                 let _ = cache.put_file(
                     report_path,
                     ArtifactKind::QualityReport,
                     Some("application/json".to_string()),
                 );
+            }
+            // Idempotency entries under the caller's key: the colored page
+            // AND the report, so a later identical request can be served
+            // entirely from cache (output image restored, not just a report).
+            if let Some(user_key) = request.idempotency_key.as_deref() {
+                let ck = CacheKey(user_key.to_string());
+                let _ = cache.put_file_as(
+                    &request.output_path,
+                    &ck,
+                    ArtifactKind::ColoredPage,
+                    Some("image/png".to_string()),
+                );
+                if let Some(report_path) = report_path.as_ref() {
+                    let _ = cache.put_file_as(
+                        report_path,
+                        &ck,
+                        ArtifactKind::QualityReport,
+                        Some("application/json".to_string()),
+                    );
+                }
             }
         }
 
@@ -862,13 +1215,14 @@ fn select_backend_for_model(
             "real colorization requires an ONNX model; pass --model path/to/model.onnx or use --mock for pipeline verification"
         ));
     }
+
     #[cfg(feature = "native-onnx")]
     if let Ok(backend) =
         mangahue_inference::RustOnnxBackend::new(model_path, &config.inference.model_metadata_path)
     {
         return Ok(Box::new(backend));
     }
-    Ok(Box::new(OnnxColorizationBackend::new(
+    Ok(Box::new(mangahue_inference::OnnxColorizationBackend::new(
         model_path,
         &config.inference.model_metadata_path,
     )?))
@@ -1086,7 +1440,16 @@ fn build_pool(jobs: usize) -> rayon::ThreadPool {
             warn!(error = %error, "failed to build custom thread pool, falling back to global pool");
             rayon::ThreadPoolBuilder::new()
                 .build()
-                .expect("rayon global pool must always build")
+                .unwrap_or_else(|fallback_error| {
+                    warn!(
+                        error = %fallback_error,
+                        "failed to build any thread pool; running single-threaded"
+                    );
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .expect("a single-threaded rayon pool cannot fail")
+                })
         })
 }
 
@@ -1096,13 +1459,25 @@ fn build_ensembler(
     style: &StyleProfile,
 ) -> Result<Ensembler> {
     let primary: Arc<dyn ColorizationBackend> = Arc::from(select_backend(request, config, style)?);
+    let has_reference = request.reference_image_path.is_some();
     let auxiliaries = request
         .ensemble_model_paths
         .iter()
-        .map(|path| {
-            select_backend_for_model(path, config, request.reference_image_path.as_deref())
-                .map(Arc::<dyn ColorizationBackend>::from)
-                .with_context(|| format!("failed to load ensemble model {}", path.display()))
+        .filter_map(|path| {
+            // Reference-cGAN auxiliaries require a reference image; skip them
+            // gracefully (warn, don't fail the whole job) when none is set.
+            if mangahue_inference::is_reference_cgan_model_dir(path) && !has_reference {
+                tracing::warn!(
+                    model = %path.display(),
+                    "skipping reference-cGAN ensemble model (no reference image set)"
+                );
+                return None;
+            }
+            Some(
+                select_backend_for_model(path, config, request.reference_image_path.as_deref())
+                    .map(Arc::<dyn ColorizationBackend>::from)
+                    .with_context(|| format!("failed to load ensemble model {}", path.display())),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let ensemble_config = EnsembleConfig {

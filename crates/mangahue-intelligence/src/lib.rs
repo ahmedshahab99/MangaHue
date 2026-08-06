@@ -189,6 +189,14 @@ pub fn semantic_region_locks(
         .filter_map(|region| {
             let color = palette.get(&region.class).copied();
             let mode = if region.class == SemanticClass::Speech {
+                // The pixel classifier marks ALL near-white interior pixels
+                // as Speech; on a manga page that is usually the whole paper
+                // background, not speech bubbles. A Preserve lock larger
+                // than half the page would gray out the page when enforced,
+                // so only bubble-sized regions are preserved.
+                if region.coverage > 0.5 {
+                    return None;
+                }
                 RegionLockMode::Preserve
             } else if color.is_some() {
                 RegionLockMode::Colorize

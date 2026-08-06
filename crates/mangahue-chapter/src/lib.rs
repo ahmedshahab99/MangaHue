@@ -53,6 +53,14 @@ pub struct ChapterConsistencyRetry {
     pub tone_drift_threshold: f32,
     #[serde(default = "default_retry_max_pages")]
     pub max_pages: usize,
+    /// How many retries a single page may receive across runs. Without a
+    /// cap, resume runs re-retried the same drifting pages forever.
+    #[serde(default = "default_retry_max_rounds")]
+    pub max_rounds: usize,
+}
+
+pub fn default_retry_max_rounds() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +90,7 @@ impl Default for ChapterConsistencyRetry {
             palette_drift_threshold: default_retry_drift_threshold(),
             tone_drift_threshold: default_retry_tone_threshold(),
             max_pages: default_retry_max_pages(),
+            max_rounds: default_retry_max_rounds(),
         }
     }
 }
@@ -257,7 +266,9 @@ fn start_chapter_job(
         &import_dir,
         request.import_options.clone(),
     )?;
-    let import_manifest_path = request.output_dir.join("mangahue_import_manifest.json");
+    let import_manifest_path = request
+        .output_dir
+        .join(format!("mangahue_import_manifest_{job_id}.json"));
     write_chapter_manifest(&import_manifest, &import_manifest_path)?;
     let now = Utc::now().to_rfc3339();
     let pages = make_pages(&import_manifest, &request.output_dir);
@@ -558,7 +569,22 @@ fn run_consistency_retry(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
-    candidates.truncate(request.consistency_retry.max_pages.max(1));
+    if request.consistency_retry.max_pages > 0 {
+        candidates.truncate(request.consistency_retry.max_pages);
+    } else {
+        candidates.clear();
+    }
+    // A page is never retried more than max_rounds times across all runs:
+    // a retry that did not fix the drift must not be re-executed forever.
+    let max_rounds = request.consistency_retry.max_rounds.max(1);
+    candidates.retain(|(page_index, _)| {
+        manifest
+            .pages
+            .iter()
+            .find(|page| page.index == *page_index)
+            .map(|page| page.consistency_retry_count < max_rounds)
+            .unwrap_or(false)
+    });
 
     let mut retried = 0usize;
     for (page_index, _) in candidates {
@@ -760,8 +786,12 @@ fn save_job_manifest(manifest: &mut ChapterJobManifest, path: &Path) -> Result<(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_string_pretty(manifest)?)
-        .with_context(|| format!("failed to write {}", path.display()))
+    // Atomic write: a crash mid-write must never truncate the live manifest
+    // (a truncated manifest previously forced the whole chapter to restart).
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))
 }
 
 fn recompute_counts(manifest: &mut ChapterJobManifest) {

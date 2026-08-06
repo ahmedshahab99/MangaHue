@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
-use mangahue_ingest::extract_manga_urls;
+use mangahue_ingest::{extract_manga_urls, validate_public_url, SafePublicResolver};
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
@@ -87,6 +87,14 @@ struct Args {
     hint_propagate: bool,
     #[arg(long, help = "Region lock file or per-page lock directory")]
     region_locks: Option<PathBuf>,
+    #[arg(long, help = "Global user hints file (per-chat memory overrides)")]
+    hints: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "configs/palettes",
+        help = "Artist palette directory (configs/palettes/*.yaml)"
+    )]
+    palettes_dir: PathBuf,
     #[arg(long, default_value_t = 2)]
     max_concurrent_jobs: usize,
     #[arg(long, help = "Stop a chapter after the first failed page")]
@@ -126,6 +134,27 @@ struct Message {
     message_id: i64,
     chat: Chat,
     text: Option<String>,
+    caption: Option<String>,
+    photo: Option<Vec<PhotoSize>>,
+    document: Option<Document>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Document {
+    file_id: String,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotoSize {
+    file_id: String,
+    width: i32,
+    height: i32,
+    #[serde(default)]
+    file_size: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,20 +196,36 @@ struct DailyUsage {
 struct PerChatSettings {
     style_path: Option<PathBuf>,
     batch_size: usize,
+    reference_image: Option<PathBuf>,
+    /// Artist palette (configs/palettes/*.yaml) chosen per chat/series.
+    palette_path: Option<PathBuf>,
+    /// Auto-select the artist palette from the page fingerprint.
+    auto_palette: bool,
 }
 
 struct BotState {
     active_jobs: AtomicUsize,
     active_chats: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     per_chat_settings: Mutex<HashMap<i64, PerChatSettings>>,
+    usage_lock: Mutex<()>,
     usage_path: PathBuf,
     daily_limit: usize,
     styles_dir: Option<PathBuf>,
+    palettes_dir: PathBuf,
+}
+
+/// Lock that recovers from poisoning: a panic in a worker thread must never
+/// wedge the whole bot (a poisoned lock would otherwise panic every later
+/// acquirer and permanently leak chat slots).
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl BotState {
     fn try_start(&self, chat_id: i64, limit: usize) -> Option<Arc<AtomicBool>> {
-        let mut chats = self.active_chats.lock().expect("active chat lock poisoned");
+        let mut chats = lock_or_recover(&self.active_chats);
         if chats.contains_key(&chat_id) || self.active_jobs.load(Ordering::Acquire) >= limit.max(1)
         {
             return None;
@@ -192,22 +237,16 @@ impl BotState {
     }
 
     fn finish(&self, chat_id: i64) {
-        self.active_chats
-            .lock()
-            .expect("active chat lock poisoned")
-            .remove(&chat_id);
+        lock_or_recover(&self.active_chats).remove(&chat_id);
         self.active_jobs.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn is_active(&self, chat_id: i64) -> bool {
-        self.active_chats
-            .lock()
-            .expect("active chat lock poisoned")
-            .contains_key(&chat_id)
+        lock_or_recover(&self.active_chats).contains_key(&chat_id)
     }
 
     fn cancel(&self, chat_id: i64) -> bool {
-        let chats = self.active_chats.lock().expect("active chat lock poisoned");
+        let chats = lock_or_recover(&self.active_chats);
         let Some(cancel) = chats.get(&chat_id) else {
             return false;
         };
@@ -216,59 +255,104 @@ impl BotState {
     }
 
     fn get_settings(&self, chat_id: i64, default_batch: usize) -> PerChatSettings {
-        let settings = self
-            .per_chat_settings
-            .lock()
-            .expect("settings lock poisoned");
+        let settings = lock_or_recover(&self.per_chat_settings);
         settings.get(&chat_id).cloned().unwrap_or(PerChatSettings {
             style_path: None,
             batch_size: default_batch,
+            reference_image: None,
+            palette_path: None,
+            auto_palette: false,
         })
     }
 
-    fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
-        let mut settings = self
-            .per_chat_settings
-            .lock()
-            .expect("settings lock poisoned");
+    fn set_reference_image(&self, chat_id: i64, path: PathBuf) {
+        let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
             style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            reference_image: None,
+            palette_path: None,
+            auto_palette: false,
+        });
+        entry.reference_image = Some(path);
+    }
+
+    fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
+        let mut settings = lock_or_recover(&self.per_chat_settings);
+        let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
+            style_path: None,
+            batch_size: DEFAULT_BATCH_SIZE,
+            reference_image: None,
+            palette_path: None,
+            auto_palette: false,
         });
         entry.style_path = path;
     }
 
-    fn set_batch_size(&self, chat_id: i64, size: usize) {
-        let mut settings = self
-            .per_chat_settings
-            .lock()
-            .expect("settings lock poisoned");
+    fn set_palette(&self, chat_id: i64, path: Option<PathBuf>, auto: bool) {
+        let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
             style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
+            reference_image: None,
+            palette_path: None,
+            auto_palette: false,
+        });
+        entry.palette_path = path;
+        entry.auto_palette = auto;
+    }
+
+    fn set_batch_size(&self, chat_id: i64, size: usize) {
+        let mut settings = lock_or_recover(&self.per_chat_settings);
+        let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
+            style_path: None,
+            batch_size: DEFAULT_BATCH_SIZE,
+            reference_image: None,
+            palette_path: None,
+            auto_palette: false,
         });
         entry.batch_size = size.clamp(1, 10);
     }
 
-    fn load_usage(&self) -> DailyUsage {
+    /// Load usage, resetting the counter whenever the stored date is not
+    /// today: the quota is DAILY, not cumulative.
+    fn load_usage_locked(&self) -> DailyUsage {
         let today = Utc::now().format("%Y-%m-%d").to_string();
-        match std::fs::read_to_string(&self.usage_path) {
+        let usage = match std::fs::read_to_string(&self.usage_path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|_| DailyUsage {
-                date: today,
+                date: today.clone(),
                 pages: HashMap::new(),
             }),
             Err(_) => DailyUsage {
-                date: today,
+                date: today.clone(),
                 pages: HashMap::new(),
             },
+        };
+        if usage.date == today {
+            usage
+        } else {
+            DailyUsage {
+                date: today,
+                pages: HashMap::new(),
+            }
+        }
+    }
+
+    fn write_usage_atomic(&self, json: &str) {
+        let tmp = self.usage_path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.usage_path);
         }
     }
 
     fn record_pages(&self, chat_id: i64, count: usize) {
-        let mut usage = self.load_usage();
+        // Serialize the read-modify-write so concurrent jobs cannot lose
+        // updates (which would undercount and bypass the quota).
+        let _guard = lock_or_recover(&self.usage_lock);
+        let mut usage = self.load_usage_locked();
         *usage.pages.entry(chat_id).or_insert(0) += count;
         if let Ok(json) = serde_json::to_string(&usage) {
-            let _ = std::fs::write(&self.usage_path, json);
+            self.write_usage_atomic(&json);
         }
     }
 
@@ -276,13 +360,15 @@ impl BotState {
         if self.daily_limit == 0 {
             return usize::MAX;
         }
-        let usage = self.load_usage();
+        let _guard = lock_or_recover(&self.usage_lock);
+        let usage = self.load_usage_locked();
         let used = usage.pages.get(&chat_id).copied().unwrap_or(0);
         self.daily_limit.saturating_sub(used)
     }
 
     fn pages_used_today(&self, chat_id: i64) -> usize {
-        let usage = self.load_usage();
+        let _guard = lock_or_recover(&self.usage_lock);
+        let usage = self.load_usage_locked();
         usage.pages.get(&chat_id).copied().unwrap_or(0)
     }
 
@@ -315,10 +401,7 @@ impl BotState {
     }
 
     fn resolve_style_path(&self, chat_id: i64, default_style: &Option<PathBuf>) -> Option<PathBuf> {
-        let settings = self
-            .per_chat_settings
-            .lock()
-            .expect("settings lock poisoned");
+        let settings = lock_or_recover(&self.per_chat_settings);
         let style_path = settings
             .get(&chat_id)
             .and_then(|s| s.style_path.clone())
@@ -368,6 +451,7 @@ fn main() -> Result<()> {
         .user_agent("MangaHueTelegram/0.2")
         .build()
         .context("failed to build Telegram HTTP client")?;
+    let fetch_client = build_fetch_client()?;
 
     let identity = configure_bot(&client, &token)?;
     tracing::info!(
@@ -377,6 +461,9 @@ fn main() -> Result<()> {
     );
 
     std::fs::create_dir_all(&args.work_dir).context("failed to create work_dir")?;
+    std::fs::create_dir_all(args.work_dir.join("memory")).context("failed to create memory dir")?;
+    std::fs::create_dir_all(args.work_dir.join("references"))
+        .context("failed to create references dir")?;
     let scratch_dir = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     std::fs::create_dir_all(scratch_dir).context("failed to create scratch_dir")?;
     if args.scratch_dir.is_some() {
@@ -403,15 +490,21 @@ fn main() -> Result<()> {
         active_jobs: AtomicUsize::new(0),
         active_chats: Mutex::new(HashMap::new()),
         per_chat_settings: Mutex::new(HashMap::new()),
+        usage_lock: Mutex::new(()),
         usage_path,
         daily_limit: args.daily_limit,
         styles_dir,
+        palettes_dir: args.palettes_dir.clone(),
     });
+
+    // Re-hydrate per-chat reference photos after a restart so users keep
+    // their saved style reference.
+    restore_reference_photos(&state, &args.work_dir.join("references"));
 
     let mut offset = None;
     let mut backoff = Duration::from_secs(1);
     loop {
-        match poll_once(&client, &token, &args, &state, &mut offset) {
+        match poll_once(&client, &fetch_client, &token, &args, &state, &mut offset) {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => {
                 tracing::error!("poll error (will retry in {}s): {e}", backoff.as_secs());
@@ -420,6 +513,29 @@ fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// HTTP client for fetching user-supplied content. Every redirect hop is
+/// re-validated against the SSRF guard so a redirect to an internal host
+/// (e.g. cloud metadata 169.254.169.254) is aborted.
+fn build_fetch_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(45))
+        // DNS-rebinding guard: the validating resolver applies to the
+        // initial request and every redirect hop, and the connection uses
+        // exactly the addresses it validated.
+        .dns_resolver(std::sync::Arc::new(SafePublicResolver))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            match validate_public_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(error) => attempt.error(error),
+            }
+        }))
+        .build()
+        .context("failed to build fetch client")
 }
 
 fn resolve_styles_dir(style_arg: &Option<PathBuf>) -> Option<PathBuf> {
@@ -435,6 +551,7 @@ fn resolve_styles_dir(style_arg: &Option<PathBuf>) -> Option<PathBuf> {
 
 fn poll_once(
     client: &Client,
+    fetch_client: &Client,
     token: &str,
     args: &Args,
     state: &Arc<BotState>,
@@ -442,72 +559,206 @@ fn poll_once(
 ) -> Result<()> {
     let updates = get_updates(client, token, *offset, args.poll_timeout_seconds)?;
     for update in updates {
-        *offset = Some(update.update_id + 1);
-
-        if let Some(cb) = update.callback_query {
-            handle_callback(client, token, args, state, cb)?;
-            continue;
+        let update_id = update.update_id;
+        // A failing update must never drop the rest of the batch: log and
+        // continue, then advance the offset so Telegram stops redelivering.
+        if let Err(error) = process_update(client, fetch_client, token, args, state, update) {
+            tracing::error!("update {update_id} failed: {error:#}");
         }
+        *offset = Some(update_id + 1);
+    }
+    Ok(())
+}
 
-        let Some(message) = update.message else {
-            continue;
-        };
+fn process_update(
+    client: &Client,
+    fetch_client: &Client,
+    token: &str,
+    args: &Args,
+    state: &Arc<BotState>,
+    update: Update,
+) -> Result<()> {
+    if let Some(cb) = update.callback_query {
+        handle_callback(client, token, args, state, cb)?;
+        return Ok(());
+    }
 
-        let Some(text) = message.text.as_deref() else {
-            if message.text.is_none() {
-                send_message(
-                    client,
-                    token,
-                    message.chat.id,
-                    "Send an authorized manga, webtoon, or image URL and I will colorize it.",
-                    None,
-                )?;
+    let Some(message) = update.message else {
+        return Ok(());
+    };
+
+    let chat_id = message.chat.id;
+    let caption = message
+        .caption
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    // A photo/document message is COLORIZED by default; with a caption
+    // starting with "ref" or "style" it sets the chat's reference look.
+    // Must be checked BEFORE the text check: photos have text == None.
+    let image_file_id: Option<String> = message
+        .photo
+        .as_ref()
+        .and_then(|photos| photos.iter().max_by_key(|p| p.file_size.unwrap_or(0)))
+        .map(|p| p.file_id.clone())
+        .or_else(|| {
+            message.document.as_ref().and_then(|doc| {
+                let is_image = doc
+                    .mime_type
+                    .as_deref()
+                    .map(|m| m.starts_with("image/"))
+                    .unwrap_or(false);
+                if is_image {
+                    Some(doc.file_id.clone())
+                } else {
+                    None
+                }
+            })
+        });
+
+    if let Some(file_id) = image_file_id {
+        if caption.starts_with("ref") || caption.starts_with("style") {
+            match save_reference_photo(client, token, args, state, chat_id, &file_id) {
+                Ok(_) => {
+                    let _ = send_message(
+                            client,
+                            token,
+                            chat_id,
+                            "Reference style photo saved. Send a photo or manga link to colorize; pages will be graded to match this look. Use /resetref to clear it.",
+                            None,
+                        );
+                }
+                Err(error) => {
+                    let _ = send_message(
+                        client,
+                        token,
+                        chat_id,
+                        &format!("Could not save reference photo: {error}"),
+                        None,
+                    );
+                }
             }
-            continue;
-        };
-
-        let chat_id = message.chat.id;
-        let text = text.trim();
-
-        if text.starts_with('/') {
-            handle_command(
-                client,
-                token,
-                args,
-                state,
-                chat_id,
-                text,
-                message.message_id,
-            )?;
-            continue;
+            return Ok(());
         }
 
-        let url = match first_url(text) {
-            Some(u) => u,
-            None => {
-                send_message(
+        // Colorize the image directly.
+        if state.remaining_pages_today(chat_id) == 0 {
+            send_message(
                     client,
                     token,
                     chat_id,
-                    "Send an authorized manga chapter or image URL. Use /help for available commands.",
+                    &format!(
+                        "Daily limit of {} pages reached. Try again tomorrow or use /stats to see your usage.",
+                        state.daily_limit
+                    ),
                     None,
                 )?;
-                continue;
-            }
-        };
-
-        let validation = validate_user_url(&url);
-        if let Some(warning) = validation.warning {
-            send_message(client, token, chat_id, &warning, None)?;
+            return Ok(());
         }
-        if let Some(error) = validation.error {
-            send_message(client, token, chat_id, &error, None)?;
-            continue;
-        }
-
-        let remaining = state.remaining_pages_today(chat_id);
-        if remaining == 0 {
+        let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
             send_message(
+                    client,
+                    token,
+                    chat_id,
+                    "A MangaHue job is already active for this chat. Wait for it to finish, or use /cancel.",
+                    None,
+                )?;
+            return Ok(());
+        };
+        let client = client.clone();
+        let token = token.to_string();
+        let args = args.clone();
+        let state = Arc::clone(state);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_photo(
+                    &client,
+                    &token,
+                    &args,
+                    &state,
+                    chat_id,
+                    &file_id,
+                    cancel_token,
+                )
+            }));
+            // Always release the chat slot, even on error or panic.
+            state.finish(chat_id);
+            if let Err(error) = result {
+                let message = if let Some(payload) = error.downcast_ref::<&str>() {
+                    (*payload).to_string()
+                } else if let Some(payload) = error.downcast_ref::<String>() {
+                    payload.clone()
+                } else {
+                    "internal error".to_string()
+                };
+                let _ = send_message(
+                    &client,
+                    &token,
+                    chat_id,
+                    &format!("Could not colorize this image: {message}"),
+                    None,
+                );
+            }
+        });
+        return Ok(());
+    }
+
+    let Some(text) = message.text.as_deref() else {
+        if message.text.is_none() {
+            send_message(
+                client,
+                token,
+                message.chat.id,
+                "Send an image, a manga chapter link, or an image URL and I will colorize it.",
+                None,
+            )?;
+        }
+        return Ok(());
+    };
+
+    let text = text.trim();
+
+    if text.starts_with('/') {
+        handle_command(
+            client,
+            token,
+            args,
+            state,
+            chat_id,
+            text,
+            message.message_id,
+        )?;
+        return Ok(());
+    }
+
+    let url = match first_url(text) {
+        Some(u) => u,
+        None => {
+            send_message(
+                client,
+                token,
+                chat_id,
+                "Send an authorized manga chapter or image URL. Use /help for available commands.",
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+
+    let validation = validate_user_url(&url);
+    if let Some(warning) = validation.warning {
+        send_message(client, token, chat_id, &warning, None)?;
+    }
+    if let Some(error) = validation.error {
+        send_message(client, token, chat_id, &error, None)?;
+        return Ok(());
+    }
+
+    let remaining = state.remaining_pages_today(chat_id);
+    if remaining == 0 {
+        send_message(
                 client,
                 token,
                 chat_id,
@@ -517,39 +768,56 @@ fn poll_once(
                 ),
                 None,
             )?;
-            continue;
-        }
-
-        let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
-            send_message(
-                client,
-                token,
-                chat_id,
-                "A MangaHue job is already active for this chat, or the worker pool is full.",
-                None,
-            )?;
-            continue;
-        };
-
-        let client = client.clone();
-        let token = token.to_string();
-        let args = args.clone();
-        let state = Arc::clone(state);
-        std::thread::spawn(move || {
-            if let Err(error) =
-                handle_link(&client, &token, &args, &state, chat_id, &url, cancel_token)
-            {
-                let _ = send_message(
-                    &client,
-                    &token,
-                    chat_id,
-                    &format!("MangaHue could not finish this link: {error}"),
-                    None,
-                );
-            }
-            state.finish(chat_id);
-        });
+        return Ok(());
     }
+
+    let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "A MangaHue job is already active for this chat, or the worker pool is full.",
+            None,
+        )?;
+        return Ok(());
+    };
+
+    let client = client.clone();
+    let fetch_client = fetch_client.clone();
+    let token = token.to_string();
+    let args = args.clone();
+    let state = Arc::clone(state);
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_link(
+                &client,
+                &fetch_client,
+                &token,
+                &args,
+                &state,
+                chat_id,
+                &url,
+                cancel_token,
+            )
+        }));
+        state.finish(chat_id);
+        if let Err(error) = result {
+            let message = if let Some(payload) = error.downcast_ref::<&str>() {
+                (*payload).to_string()
+            } else if let Some(payload) = error.downcast_ref::<String>() {
+                payload.clone()
+            } else {
+                "internal error".to_string()
+            };
+            let _ = send_message(
+                &client,
+                &token,
+                chat_id,
+                &format!("MangaHue could not finish this link: {message}"),
+                None,
+            );
+        }
+    });
     Ok(())
 }
 
@@ -575,9 +843,13 @@ fn handle_command(
         "/status" => cmd_status(client, token, state, chat_id),
         "/cancel" => cmd_cancel(client, token, state, chat_id),
         "/style" => cmd_style(client, token, state, chat_id, &arg),
+        "/palette" => cmd_palette(client, token, state, chat_id, &arg),
         "/batch" => cmd_batch(client, token, state, chat_id, &arg, args.batch_size),
         "/stats" => cmd_stats(client, token, state, chat_id),
         "/clean" => cmd_clean(client, token, state, args, chat_id),
+        "/resetref" => cmd_reset_reference(client, token, state, chat_id),
+        "/memory" => cmd_memory(client, token, args, chat_id),
+        "/color" => cmd_color(client, token, args, chat_id, &arg),
         _ => {
             send_message(
                 client,
@@ -592,9 +864,389 @@ fn handle_command(
 }
 
 fn cmd_start(client: &Client, token: &str, chat_id: i64) -> Result<()> {
-    let text = "Welcome to MangaHue. Send an authorized manga chapter or image URL and I will colorize it.\n\n\
+    let text = "Welcome to MangaHue. Send a photo, a manga chapter link, or an image URL and I will colorize it in soft cel-shaded anime style.\n\n\
                 Use /help to learn about all available commands.";
     send_message(client, token, chat_id, text, None)?;
+    Ok(())
+}
+
+fn cmd_reset_reference(
+    client: &Client,
+    token: &str,
+    state: &Arc<BotState>,
+    chat_id: i64,
+) -> Result<()> {
+    state.set_reference_image(chat_id, PathBuf::new());
+    send_message(
+        client,
+        token,
+        chat_id,
+        "Reference style photo cleared. Pages will use the default grading.",
+        None,
+    )?;
+    Ok(())
+}
+
+fn cmd_memory(client: &Client, token: &str, args: &Args, chat_id: i64) -> Result<()> {
+    let memory = args
+        .work_dir
+        .join("memory")
+        .join(format!("chat_{chat_id}.hints.json"));
+    let text = if memory.is_file() {
+        let size = std::fs::metadata(&memory).map(|m| m.len()).unwrap_or(0);
+        format!(
+            "Your color memory is active ({size} bytes of learned hints). It is applied automatically to every page you colorize. Corrections will refine it over time."
+        )
+    } else {
+        "No learned color memory yet. It builds automatically from your corrections over time."
+            .to_string()
+    };
+    send_message(client, token, chat_id, &text, None)?;
+    Ok(())
+}
+
+/// /color <x> <y> <radius> #RRGGBB â€” add a color memory hint (normalized 0-1 coords).
+fn cmd_color(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str) -> Result<()> {
+    let parts: Vec<&str> = arg.split_whitespace().collect();
+    if parts.len() < 4 {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "Usage: /color <x> <y> <radius> <hex>  â€” e.g. /color 0.5 0.3 0.05 #f5c9a8 (coordinates are 0-1, relative to the page)",
+            None,
+        )?;
+        return Ok(());
+    }
+    let x: f32 = parts[0].parse().unwrap_or(-1.0);
+    let y: f32 = parts[1].parse().unwrap_or(-1.0);
+    let radius: f32 = parts[2].parse().unwrap_or(-1.0);
+    let hex = parts[3].trim_start_matches('#');
+    if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) || !(0.0..=1.0).contains(&radius) {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "Coordinates and radius must be between 0 and 1.",
+            None,
+        )?;
+        return Ok(());
+    }
+    let rgb = u32::from_str_radix(hex, 16);
+    let rgb = match rgb {
+        Ok(v) if v <= 0xFF_FFFF => v,
+        _ => {
+            send_message(
+                client,
+                token,
+                chat_id,
+                "Invalid hex color. Use #RRGGBB, e.g. #f5c9a8.",
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+    let (r, g, b) = ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+
+    let memory_path = args
+        .work_dir
+        .join("memory")
+        .join(format!("chat_{chat_id}.hints.json"));
+    let mut file: mangahue_core::UserHintFile = std::fs::read_to_string(&memory_path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    file.hints.push(mangahue_core::ColorHint {
+        x: (x * 1000.0) as u32,
+        y: (y * 1000.0) as u32,
+        radius: (radius * 1000.0) as u32,
+        color: mangahue_core::ColorRgb { r, g, b },
+        label: Some("user_memory".to_string()),
+        strength: 0.9,
+        source: mangahue_core::HintSource::User,
+    });
+    std::fs::write(&memory_path, serde_json::to_string_pretty(&file)?)
+        .context("failed to save color memory")?;
+    send_message(
+        client,
+        token,
+        chat_id,
+        &format!(
+            "Color memory saved: #{:02X}{:02X}{:02X} at ({:.2}, {:.2}) r={:.2}. It applies to your future pages.",
+            r, g, b, x, y, radius
+        ),
+        None,
+    )?;
+    Ok(())
+}
+
+/// Download a Telegram photo into the chat's reference file and register it.
+fn save_reference_photo(
+    client: &Client,
+    token: &str,
+    args: &Args,
+    state: &Arc<BotState>,
+    chat_id: i64,
+    file_id: &str,
+) -> Result<PathBuf> {
+    let bytes = fetch_telegram_file(client, token, file_id)?;
+    let refs_dir = args.work_dir.join("references");
+    std::fs::create_dir_all(&refs_dir).context("failed to create references dir")?;
+    let local_path = refs_dir.join(format!("chat_{chat_id}.jpg"));
+    std::fs::write(&local_path, &bytes).context("failed to save reference photo")?;
+
+    state.set_reference_image(chat_id, local_path.clone());
+    Ok(local_path)
+}
+
+/// Download a Telegram file (photo/document) by file_id to bytes.
+fn fetch_telegram_file(client: &Client, token: &str, file_id: &str) -> Result<Vec<u8>> {
+    const MAX_TELEGRAM_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    #[derive(Debug, Deserialize)]
+    struct FileEnvelope {
+        ok: bool,
+        result: Option<FileResult>,
+        description: Option<String>,
+    }
+    #[derive(Debug, Deserialize)]
+    struct FileResult {
+        file_path: Option<String>,
+    }
+
+    let envelope: FileEnvelope = client
+        .get(telegram_url(token, "getFile"))
+        .query(&[("file_id", file_id)])
+        .send()
+        .context("failed to call getFile")?
+        .error_for_status()
+        .context("Telegram getFile failed")?
+        .json()
+        .context("failed to parse getFile response")?;
+    let remote_path = envelope
+        .result
+        .and_then(|r| r.file_path)
+        .ok_or_else(|| anyhow::anyhow!("Telegram did not return a file path"))?;
+
+    let url = format!("https://api.telegram.org/file/bot{token}/{remote_path}");
+    // Cap the body: an unbounded read lets a huge upload fill RAM before
+    // any size check runs.
+    let mut response = client
+        .get(&url)
+        .send()
+        .context("failed to download Telegram file")?
+        .error_for_status()
+        .context("Telegram file download failed")?;
+    use std::io::Read as _;
+    let mut reader = response.take(MAX_TELEGRAM_FILE_BYTES + 1);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .context("failed to read Telegram file body")?;
+    if bytes.len() as u64 > MAX_TELEGRAM_FILE_BYTES {
+        anyhow::bail!("Telegram file exceeds {MAX_TELEGRAM_FILE_BYTES} bytes");
+    }
+    Ok(bytes)
+}
+
+/// Colorize a single image sent as a photo/document and send the result back.
+fn handle_photo(
+    client: &Client,
+    token: &str,
+    args: &Args,
+    state: &Arc<BotState>,
+    chat_id: i64,
+    file_id: &str,
+    cancel_token: Arc<AtomicBool>,
+) -> Result<()> {
+    let job_id = Uuid::new_v4().to_string();
+    let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
+    let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
+    let _workspace = JobWorkspace::new(job_dir.clone());
+    let downloads_dir = job_dir.join("downloads");
+    let output_dir = job_dir.join("colored");
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    std::fs::create_dir_all(&downloads_dir)
+        .with_context(|| format!("failed to create {}", downloads_dir.display()))?;
+
+    let cancel_kb = InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton::new("Cancel job").callback_data("cancel_job")
+        ]],
+    };
+    let cancel_markup = serde_json::to_string(&cancel_kb).unwrap_or_default();
+
+    send_chat_action(client, token, chat_id, "typing")?;
+    let status_msg_id = send_message(
+        client,
+        token,
+        chat_id,
+        "Got it! Coloring your imageâ€¦ This takes about 3 minutes. You can cancel anytime.",
+        Some(&cancel_markup),
+    )?;
+
+    if cancel_token.load(Ordering::Acquire) {
+        let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
+        cleanup_dir(&job_dir);
+        return Ok(());
+    }
+
+    // Download + validate the image.
+    let bytes = fetch_telegram_file(client, token, file_id)?;
+    if bytes.len() > args.max_bytes_per_page as usize {
+        cleanup_dir(&job_dir);
+        anyhow::bail!("image exceeds {} bytes", args.max_bytes_per_page);
+    }
+    let local_path = downloads_dir.join("image.jpg");
+    std::fs::write(&local_path, &bytes).context("failed to save uploaded image")?;
+    // Header-only dimension validation BEFORE decode: a small file with a
+    // huge IHDR would otherwise allocate gigabytes at decode time.
+    let (img_width, img_height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .context("uploaded file is not a readable image")?
+        .into_dimensions()
+        .context("uploaded file has invalid dimensions")?;
+    if img_width > 50_000
+        || img_height > 50_000
+        || img_width as u64 * img_height as u64 > 120_000_000
+    {
+        cleanup_dir(&job_dir);
+        anyhow::bail!("image dimensions exceed security limits");
+    }
+    let image = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .context("uploaded file is not a readable image")?
+        .decode()
+        .context("uploaded file is not a readable image")?;
+    if image.width() < 64 || image.height() < 64 {
+        cleanup_dir(&job_dir);
+        anyhow::bail!("that image is too small to colorize (minimum 64x64 px)");
+    }
+
+    let settings = state.get_settings(chat_id, args.batch_size);
+    let style_path = state.resolve_style_path(chat_id, &args.style);
+    let reference_image = settings
+        .reference_image
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let output_path = output_dir.join("image.png");
+    let (progress_sender, mut progress_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<ProgressUpdate>();
+    let progress_client = client.clone();
+    let progress_token = token.to_string();
+    let progress_msg_id2 = status_msg_id;
+    let progress_chat = chat_id;
+    let progress_markup = cancel_markup.clone();
+    let progress_thread = std::thread::spawn(move || {
+        let mut last_stage = String::new();
+        let mut last_percent = -10i32;
+        while let Some(update) = progress_receiver.blocking_recv() {
+            let percent = update.percent.round() as i32;
+            if update.stage != last_stage || percent >= last_percent + 10 || percent >= 100 {
+                let text = format!(
+                    "Coloring your image: {} ({}%)",
+                    humanize_stage(&update.stage),
+                    percent.clamp(0, 100)
+                );
+                let _ = edit_message_with_markup(
+                    &progress_client,
+                    &progress_token,
+                    progress_chat,
+                    progress_msg_id2,
+                    &text,
+                    Some(&progress_markup),
+                );
+                last_stage = update.stage;
+                last_percent = percent;
+            }
+        }
+    });
+
+    let engine = MangaHueEngine::new();
+    let result = engine.colorize(ColorizeRequest {
+        input_path: local_path.clone(),
+        output_path: output_path.clone(),
+        model_path: args.model.clone(),
+        reference_image_path: reference_image,
+        enable_ensemble: !args.ensemble_models.is_empty(),
+        ensemble_model_paths: args.ensemble_models.clone(),
+        config_path: args.config.clone(),
+        preset_path: args.preset.clone(),
+        style_path: style_path.clone(),
+        project_path: args.project.clone(),
+        region_locks_path: None,
+        user_hints_path: resolve_user_hints(args, chat_id, "image"),
+        use_mock_backend: args.mock,
+        pyramid_enabled: args.pyramid,
+        hint_propagation_enabled: args.hint_propagate,
+        palette_path: settings.palette_path.clone(),
+        auto_palette: settings.auto_palette,
+        cancel_token: Some(Arc::clone(&cancel_token)),
+        progress_sender: Some(progress_sender),
+        ..ColorizeRequest::default()
+    });
+
+    let _ = progress_thread.join();
+
+    match result {
+        Ok(colorize_result) => {
+            if cancel_token.load(Ordering::Acquire) {
+                let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
+                cleanup_dir(&job_dir);
+                return Ok(());
+            }
+            let caption = format!(
+                "MangaHue | {}",
+                colorize_result
+                    .report
+                    .director_verdict
+                    .unwrap_or_else(|| "colored".to_string())
+            );
+            let delivery_path =
+                prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+            send_chat_action(client, token, chat_id, "upload_document")?;
+            if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption) {
+                tracing::error!(error = %e, "send failed");
+            }
+            if delivery_path != output_path {
+                let _ = std::fs::remove_file(&delivery_path);
+            }
+            let _ = std::fs::remove_file(&output_path);
+            let _ = std::fs::remove_file(&local_path);
+            state.record_pages(chat_id, 1);
+            let _ = edit_message_with_markup(
+                client,
+                token,
+                chat_id,
+                status_msg_id,
+                "Done! Send another photo or a manga chapter link to keep going.",
+                Some(r#"{"inline_keyboard":[]}"#),
+            );
+        }
+        Err(error) => {
+            if cancel_token.load(Ordering::Acquire) {
+                let _ = edit_message_with_markup(
+                    client,
+                    token,
+                    chat_id,
+                    status_msg_id,
+                    "Cancelled.",
+                    Some(r#"{"inline_keyboard":[]}"#),
+                );
+            } else {
+                let _ = edit_message_with_markup(
+                    client,
+                    token,
+                    chat_id,
+                    status_msg_id,
+                    &format!("Could not colorize this image: {error}"),
+                    Some(r#"{"inline_keyboard":[]}"#),
+                );
+            }
+        }
+    }
+    cleanup_dir(&job_dir);
     Ok(())
 }
 
@@ -619,9 +1271,12 @@ fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -
                 /batch \\- Show current batch size\n\
                 /batch _N_ \\- Set batch size \\(1\\-10, default 10\\)\n\
                 /stats \\- Show your daily page usage\n\
-                /clean \\- Delete all your job data from the server\n\n\
+                /clean \\- Delete all your job data from the server\n\
+                /resetref \\- Clear your reference style photo\n\n\
                 *How it works:*\n\
-                Send any manga chapter URL or direct image link\\. The bot downloads pages, colorizes them in batches of 10, and sends them back as media groups\\.\n\n\
+                Send a photo, a manga chapter URL, or a direct image link\\. The bot colorizes it in soft cel\\-shaded anime style and sends the result back\\.\n\n\
+                *Optional reference style:*\n\
+                Send a \\(colored\\) photo with caption \\`ref\\` to grade future pages toward that look\\. Use /resetref to clear it\\. Without it, pages get the default soft cel style\\.\n\n\
                 *Supported URL types:*\n\
                 \\- Manga reader chapter URLs \\(any site with page images\\)\n\
                 \\- Direct image URLs \\(\\.png, \\.jpg, \\.webp, etc\\.\\)\n\n\
@@ -649,6 +1304,99 @@ fn cmd_cancel(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64)
         "No active MangaHue job to cancel."
     };
     send_message(client, token, chat_id, status, None)?;
+    Ok(())
+}
+
+/// /palette — choose the artist color palette for this chat (per-series
+/// color memory). "auto" picks the palette from each page's fingerprint.
+fn cmd_palette(
+    client: &Client,
+    token: &str,
+    state: &Arc<BotState>,
+    chat_id: i64,
+    arg: &str,
+) -> Result<()> {
+    let arg = arg.trim();
+    let dir = &state.palettes_dir;
+    if !arg.is_empty() {
+        match arg.to_ascii_lowercase().as_str() {
+            "default" | "off" | "reset" => {
+                state.set_palette(chat_id, None, false);
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    "Palette reset to the style default.",
+                    None,
+                )?;
+                return Ok(());
+            }
+            "auto" => {
+                state.set_palette(chat_id, None, true);
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    "Auto palette enabled: each page's fingerprint picks its artist palette (seinen/shonen/shojo/fantasy/webtoon).",
+                    None,
+                )?;
+                return Ok(());
+            }
+            _ => {
+                let candidate = dir.join(format!("{arg}.yaml"));
+                if candidate.is_file() {
+                    state.set_palette(chat_id, Some(candidate), false);
+                    send_message(
+                        client,
+                        token,
+                        chat_id,
+                        &format!("Artist palette set to *{arg}* for this series.",),
+                        Some("MarkdownV2"),
+                    )?;
+                    return Ok(());
+                }
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    &format!("Palette '{arg}' not found. Use /palette to see available palettes."),
+                    None,
+                )?;
+                return Ok(());
+            }
+        }
+    }
+
+    // List the artist palettes from the palette directory.
+    let mut names: Vec<String> = Vec::new();
+    if dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "yaml").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    if names.is_empty() {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "No artist palettes configured.",
+            None,
+        )?;
+        return Ok(());
+    }
+    let text = format!(
+        "Available artist palettes (each series has its own color vision):\n{}\n\nUse /palette <name> to set it for this series, /palette auto for automatic selection, /palette default to reset.",
+        names.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n")
+    );
+    send_message(client, token, chat_id, &text, None)?;
     Ok(())
 }
 
@@ -847,21 +1595,20 @@ fn cmd_clean(
     }
 
     let chat_dir = args.work_dir.join(chat_id.to_string());
+    let ref_file = args
+        .work_dir
+        .join("references")
+        .join(format!("chat_{chat_id}.jpg"));
+    let mem_file = args
+        .work_dir
+        .join("memory")
+        .join(format!("chat_{chat_id}.hints.json"));
+    let mut removed_any = false;
+
     if chat_dir.exists() {
         match std::fs::remove_dir_all(&chat_dir) {
             Ok(()) => {
-                let _ = state
-                    .per_chat_settings
-                    .lock()
-                    .expect("settings lock poisoned")
-                    .remove(&chat_id);
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    "All your job data has been cleaned up.",
-                    None,
-                )?;
+                removed_any = true;
             }
             Err(e) => {
                 send_message(
@@ -873,6 +1620,27 @@ fn cmd_clean(
                 )?;
             }
         }
+    }
+    if ref_file.exists() {
+        let _ = std::fs::remove_file(&ref_file);
+        removed_any = true;
+    }
+    if mem_file.exists() {
+        let _ = std::fs::remove_file(&mem_file);
+        removed_any = true;
+    }
+    {
+        let _ = lock_or_recover(&state.per_chat_settings).remove(&chat_id);
+    }
+
+    if removed_any {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "All your job data, reference photo, and color memory have been cleaned up.",
+            None,
+        )?;
     } else {
         send_message(client, token, chat_id, "No job data found to clean.", None)?;
     }
@@ -886,7 +1654,9 @@ fn handle_callback(
     state: &Arc<BotState>,
     cb: CallbackQuery,
 ) -> Result<()> {
-    let chat_id = cb.from.id;
+    // Prefer the chat the button was attached to; in group chats cb.from.id
+    // is the pressing user, not the chat.
+    let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
 
     let Some(data) = cb.data.as_deref() else {
         answer_callback_query(client, token, &cb.id, None, None)?;
@@ -1013,18 +1783,11 @@ fn validate_user_url(url: &str) -> UrlValidation {
         };
     }
 
-    let host = parsed.host_str().unwrap_or("");
-    let host_lower = host.to_ascii_lowercase();
-
-    if matches!(
-        host_lower.as_str(),
-        "localhost" | "localhost.localdomain" | "127.0.0.1"
-    ) || host_lower.starts_with("192.168.")
-        || host_lower.starts_with("10.")
-        || host_lower == "0.0.0.0"
-    {
+    // Robust SSRF guard: DNS-resolve and reject private/reserved/loopback/
+    // metadata hosts (127.0.0.2, [::1], 169.254.169.254, 172.16/12, ...).
+    if let Err(e) = validate_public_url(&parsed) {
         return UrlValidation {
-            error: Some("Local and private network URLs are not allowed.".to_string()),
+            error: Some(format!("Unsafe or invalid URL: {e}")),
             warning: None,
         };
     }
@@ -1051,6 +1814,7 @@ fn is_direct_image_url(url: &url::Url) -> bool {
 
 fn handle_link(
     client: &Client,
+    fetch_client: &Client,
     token: &str,
     args: &Args,
     state: &Arc<BotState>,
@@ -1076,6 +1840,14 @@ fn handle_link(
     };
     let cancel_markup = serde_json::to_string(&cancel_kb).unwrap_or_default();
 
+    // Reference: only the chat's own saved reference photo (caption "ref").
+    // No global default and no auto-cover fetch â€” pages colorize with the
+    // soft cel style by default.
+    let reference_image = settings
+        .reference_image
+        .clone()
+        .filter(|p| !p.as_os_str().is_empty());
+
     send_chat_action(client, token, chat_id, "typing")?;
     let scan_msg_id = send_message(
         client,
@@ -1086,9 +1858,12 @@ fn handle_link(
     )?;
 
     let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
-    let page_resp = client
+    let page_resp = fetch_client
         .get(url)
-        .header(USER_AGENT, "MangaHueBot/1.0")
+        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+        .header(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header(REFERER, "https://www.google.com/")
         .send()
         .with_context(|| format!("failed to fetch {url}"))?
         .error_for_status()
@@ -1106,8 +1881,34 @@ fn handle_link(
         let html = page_resp
             .text()
             .with_context(|| format!("failed to read HTML from {url}"))?;
-        extract_manga_urls(client, &source_url, &html, &source_url, args.max_pages)?
+        extract_manga_urls(
+            fetch_client,
+            &source_url,
+            &html,
+            &source_url,
+            args.max_pages,
+        )?
     };
+
+    // SSRF guard: drop any extracted image URL that resolves to a private
+    // or reserved host (attacker-controlled pages can point at internal
+    // services or cloud metadata). Fail the image, not the whole job.
+    let all_image_urls: Vec<String> = all_image_urls
+        .into_iter()
+        .filter(|u| {
+            let parsed = match url::Url::parse(u) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            match validate_public_url(&parsed) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(url = %u, error = %e, "skipping unsafe image URL");
+                    false
+                }
+            }
+        })
+        .collect();
 
     if all_image_urls.is_empty() {
         cleanup_dir(&job_dir);
@@ -1169,12 +1970,13 @@ fn handle_link(
 
     for batch_idx in 0..total_batches {
         if cancel_token.load(Ordering::Acquire) {
-            let _ = edit_message(
+            let _ = edit_message_with_markup(
                 client,
                 token,
                 chat_id,
                 progress_msg_id,
                 &format!("Cancelled after {sent} page(s) colored.",),
+                Some(r#"{"inline_keyboard":[]}"#),
             );
             cleanup_dir(&job_dir);
             return Ok(());
@@ -1188,7 +1990,7 @@ fn handle_link(
             .map(|(i, u)| (start + i, u.clone()))
             .collect();
 
-        // ── Download this batch ──
+        // â”€â”€ Download this batch â”€â”€
         let mut batch_pages: Vec<(usize, PathBuf)> = Vec::new();
         for (pos, img_url) in &batch_urls {
             if cancel_token.load(Ordering::Acquire) {
@@ -1197,7 +1999,7 @@ fn handle_link(
             let ext = image_extension_from_url(img_url);
             let local_path = downloads_dir.join(format!("page_{:03}.{}", pos + 1, ext));
             match download_image_url_telegram(
-                client,
+                fetch_client,
                 img_url,
                 source_url.as_str(),
                 &local_path,
@@ -1235,6 +2037,7 @@ fn handle_link(
             let progress_total = effective_total;
             let progress_position = *position;
             let progress_chat = chat_id;
+            let progress_markup = cancel_markup.clone();
             let progress_thread = std::thread::spawn(move || {
                 let mut last_stage = String::new();
                 let mut last_percent = -10i32;
@@ -1249,12 +2052,13 @@ fn handle_link(
                             humanize_stage(&update.stage),
                             percent.clamp(0, 100)
                         );
-                        let _ = edit_message(
+                        let _ = edit_message_with_markup(
                             &progress_client,
                             &progress_token,
                             progress_chat,
                             progress_msg_id2,
                             &text,
+                            Some(&progress_markup),
                         );
                         last_stage = update.stage;
                         last_percent = percent;
@@ -1266,7 +2070,7 @@ fn handle_link(
                 input_path: local_path.clone(),
                 output_path: output_path.clone(),
                 model_path: args.model.clone(),
-                reference_image_path: args.reference_image.clone(),
+                reference_image_path: reference_image.clone(),
                 enable_ensemble: !args.ensemble_models.is_empty(),
                 ensemble_model_paths: args.ensemble_models.clone(),
                 config_path: args.config.clone(),
@@ -1274,9 +2078,12 @@ fn handle_link(
                 style_path: style_path.clone(),
                 project_path: args.project.clone(),
                 region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
+                user_hints_path: resolve_user_hints(args, chat_id, stem),
                 use_mock_backend: args.mock,
                 pyramid_enabled: args.pyramid,
                 hint_propagation_enabled: args.hint_propagate,
+                palette_path: settings.palette_path.clone(),
+                auto_palette: settings.auto_palette,
                 cancel_token: Some(Arc::clone(&cancel_token)),
                 progress_sender: Some(progress_sender),
                 ..ColorizeRequest::default()
@@ -1289,12 +2096,13 @@ fn handle_link(
             match result {
                 Ok(colorize_result) => {
                     if cancel_token.load(Ordering::Acquire) {
-                        let _ = edit_message(
+                        let _ = edit_message_with_markup(
                             client,
                             token,
                             chat_id,
                             progress_msg_id,
                             &format!("Cancelled after {sent} page(s)."),
+                            Some(r#"{"inline_keyboard":[]}"#),
                         );
                         cleanup_dir(&job_dir);
                         return Ok(());
@@ -1327,7 +2135,14 @@ fn handle_link(
                 }
                 Err(error) => {
                     if cancel_token.load(Ordering::Acquire) {
-                        let _ = edit_message(client, token, chat_id, progress_msg_id, "Cancelled.");
+                        let _ = edit_message_with_markup(
+                            client,
+                            token,
+                            chat_id,
+                            progress_msg_id,
+                            "Cancelled.",
+                            Some(r#"{"inline_keyboard":[]}"#),
+                        );
                         cleanup_dir(&job_dir);
                         return Ok(());
                     }
@@ -1348,12 +2163,13 @@ fn handle_link(
             let done =
                 start + sent.min((*position + 1) - start) + failed.min((*position + 1) - start);
             let eta = estimate_eta(&page_times, done, effective_total);
-            let _ = edit_message(
+            let _ = edit_message_with_markup(
                 client,
                 token,
                 chat_id,
                 progress_msg_id,
                 &format_progress(done, effective_total, batch_idx, total_batches, eta, failed),
+                Some(&cancel_markup),
             );
         }
 
@@ -1391,12 +2207,13 @@ fn handle_link(
         Some(&serde_json::to_string(&completion_kb).unwrap_or_default()),
     )?;
 
-    let _ = edit_message(
+    let _ = edit_message_with_markup(
         client,
         token,
         chat_id,
         progress_msg_id,
         &format!("Complete: *{sent}* sent, *{failed}* failed.",),
+        Some(r#"{"inline_keyboard":[]}"#),
     );
 
     Ok(())
@@ -1437,12 +2254,12 @@ fn format_progress(
 
 fn progress_bar(done: usize, total: usize, width: usize) -> String {
     if total == 0 {
-        return "░".repeat(width);
+        return "â–‘".repeat(width);
     }
     let filled = ((done as f64 / total as f64) * width as f64).round() as usize;
     let filled = filled.min(width);
     let empty = width.saturating_sub(filled);
-    format!("{}{}", "▓".repeat(filled), "░".repeat(empty))
+    format!("{}{}", "â–“".repeat(filled), "â–‘".repeat(empty))
 }
 
 fn estimate_eta(times: &[f32], done: usize, total: usize) -> Option<f32> {
@@ -1551,9 +2368,13 @@ fn download_image_url_telegram(
     output: &Path,
     max_bytes: u64,
 ) -> Result<()> {
+    // SSRF guard at the exact fetch point: reject private/reserved hosts
+    // (attacker-controlled HTML can point image URLs at internal services).
+    let parsed = url::Url::parse(url).with_context(|| format!("invalid image URL: {url}"))?;
+    validate_public_url(&parsed).with_context(|| format!("unsafe image URL skipped: {url}"))?;
     let resp = client
         .get(url)
-        .header(USER_AGENT, "Mozilla/5.0 (compatible; MangaHue/0.1)")
+        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
         .header(REFERER, referer)
         .header(
             ACCEPT,
@@ -1633,6 +2454,47 @@ fn resolve_region_locks(root: Option<&Path>, page_stem: &str) -> Option<PathBuf>
     .into_iter()
     .map(|name| root.join(name))
     .find(|candidate| candidate.is_file())
+}
+
+/// Per-chat learned color memory. If the chat has a hints file from prior
+/// corrections, prefer it; otherwise fall back to the global --hints file.
+fn resolve_user_hints(args: &Args, chat_id: i64, _page_stem: &str) -> Option<PathBuf> {
+    let chat_memory = args
+        .work_dir
+        .join("memory")
+        .join(format!("chat_{chat_id}.hints.json"));
+    if chat_memory.is_file() {
+        return Some(chat_memory);
+    }
+    args.hints.clone()
+}
+
+/// After a restart, re-register saved reference photos (chat_{id}.jpg) so
+/// the per-chat style reference survives process restarts.
+fn restore_reference_photos(state: &BotState, references_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(references_dir) else {
+        return;
+    };
+    let mut restored = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name_str.strip_prefix("chat_") else {
+            continue;
+        };
+        let Some(chat_str) = rest.strip_suffix(".jpg") else {
+            continue;
+        };
+        if let Ok(chat_id) = chat_str.parse::<i64>() {
+            state.set_reference_image(chat_id, entry.path());
+            restored += 1;
+        }
+    }
+    if restored > 0 {
+        tracing::info!(restored, "restored saved reference photos after restart");
+    }
 }
 
 fn humanize_stage(stage: &str) -> &str {
@@ -1750,6 +2612,19 @@ fn edit_message(
     message_id: i64,
     text: &str,
 ) -> Result<()> {
+    edit_message_with_markup(client, token, chat_id, message_id, text, None)
+}
+
+/// Like [edit_message] but re-applies an inline keyboard (e.g. the cancel
+/// button) on every edit so it stays visible during the whole colorization.
+fn edit_message_with_markup(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    markup: Option<&str>,
+) -> Result<()> {
     let mut body = json!({
         "chat_id": chat_id,
         "message_id": message_id,
@@ -1757,6 +2632,11 @@ fn edit_message(
     });
     if text.contains('*') || text.contains('`') {
         body["parse_mode"] = json!("MarkdownV2");
+    }
+    if let Some(markup) = markup {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(markup) {
+            body["reply_markup"] = parsed;
+        }
     }
 
     let envelope: TelegramEnvelope<serde_json::Value> = client
@@ -1899,6 +2779,7 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
             styles_dir: None,
@@ -1921,6 +2802,7 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
             styles_dir: None,
@@ -1952,6 +2834,7 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 100,
             styles_dir: Some(dir.path().to_path_buf()),
@@ -2040,8 +2923,8 @@ mod tests {
 
     #[test]
     fn formats_progress_bar_correctly() {
-        assert_eq!(progress_bar(0, 10, 10), "░░░░░░░░░░");
-        assert_eq!(progress_bar(5, 10, 10), "▓▓▓▓▓░░░░░");
-        assert_eq!(progress_bar(10, 10, 10), "▓▓▓▓▓▓▓▓▓▓");
+        assert_eq!(progress_bar(0, 10, 10), "â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘");
+        assert_eq!(progress_bar(5, 10, 10), "â–“â–“â–“â–“â–“â–‘â–‘â–‘â–‘â–‘");
+        assert_eq!(progress_bar(10, 10, 10), "â–“â–“â–“â–“â–“â–“â–“â–“â–“â–“");
     }
 }

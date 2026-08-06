@@ -298,11 +298,40 @@ pub fn analyze_chapter_brain(request: ChapterBrainRequest) -> Result<ChapterBrai
 
     let global_palette = build_global_palette(&pages, max_palette_colors);
     let palette_locks = build_palette_locks(&global_palette, pages.len());
-    let mean_luma = mean_by(&pages, |page| page.mean_luma);
-    let mean_saturation = mean_by(&pages, |page| page.mean_saturation);
+    // Leave-one-out means: a page is never compared against its own tone
+    // statistics (comparing a page to a mean that includes the page itself
+    // systematically underestimated drift on small chapters).
+    let total_luma: f32 = pages.iter().map(|page| page.mean_luma).sum();
+    let total_saturation: f32 = pages.iter().map(|page| page.mean_saturation).sum();
+    let page_count = pages.len() as f32;
 
-    for page in &mut pages {
-        page.palette_drift_score = palette_drift_score(page, &palette_locks);
+    // Leave-one-out palette locks: a page always matches its own colors in
+    // the shared palette, which hid real drift from the score. Compute the
+    // per-page locks in an immutable pass, then apply them.
+    let other_locks_for_pages: Vec<Vec<PaletteLock>> = (0..pages.len())
+        .map(|page_index| {
+            build_palette_locks(
+                &build_global_palette_excluding(&pages, Some(page_index), max_palette_colors),
+                pages.len().saturating_sub(1).max(1),
+            )
+        })
+        .collect();
+
+    for (page_index, page) in pages.iter_mut().enumerate() {
+        page.palette_drift_score = if page_count > 1.0 {
+            palette_drift_score(page, &other_locks_for_pages[page_index])
+        } else {
+            // A single-page chapter has nothing to drift against.
+            0.0
+        };
+        let (mean_luma, mean_saturation) = if page_count > 1.0 {
+            (
+                (total_luma - page.mean_luma) / (page_count - 1.0),
+                (total_saturation - page.mean_saturation) / (page_count - 1.0),
+            )
+        } else {
+            (page.mean_luma, page.mean_saturation)
+        };
         page.tone_drift_score = tone_drift_score(page, mean_luma, mean_saturation);
         page.consistency_score = (1.0
             - (page.palette_drift_score * 0.74 + page.tone_drift_score * 0.26))
@@ -786,7 +815,10 @@ fn analyze_page_palette(
             let saturation = color_saturation(color);
             PaletteSwatch {
                 color,
-                coverage: bucket.pixels as f32 / sampled as f32,
+                // Coverage relative to CHROMATIC pixels (the paintable
+                // signal): white paper/ink previously diluted every
+                // coverage to a few percent and flattened lock confidence.
+                coverage: bucket.pixels as f32 / chromatic.max(1) as f32,
                 weight: bucket.pixels as f32 * (0.35 + saturation),
                 pixels: bucket.pixels,
                 support_pages: 1,
@@ -829,8 +861,22 @@ fn build_global_palette(
     pages: &[PageBrainReport],
     max_palette_colors: usize,
 ) -> Vec<PaletteSwatch> {
+    build_global_palette_excluding(pages, None, max_palette_colors)
+}
+
+/// Build the chapter palette optionally excluding one page (leave-one-out),
+/// used to score a page against the chapter WITHOUT its own colors — a page
+/// always matches its own palette entries, which hides real drift.
+fn build_global_palette_excluding(
+    pages: &[PageBrainReport],
+    exclude_index: Option<usize>,
+    max_palette_colors: usize,
+) -> Vec<PaletteSwatch> {
     let mut buckets: Vec<GlobalBucket> = Vec::new();
-    for page in pages {
+    for (page_index, page) in pages.iter().enumerate() {
+        if Some(page_index) == exclude_index {
+            continue;
+        }
         for swatch in &page.palette {
             if let Some(bucket) = buckets
                 .iter_mut()
@@ -866,9 +912,14 @@ fn build_global_palette(
         .map(|bucket| {
             let support_pages = bucket.pages.len();
             let saturation = color_saturation(bucket.color);
+            let palette_size = if exclude_index.is_some() {
+                pages.len().saturating_sub(1).max(1)
+            } else {
+                pages.len().max(1)
+            };
             PaletteSwatch {
                 color: bucket.color,
-                coverage: bucket.coverage / pages.len().max(1) as f32,
+                coverage: bucket.coverage / palette_size as f32,
                 weight: bucket.weight * (1.0 + support_pages as f32 * 0.18),
                 pixels: bucket.pixels,
                 support_pages,
@@ -944,7 +995,11 @@ fn palette_drift_score(page: &PageBrainReport, locks: &[PaletteLock]) -> f32 {
     let normalized_distance = (total_distance / total_weight / 148.0).clamp(0.0, 1.0);
     let miss_penalty = (outside_tolerance / total_weight).clamp(0.0, 1.0);
     let stability_penalty = (unstable_lock / total_weight).clamp(0.0, 1.0);
-    (normalized_distance * 0.34 + miss_penalty * 0.16 + stability_penalty * 0.50).clamp(0.0, 1.0)
+    // Actual color deviation dominates; the lock-stability term is only a
+    // gentle correction. Locks are derived from the very pages being scored,
+    // so a large stability weight inflated every page's drift and triggered
+    // retries on fully consistent chapters.
+    (normalized_distance * 0.50 + miss_penalty * 0.25 + stability_penalty * 0.25).clamp(0.0, 1.0)
 }
 
 fn tone_drift_score(page: &PageBrainReport, mean_luma: f32, mean_saturation: f32) -> f32 {
@@ -972,11 +1027,11 @@ fn merge_swatches(
             existing.pixels += swatch.pixels;
             existing.luma = color_luma(existing.color);
             existing.saturation = color_saturation(existing.color);
-        } else {
+        } else if merged.len() < limit {
+            // Only NEW clusters are capped; a swatch that belongs to an
+            // existing cluster still merges even when the limit is reached
+            // (previously its pixels/coverage silently vanished).
             merged.push(swatch);
-        }
-        if merged.len() >= limit {
-            break;
         }
     }
     merged
@@ -1163,7 +1218,10 @@ pub fn extract_chapter_palette(
         ));
     }
 
-    let k = num_colors.min(all_pixels.len());
+    // K-means is O(n·k²) in initialization and O(n·k) per assignment pass:
+    // an unbounded k (caller-supplied) turns a chapter into an effective
+    // hang. 64 clusters is far beyond any usable palette.
+    let k = num_colors.min(all_pixels.len()).min(64);
     let mut rng = rand::thread_rng();
     let (centroids, assignments) = kmeans_plus_plus(&all_pixels, k, &mut rng);
 

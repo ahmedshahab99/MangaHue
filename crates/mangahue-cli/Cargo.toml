@@ -19,6 +19,7 @@ mangahue-core = { path = "../mangahue-core" }
 mangahue-api = { path = "../mangahue-api" }
 mangahue-brain = { path = "../mangahue-brain" }
 mangahue-chapter = { path = "../mangahue-chapter" }
+mangahue-eval = { path = "../mangahue-eval" }
 mangahue-hints = { path = "../mangahue-hints" }
 mangahue-image = { path = "../mangahue-image" }
 mangahue-ingest = { path = "../mangahue-ingest" }

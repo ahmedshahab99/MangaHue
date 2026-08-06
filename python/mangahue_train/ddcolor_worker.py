@@ -12,9 +12,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import cv2
 from PIL import Image
 
-_MODEL_ROOT = Path(__file__).resolve().parents[3] / "models" / "ddcolor_repo"
+_MODEL_ROOT = Path(__file__).resolve().parents[2] / "models" / "ddcolor_repo"
 sys.path.insert(0, str(_MODEL_ROOT))
 
 from ddcolor import DDColor, build_ddcolor_model
@@ -38,17 +39,29 @@ def _run_request(model, request: dict, input_size: int, device) -> dict:
         original_size = src.size
         img = np.asarray(src.convert("RGB"), dtype=np.float32) / 255.0
 
-    # DDColor expects BGR input (OpenCV format) or RGB tensor
+    # DDColor outputs ab channels in LAB space; merge with the input's L.
+    # Model expects a raw [0,1] RGB tensor (do_normalize=False).
     tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
 
     with torch.inference_mode():
         result = model(tensor)
 
     if isinstance(result, torch.Tensor):
-        result = result.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    result = np.clip(result * 255.0, 0, 255).astype(np.uint8)
+        ab = result.squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H, W, 2)
+    else:
+        ab = np.asarray(result).squeeze(0).transpose(1, 2, 0)
 
-    image = Image.fromarray(result, mode="RGB")
+    # Build LAB and convert to RGB (mirrors ColorizationPipeline.process).
+    if ab.shape[2] != 2:
+        raise ValueError(f"unexpected DDColor output channels: {ab.shape}")
+    img_lab = cv2.cvtColor(img.astype(np.float32), cv2.COLOR_RGB2Lab)
+    l_channel = img_lab[:, :, :1]
+    # DDColor ab is in [-110, 110] roughly; scale from tanh output.
+    merged = np.concatenate([l_channel, ab * 110.0], axis=2)
+    rgb = cv2.cvtColor(merged.astype(np.float32), cv2.COLOR_Lab2RGB)
+    rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+    image = Image.fromarray(rgb, mode="RGB")
     if image.size != original_size:
         image = image.resize(original_size, Image.Resampling.LANCZOS)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -19,3 +19,21 @@ models/pretrained/
 examples/output/
 projects/*/history/*.png
 projects/*/corrections/*.png
+web/gpu/dev_server*.log
+web/gpu/dev_server_err.log
+
+# Local experiments and operator scratch files may contain server credentials.
+/scripts/*.py
+/local_tuning/
+/test_images/
+/download_test.py
+/test_*.py
+/*.png
+/*.jpg
+
+# Private research notes can mention local infrastructure and credentials.
+/docs/AUDIT_STUDY.md
+/docs/FIX_TODO.md
+/docs/MIRACLE_PLAN.md
+/docs/MODEL_STUDY.md
+/docs/TRANSFORMATION_STUDY.md

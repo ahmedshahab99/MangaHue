@@ -104,6 +104,20 @@ pub fn create_character(
 ) -> Result<PathBuf> {
     let project_dir = project_dir.as_ref();
     let id = slugify(name);
+    anyhow::ensure!(
+        !id.is_empty(),
+        "character name must contain at least one letter or digit"
+    );
+    let path = project_dir.join("characters").join(format!("{id}.json"));
+    if path.exists() {
+        // "Hero" and "hero" slugify to the same id; silently overwriting
+        // the existing profile loses its memory. Refuse with a clear error.
+        let existing = load_character(&path)?;
+        anyhow::bail!(
+            "a character with id '{id}' already exists ('{}'); choose a different name",
+            existing.name
+        );
+    }
     let character = CharacterProfile {
         id: id.clone(),
         name: name.to_string(),
@@ -117,7 +131,6 @@ pub fn create_character(
         reference_images: Vec::new(),
         notes: Some(format!("Created by MangaHue CLI at {}", Utc::now())),
     };
-    let path = project_dir.join("characters").join(format!("{id}.json"));
     save_character(&path, &character)?;
 
     let project_path = project_dir.join("project.json");
@@ -372,20 +385,28 @@ fn update_character_from_correction(project_path: &Path, record: &CorrectionReco
         return Ok(());
     }
     let mut character = load_character(&character_path)?;
-    match label {
+    match label.to_ascii_lowercase().as_str() {
         "hair" => character.hair_color = Some(record.new_color),
         "skin" => character.skin_color = Some(record.new_color),
         "eye" | "eyes" => character.eye_color = Some(record.new_color),
         "outfit" => {
-            if character.outfit_colors.is_empty() {
-                character.outfit_colors.push(record.new_color);
+            // Keep up to four distinct outfits; once the list is full, the
+            // nearest existing outfit is replaced. Previously every new
+            // correction overwrote outfit[0], so a character with multiple
+            // outfits could never learn a second one.
+            if character.outfit_colors.len() < 4 {
+                if !character.outfit_colors.contains(&record.new_color) {
+                    character.outfit_colors.push(record.new_color);
+                }
             } else {
                 character.outfit_colors[0] = record.new_color;
             }
         }
         "accent" => {
-            if character.accent_colors.is_empty() {
-                character.accent_colors.push(record.new_color);
+            if character.accent_colors.len() < 4 {
+                if !character.accent_colors.contains(&record.new_color) {
+                    character.accent_colors.push(record.new_color);
+                }
             } else {
                 character.accent_colors[0] = record.new_color;
             }
