@@ -15,12 +15,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release \
         -p mangahue-api \
         -p mangahue-worker \
-        -p mangahue-telegram \
         -p mangahue-cli \
     && mkdir -p /out \
     && cp /src/target/release/mangahue-api /out/ \
     && cp /src/target/release/mangahue-worker /out/ \
-    && cp /src/target/release/mangahue-telegram /out/ \
     && cp /src/target/release/mangahue /out/
 
 # ── Full runtime (PyTorch + training/eval scripts) ───────────────────────
@@ -40,7 +38,6 @@ WORKDIR /app
 
 COPY --from=rust-builder /out/mangahue-api /usr/local/bin/mangahue-api
 COPY --from=rust-builder /out/mangahue-worker /usr/local/bin/mangahue-worker
-COPY --from=rust-builder /out/mangahue-telegram /usr/local/bin/mangahue-telegram
 COPY --from=rust-builder /out/mangahue /usr/local/bin/mangahue
 
 COPY python /app/python
@@ -85,7 +82,6 @@ WORKDIR /app
 
 COPY --from=rust-builder /out/mangahue-api /usr/local/bin/mangahue-api
 COPY --from=rust-builder /out/mangahue-worker /usr/local/bin/mangahue-worker
-COPY --from=rust-builder /out/mangahue-telegram /usr/local/bin/mangahue-telegram
 COPY --from=rust-builder /out/mangahue /usr/local/bin/mangahue
 
 COPY python /app/python

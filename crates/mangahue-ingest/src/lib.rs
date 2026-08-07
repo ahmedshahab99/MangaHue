@@ -7,8 +7,8 @@ use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT}
 use scraper::{Html, Selector};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -415,22 +415,46 @@ fn download_image_response(
     }
     let extension = image_extension(url, content_type.as_deref());
     let local_path = output_dir.join(format!("page_{index:03}.{extension}"));
+    let partial_path = output_dir.join(format!(".page_{index:03}.{extension}.partial"));
     let mut reader = response.take(max_bytes + 1);
-    let mut data = Vec::new();
-    reader
-        .read_to_end(&mut data)
-        .with_context(|| format!("failed to read image bytes from {url}"))?;
-    if data.len() as u64 > max_bytes {
+    let streamed = (|| -> Result<u64> {
+        let mut output = File::create(&partial_path)
+            .with_context(|| format!("failed to create {}", partial_path.display()))?;
+        let bytes = std::io::copy(&mut reader, &mut output)
+            .with_context(|| format!("failed to stream image bytes from {url}"))?;
+        output
+            .flush()
+            .with_context(|| format!("failed to flush {}", partial_path.display()))?;
+        Ok(bytes)
+    })();
+    let bytes = match streamed {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&partial_path);
+            return Err(error);
+        }
+    };
+    if bytes > max_bytes {
+        let _ = fs::remove_file(&partial_path);
         anyhow::bail!("image exceeded {max_bytes} bytes");
     }
-    fs::write(&local_path, &data)
-        .with_context(|| format!("failed to write {}", local_path.display()))?;
+    if local_path.exists() {
+        fs::remove_file(&local_path)
+            .with_context(|| format!("failed to replace {}", local_path.display()))?;
+    }
+    fs::rename(&partial_path, &local_path).with_context(|| {
+        format!(
+            "failed to commit {} to {}",
+            partial_path.display(),
+            local_path.display()
+        )
+    })?;
     Ok(IngestedPage {
         index,
         source_url: url.to_string(),
         local_path,
         content_type,
-        bytes: data.len() as u64,
+        bytes,
     })
 }
 

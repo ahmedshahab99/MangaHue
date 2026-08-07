@@ -67,4 +67,4 @@ jobs:
       - run: >-
           docker run --rm --entrypoint python mangahue:${{ github.sha }}
           -c "import numpy, onnxruntime, PIL, mangahue_train.onnx_worker; print('compact runtime OK')"
-      - run: docker run --rm --entrypoint mangahue-telegram mangahue:${{ github.sha }} --help
+      - run: docker run --rm --entrypoint mangahue-api mangahue:${{ github.sha }} --help

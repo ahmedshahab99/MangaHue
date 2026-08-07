@@ -1,6 +1,7 @@
-import type { JobEvent, MangaHueJob, StyleSummary, UploadResult } from "./types";
+import type { JobEvent, MangaHueJob, QuotaSnapshot, StyleSummary, UploadResult } from "./types";
 
 const configuredBase = process.env.NEXT_PUBLIC_MANGAHUE_API_URL?.replace(/\/$/, "");
+const tokenKey = "mangahue-token";
 
 export function apiBase(): string {
   if (configuredBase) return configuredBase;
@@ -14,7 +15,7 @@ function apiUrl(path: string): string {
 function requestHeaders(extra?: HeadersInit): Headers {
   const headers = new Headers(extra);
   headers.set("x-mangahue-local", "1");
-  const token = typeof window !== "undefined" ? window.localStorage.getItem("mangahue-token") : null;
+  const token = typeof window !== "undefined" ? window.localStorage.getItem(tokenKey) : null;
   if (token) headers.set("authorization", `Bearer ${token}`);
   return headers;
 }
@@ -53,8 +54,22 @@ export function getJobs(): Promise<MangaHueJob[]> {
   return apiRequest<MangaHueJob[]>("/api/jobs");
 }
 
+export function getQuota(): Promise<QuotaSnapshot> {
+  return apiRequest<QuotaSnapshot>("/api/v1/quota");
+}
+
 export function getJob(id: string): Promise<MangaHueJob> {
   return apiRequest<MangaHueJob>(`/api/jobs/${encodeURIComponent(id)}`);
+}
+
+export function getAccessToken(): string {
+  return typeof window === "undefined" ? "" : window.localStorage.getItem(tokenKey) || "";
+}
+
+export function setAccessToken(token: string): void {
+  const normalized = token.trim();
+  if (normalized) window.localStorage.setItem(tokenKey, normalized);
+  else window.localStorage.removeItem(tokenKey);
 }
 
 export function cancelJob(id: string): Promise<{ status: string; id: string }> {
@@ -67,8 +82,10 @@ export async function uploadSource(file: File): Promise<UploadResult> {
   return apiRequest<UploadResult>("/api/upload", { method: "POST", body });
 }
 
-export async function fetchAsset(path: string): Promise<string> {
-  const response = await fetch(apiUrl(`/api/file?path=${encodeURIComponent(path)}`), {
+export async function fetchAsset(path: string, jobId?: string): Promise<string> {
+  const query = new URLSearchParams({ path });
+  if (jobId) query.set("job_id", jobId);
+  const response = await fetch(apiUrl(`/api/file?${query.toString()}`), {
     headers: requestHeaders(),
     cache: "no-store",
   });
@@ -76,8 +93,8 @@ export async function fetchAsset(path: string): Promise<string> {
   return URL.createObjectURL(await response.blob());
 }
 
-export async function downloadAsset(path: string, filename: string): Promise<void> {
-  const objectUrl = await fetchAsset(path);
+export async function downloadAsset(path: string, filename: string, jobId?: string): Promise<void> {
+  const objectUrl = await fetchAsset(path, jobId);
   const link = document.createElement("a");
   link.href = objectUrl;
   link.download = filename;

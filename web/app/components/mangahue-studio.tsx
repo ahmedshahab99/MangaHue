@@ -15,6 +15,7 @@ import {
   Gauge,
   History,
   Image as ImageIcon,
+  KeyRound,
   Layers3,
   Link2,
   LoaderCircle,
@@ -24,6 +25,8 @@ import {
   RefreshCw,
   SlidersHorizontal,
   Sparkles,
+  Save,
+  Trash2,
   Upload,
   WandSparkles,
   X,
@@ -35,11 +38,14 @@ import {
   cancelJob,
   downloadAsset,
   fetchAsset,
+  getAccessToken,
   getJob,
   getJobs,
+  getQuota,
   getStyles,
   healthcheck,
   streamJob,
+  setAccessToken,
   uploadSource,
 } from "@/lib/api";
 import type { JobEvent, JobPage, MangaHueJob, StyleSummary } from "@/lib/types";
@@ -95,6 +101,7 @@ export function MangaHueStudio() {
   const [stylePath, setStylePath] = useState("");
   const [quality, setQuality] = useState<Quality>("masterpiece");
   const [maxPages, setMaxPages] = useState(80);
+  const [pageCeiling, setPageCeiling] = useState(500);
   const [autoPalette, setAutoPalette] = useState(true);
   const [consistency, setConsistency] = useState(true);
   const [jobs, setJobs] = useState<MangaHueJob[]>([]);
@@ -109,6 +116,8 @@ export function MangaHueStudio() {
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [accessOpen, setAccessOpen] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
@@ -136,19 +145,37 @@ export function MangaHueStudio() {
 
   useEffect(() => {
     let mounted = true;
-    Promise.all([healthcheck(), getStyles().catch(() => []), getJobs().catch(() => [])]).then(
-      ([health, nextStyles, nextJobs]) => {
+    void (async () => {
+      const health = await healthcheck();
+      try {
+        const [nextStyles, nextJobs, quota] = await Promise.all([
+          getStyles(),
+          getJobs(),
+          getAccessToken() ? getQuota().catch(() => null) : Promise.resolve(null),
+        ]);
         if (!mounted) return;
         setConnected(health);
         setStyles(nextStyles);
         setJobs(nextJobs);
+        if (quota) {
+          const ceiling = Math.max(1, Math.min(500, Number(quota.policy.max_pages_per_job)));
+          setPageCeiling(ceiling);
+          setMaxPages((current) => Math.min(current, ceiling));
+        }
         const preferred = nextStyles.find((style) => style.id === "target_style") || nextStyles[0];
         if (preferred) setStylePath(preferred.path);
         const current = nextJobs.find((job) => job.status === "running" || job.status === "queued");
         if (current) setActiveId(current.id);
-      },
-    );
-    const poller = window.setInterval(refreshJobs, 2500);
+      } catch {
+        if (!mounted) return;
+        setConnected(false);
+        if (health) {
+          setTokenDraft(getAccessToken());
+          setAccessOpen(true);
+        }
+      }
+    })();
+    const poller = window.setInterval(refreshJobs, 5000);
     return () => {
       mounted = false;
       window.clearInterval(poller);
@@ -180,6 +207,7 @@ export function MangaHueStudio() {
         ),
       );
       if (terminalStatuses.has(event.status)) {
+        if (event.status === "failed") setError(event.error || "Colorization failed");
         void getJob(activeId).then((job) => {
           setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
           setSelectedJob(job);
@@ -208,8 +236,8 @@ export function MangaHueStudio() {
     if (!page?.output_path) return;
 
     Promise.all([
-      page.input_path ? fetchAsset(page.input_path).catch(() => null) : Promise.resolve(null),
-      fetchAsset(page.output_path),
+      page.input_path ? fetchAsset(page.input_path, selectedJob?.id).catch(() => null) : Promise.resolve(null),
+      fetchAsset(page.output_path, selectedJob?.id),
     ]).then(([before, after]) => {
       beforeObject = before;
       afterObject = after;
@@ -228,7 +256,7 @@ export function MangaHueStudio() {
       if (beforeObject) URL.revokeObjectURL(beforeObject);
       if (afterObject) URL.revokeObjectURL(afterObject);
     };
-  }, [pages, selectedPage, selectedJob?.kind, sourceFile, sourcePreview]);
+  }, [pages, selectedPage, selectedJob?.id, selectedJob?.kind, sourceFile, sourcePreview]);
 
   useEffect(() => {
     return () => {
@@ -360,6 +388,19 @@ export function MangaHueStudio() {
     if (!terminalStatuses.has(fresh.status)) setActiveId(fresh.id);
   }
 
+  function saveAccessToken() {
+    setAccessToken(tokenDraft);
+    setAccessOpen(false);
+    window.location.reload();
+  }
+
+  function clearAccessToken() {
+    setAccessToken("");
+    setTokenDraft("");
+    setAccessOpen(false);
+    window.location.reload();
+  }
+
   const progress = activeJob?.progress.percent || (activeJob?.status === "complete" ? 100 : 0);
   const canStart = sourceMode === "link" ? Boolean(sourceUrl.trim()) : Boolean(sourceFile);
 
@@ -381,6 +422,9 @@ export function MangaHueStudio() {
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")} title="Library">
             <FolderOpen size={20} /><span>Library</span>
           </button>
+          <button onClick={() => { setTokenDraft(getAccessToken()); setAccessOpen(true); setSidebarOpen(false); }} title="API access">
+            <KeyRound size={20} /><span>Access</span>
+          </button>
         </nav>
         <div className="sidebar-foot">
           <span className={`connection-dot ${connected ? "online" : ""}`} />
@@ -400,8 +444,9 @@ export function MangaHueStudio() {
           <div className="topbar-actions">
             <span className={`engine-state ${connected ? "connected" : ""}`}>
               {connected ? <Gauge size={15} /> : <CloudOff size={15} />}
-              {connected ? "Local engine" : "Disconnected"}
+              {connected ? "Engine ready" : "Disconnected"}
             </span>
+            <button className="icon-button" onClick={() => { setTokenDraft(getAccessToken()); setAccessOpen(true); }} title="API access"><KeyRound size={18} /></button>
             <button className="icon-button" onClick={() => void refreshJobs()} title="Refresh jobs"><RefreshCw size={18} /></button>
           </div>
         </header>
@@ -481,7 +526,7 @@ export function MangaHueStudio() {
 
               <label className="page-limit">
                 <span>Maximum pages</span>
-                <div><button onClick={() => setMaxPages((value) => Math.max(1, value - 10))}>-</button><input type="number" min="1" max="500" value={maxPages} onChange={(event) => setMaxPages(Math.min(500, Math.max(1, Number(event.target.value))))} /><button onClick={() => setMaxPages((value) => Math.min(500, value + 10))}>+</button></div>
+                <div><button onClick={() => setMaxPages((value) => Math.max(1, value - 10))}>-</button><input type="number" min="1" max={pageCeiling} value={maxPages} onChange={(event) => setMaxPages(Math.min(pageCeiling, Math.max(1, Number(event.target.value))))} /><button onClick={() => setMaxPages((value) => Math.min(pageCeiling, value + 10))}>+</button></div>
               </label>
 
               {error && <div className="error-banner" role="alert"><X size={16} /><span>{error}</span><button onClick={() => setError(null)} title="Dismiss"><X size={14} /></button></div>}
@@ -498,8 +543,8 @@ export function MangaHueStudio() {
                 <div className="viewer-title"><ImageIcon size={18} /><span>{selectedJob ? `${statusLabel(selectedJob.kind)} ${shortId(selectedJob.id)}` : "Preview"}</span></div>
                 <div className="viewer-actions">
                   {afterImage && <span className="comparison-label">BEFORE <b>{compare}</b> AFTER</span>}
-                  {archivePath(selectedJob) && <button className="icon-button light" onClick={() => void downloadAsset(archivePath(selectedJob) as string, "mangahue-colored.cbz")} title="Download chapter"><Download size={18} /></button>}
-                  {pages[selectedPage]?.output_path && <button className="icon-button light" onClick={() => void downloadAsset(pages[selectedPage].output_path, `mangahue-page-${selectedPage + 1}.png`)} title="Download page"><Download size={18} /></button>}
+                  {archivePath(selectedJob) && <button className="icon-button light" onClick={() => void downloadAsset(archivePath(selectedJob) as string, "mangahue-colored.cbz", selectedJob?.id)} title="Download chapter"><Download size={18} /></button>}
+                  {pages[selectedPage]?.output_path && <button className="icon-button light" onClick={() => void downloadAsset(pages[selectedPage].output_path, `mangahue-page-${selectedPage + 1}.png`, selectedJob?.id)} title="Download page"><Download size={18} /></button>}
                 </div>
               </div>
 
@@ -539,6 +584,16 @@ export function MangaHueStudio() {
         {view === "library" && <JobTable jobs={jobs.filter((job) => job.status === "complete")} empty="No finished colorizations yet" onOpen={openJob} onRefresh={refreshJobs} />}
       </main>
       {sidebarOpen && <button className="sidebar-scrim" onClick={() => setSidebarOpen(false)} aria-label="Close navigation" />}
+      {accessOpen && (
+        <div className="dialog-layer">
+          <button className="dialog-scrim" onClick={() => setAccessOpen(false)} aria-label="Close API access" />
+          <section className="access-dialog" role="dialog" aria-modal="true" aria-labelledby="access-title">
+            <div className="dialog-head"><div><KeyRound size={18} /><h2 id="access-title">API access</h2></div><button className="icon-button" onClick={() => setAccessOpen(false)} title="Close"><X size={17} /></button></div>
+            <label className="field-block"><span>Access token</span><input className="token-input" type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+            <div className="dialog-actions"><button className="secondary-command" onClick={clearAccessToken}><Trash2 size={16} /> Clear</button><button className="primary-command" onClick={saveAccessToken}><Save size={16} /> Save</button></div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

@@ -57,6 +57,20 @@ export interface UploadResult {
   kind: "page" | "chapter";
 }
 
+export interface QuotaSnapshot {
+  policy: {
+    daily_pages: number;
+    daily_jobs: number;
+    max_pages_per_job: number;
+    max_concurrent_jobs: number;
+    max_output_bytes: number;
+  };
+  pages_used: number;
+  jobs_used: number;
+  active_jobs: number;
+  output_bytes: number;
+}
+
 export interface JobEvent {
   status: string;
   stage?: string;

@@ -72,6 +72,24 @@ impl PyramidColorizer {
         let target_w = lineart.width();
         let target_h = lineart.height();
         let target_dim = target_w.max(target_h);
+        if target_dim == 0 {
+            return Err(anyhow!("cannot colorize an empty pyramid input"));
+        }
+
+        let mut levels = self
+            .config
+            .levels
+            .iter()
+            .copied()
+            .filter(|level| *level <= target_dim)
+            .collect::<Vec<_>>();
+        if levels.is_empty() {
+            levels.push(target_dim);
+            info!(
+                resolution = target_dim,
+                "using native-size pyramid fallback for a small tile"
+            );
+        }
 
         let mut accumulated = RgbImage::new(0, 0);
         let mut per_level_ms = Vec::new();
@@ -79,7 +97,7 @@ impl PyramidColorizer {
         // are skipped and must not consume a blend weight).
         let mut applied_count = 0usize;
 
-        for (i, &level) in self.config.levels.iter().enumerate() {
+        for (i, &level) in levels.iter().enumerate() {
             if let Some(cancel) = &self.cancel {
                 if cancel.load(Ordering::Acquire) {
                     return Err(anyhow!(
@@ -89,16 +107,6 @@ impl PyramidColorizer {
             }
 
             let level_start = Instant::now();
-
-            if level > target_dim {
-                info!(
-                    level = i,
-                    resolution = level,
-                    tile_dim = target_dim,
-                    "skipping pyramid level larger than tile"
-                );
-                continue;
-            }
 
             let scale = level as f32 / target_dim as f32;
             let lw = (target_w as f32 * scale).round().max(1.0) as u32;
@@ -253,5 +261,27 @@ mod tests {
         assert_eq!(result.dimensions(), (w, h));
         assert_eq!(report.levels_used, 3);
         assert!(!report.per_level_ms.is_empty());
+    }
+
+    #[test]
+    fn pyramid_uses_native_fallback_for_small_tiles() {
+        let backend: Arc<dyn ColorizationBackend> =
+            Arc::new(mangahue_inference::MockColorizationBackend::default());
+        let config = PyramidConfig {
+            levels: vec![768],
+            blend_weights: vec![1.0],
+            ..PyramidConfig::default()
+        };
+        let colorizer = PyramidColorizer::new(backend, config);
+        let lineart = GrayImage::from_pixel(384, 512, Luma([200]));
+        let hint_map = RgbImage::from_pixel(384, 512, Rgb([0, 0, 0]));
+        let hint_mask = GrayImage::from_pixel(384, 512, Luma([0]));
+
+        let (result, report) = colorizer
+            .colorize_with_report(&lineart, &hint_map, &hint_mask)
+            .unwrap();
+
+        assert_eq!(result.dimensions(), (384, 512));
+        assert_eq!(report.levels_used, 1);
     }
 }

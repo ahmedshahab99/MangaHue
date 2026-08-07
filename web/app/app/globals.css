@@ -196,6 +196,17 @@ button.job-row:hover { background: #f8faf9; }
 .jobs-empty strong { color: var(--ink-soft); }
 .jobs-empty span { font-size: 11px; }
 .sidebar-scrim { display: none; }
+.dialog-layer { position: fixed; z-index: 80; inset: 0; display: grid; place-items: center; padding: 18px; }
+.dialog-scrim { position: absolute; inset: 0; border: 0; background: rgba(17, 21, 22, .58); cursor: default; }
+.access-dialog { position: relative; width: min(420px, 100%); padding: 20px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius); box-shadow: 0 22px 70px rgba(8, 12, 13, .28); }
+.dialog-head { min-height: 40px; margin-bottom: 18px; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.dialog-head > div { display: flex; align-items: center; gap: 9px; }
+.dialog-head h2 { margin: 0; font-size: 16px; }
+.token-input { width: 100%; height: 42px; border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 11px; color: var(--ink); background: #fafbfa; font-family: var(--font-mono); font-size: 11px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.dialog-actions button { min-height: 36px; padding: 0 13px; border-radius: 4px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; cursor: pointer; font-size: 11px; font-weight: 700; }
+.secondary-command { border: 1px solid var(--line-strong); background: var(--surface); }
+.primary-command { border: 1px solid var(--accent-dark); background: var(--accent); color: #fff; }
 .spin { animation: spin .85s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 

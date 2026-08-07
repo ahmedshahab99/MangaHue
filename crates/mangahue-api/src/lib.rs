@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Extension, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -44,12 +44,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::io::ReaderStream;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -176,6 +178,8 @@ pub struct ApiInspectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiJob {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     #[serde(default)]
     pub kind: ApiJobKind,
     pub status: ApiJobStatus,
@@ -203,11 +207,17 @@ pub enum ApiJobStatus {
 }
 
 impl ApiJob {
-    fn new(id: String, kind: ApiJobKind, output_path: Option<PathBuf>) -> Self {
+    fn new(
+        id: String,
+        kind: ApiJobKind,
+        output_path: Option<PathBuf>,
+        owner_id: Option<String>,
+    ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             result_url: Some(format!("/api/jobs/{id}/result")),
             id,
+            owner_id,
             kind,
             status: ApiJobStatus::Queued,
             progress: ApiJobProgress {
@@ -234,6 +244,11 @@ pub struct ApiState {
     pub studio_dir: PathBuf,
     pub cancel_tokens: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
+    pub job_slots: Arc<Semaphore>,
+    pub max_concurrent_jobs: usize,
+    pub job_retention_hours: u64,
+    pub default_model_path: PathBuf,
+    pub default_config_path: PathBuf,
     pub production: ProductionStore,
     /// Root directory that /api/file and sandboxed job paths resolve under.
     pub file_root: PathBuf,
@@ -256,7 +271,18 @@ pub struct ApiServerConfig {
     pub file_root: PathBuf,
     /// Extra origins (besides loopback) allowed to call the API.
     pub allowed_origins: Vec<String>,
+    #[serde(default = "default_max_concurrent_jobs")]
+    pub max_concurrent_jobs: usize,
+    #[serde(default = "default_job_retention_hours")]
+    pub job_retention_hours: u64,
+    #[serde(default = "default_model_path")]
+    pub default_model_path: PathBuf,
+    #[serde(default = "default_server_config_path")]
+    pub default_config_path: PathBuf,
 }
+
+#[derive(Debug, Clone)]
+struct RequestUser(UserAccount);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiDurableJobRequest {
@@ -391,6 +417,7 @@ pub struct ApiDatasetCurateRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiFileQuery {
     pub path: PathBuf,
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,22 +568,46 @@ impl IntoResponse for ApiError {
 pub async fn serve(config: ApiServerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.jobs_dir)
         .with_context(|| format!("failed to create {}", config.jobs_dir.display()))?;
+    let recovered_jobs = recover_job_manifests(&config.jobs_dir)?;
+    let default_model_path = config.default_model_path.canonicalize().with_context(|| {
+        format!(
+            "default model is unavailable at {}; download it before starting the API",
+            config.default_model_path.display()
+        )
+    })?;
+    let default_config_path = config.default_config_path.canonicalize().with_context(|| {
+        format!(
+            "default engine config is unavailable at {}",
+            config.default_config_path.display()
+        )
+    })?;
+    validate_default_inference_runtime(&default_model_path)?;
     let production = ProductionStore::open(&config.production_db)?;
     let file_root = config.file_root.clone();
     let allowed_origins = config.allowed_origins.clone();
     let sandbox_jobs = config.public_api;
     let state = ApiState {
-        jobs: Arc::new(RwLock::new(HashMap::new())),
+        jobs: Arc::new(RwLock::new(recovered_jobs)),
         jobs_dir: config.jobs_dir,
         styles_dir: config.styles_dir,
         studio_dir: config.studio_dir,
         cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
         event_channels: Arc::new(RwLock::new(HashMap::new())),
+        job_slots: Arc::new(Semaphore::new(config.max_concurrent_jobs.max(1))),
+        max_concurrent_jobs: config.max_concurrent_jobs.max(1),
+        job_retention_hours: config.job_retention_hours,
+        default_model_path,
+        default_config_path,
         production,
         file_root,
         sandbox_jobs,
         allowed_origins,
     };
+    spawn_transient_job_retention(
+        state.jobs.clone(),
+        state.jobs_dir.clone(),
+        state.job_retention_hours,
+    );
     let app = router_with_mode(state, config.public_api);
     let listener = TcpListener::bind(config.addr).await?;
     info!("MangaHue API listening on http://{}", config.addr);
@@ -592,15 +643,7 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
             post(upload_file).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route("/api/colorize", post(create_colorize_job))
-        .route(
-            "/api/gpu/colorize",
-            post(gpu_colorize).layer(DefaultBodyLimit::max(96 * 1024 * 1024)),
-        )
-        .route("/api/batch", post(create_batch_job))
-        .route("/api/link/ingest", post(ingest_link))
         .route("/api/link/colorize", post(create_link_colorize_job))
-        .route("/api/chapter/import", post(import_chapter))
-        .route("/api/chapter/export", post(export_chapter))
         .route("/api/chapter/colorize", post(create_chapter_colorize_job))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:id", get(get_job))
@@ -612,6 +655,14 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
     // corrections take host paths by design and are trusted-admin tools.
     let admin_routes = Router::new()
         .route("/metrics", get(metrics))
+        .route(
+            "/api/gpu/colorize",
+            post(gpu_colorize).layer(DefaultBodyLimit::max(96 * 1024 * 1024)),
+        )
+        .route("/api/batch", post(create_batch_job))
+        .route("/api/link/ingest", post(ingest_link))
+        .route("/api/chapter/import", post(import_chapter))
+        .route("/api/chapter/export", post(export_chapter))
         .route(
             "/api/doctor",
             get(run_doctor_default).post(run_doctor_custom),
@@ -713,7 +764,37 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
                 loopback_cors,
             ))
     };
-    app.layer(TraceLayer::new_for_http()).with_state(state)
+    app.layer(axum::middleware::from_fn(security_headers))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+        ),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
+    );
+    response
 }
 
 /// Rejects local-mode API calls that do not carry the guard header the
@@ -741,19 +822,21 @@ async fn local_guard(request: axum::extract::Request, next: axum::middleware::Ne
 /// webapp surfaces.
 async fn require_user(
     State(state): State<ApiState>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Err(error) = authenticated_user(&state, request.headers()) {
-        return error.into_response();
-    }
+    let user = match authenticated_user(&state, request.headers()) {
+        Ok(user) => user,
+        Err(error) => return error.into_response(),
+    };
+    request.extensions_mut().insert(RequestUser(user));
     next.run(request).await
 }
 
 /// Public-mode gate: operator surfaces additionally require an admin token.
 async fn require_admin(
     State(state): State<ApiState>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let user = match authenticated_user(&state, request.headers()) {
@@ -764,6 +847,7 @@ async fn require_admin(
         return ApiError::with_status(StatusCode::FORBIDDEN, anyhow!("admin token required"))
             .into_response();
     }
+    request.extensions_mut().insert(RequestUser(user));
     next.run(request).await
 }
 
@@ -844,11 +928,19 @@ fn origin_is_loopback(origin: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn health(State(state): State<ApiState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "engine": "MangaHue Engine",
-        "role": "manga color director"
+        "role": "manga color director",
+        "jobs": {
+            "running_capacity": state.max_concurrent_jobs,
+            "available_slots": state.job_slots.available_permits(),
+        },
+        "model": {
+            "ready": state.default_model_path.is_file(),
+            "name": state.default_model_path.file_name().and_then(|name| name.to_str()),
+        },
     }))
 }
 
@@ -973,18 +1065,60 @@ fn validate_public_source_url(source_url: &str) -> Result<()> {
 /// Strip optional host-path knobs that only an operator should control.
 /// Model/checkpoint paths are dropped outright: a remote caller must never
 /// be able to make the engine torch.load an arbitrary file (pickle RCE).
-/// Style and palette YAMLs stay because the webapp legitimately selects
-/// them and they contain no executable code.
 fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.model_path = None;
     request.reference_image_path = None;
     request.ensemble_model_paths.clear();
+    request.config_path = None;
+    request.preset_path = None;
+    request.palette_path = None;
+    request.draft_path = None;
     request.cache_dir = None;
     request.debug_dir = None;
     request.user_hints_path = None;
     request.project_path = None;
     request.region_locks_path = None;
     request.character_ids.clear();
+    request.idempotency_key = None;
+    request.use_mock_backend = false;
+}
+
+fn apply_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) -> Result<()> {
+    if state.sandbox_jobs {
+        request.style_path = request
+            .style_path
+            .as_deref()
+            .map(|path| resolve_trusted_style(&state.styles_dir, path))
+            .transpose()?;
+    }
+    if request.model_path.is_none() {
+        request.model_path = Some(state.default_model_path.clone());
+    }
+    if request.config_path.is_none() {
+        request.config_path = Some(state.default_config_path.clone());
+    }
+    Ok(())
+}
+
+fn resolve_trusted_style(styles_dir: &Path, requested: &Path) -> Result<PathBuf> {
+    let root = styles_dir
+        .canonicalize()
+        .with_context(|| format!("failed to resolve style directory {}", styles_dir.display()))?;
+    let mut candidates = vec![requested.to_path_buf()];
+    if !requested.is_absolute() {
+        candidates.push(root.join(requested));
+    }
+    for candidate in candidates {
+        if let Ok(resolved) = candidate.canonicalize() {
+            if resolved.starts_with(&root)
+                && resolved.extension().and_then(|value| value.to_str()) == Some("yaml")
+                && resolved.is_file()
+            {
+                return Ok(resolved);
+            }
+        }
+    }
+    anyhow::bail!("style must be one of the server-provided YAML profiles")
 }
 
 /// Public-mode sandbox for a single-page colorize request: the input must
@@ -994,9 +1128,10 @@ fn sandbox_colorize_request(
     request: &mut ColorizeRequest,
     jobs_dir: &Path,
     id: &str,
+    owner_id: Option<&str>,
 ) -> Result<()> {
     let input = request.input_path.clone();
-    request.input_path = resolve_local_file(jobs_dir, &input).with_context(|| {
+    request.input_path = resolve_owned_upload(jobs_dir, &input, owner_id).with_context(|| {
         format!(
             "input_path must live under the job workspace: {}",
             input.display()
@@ -1010,16 +1145,22 @@ fn sandbox_colorize_request(
     Ok(())
 }
 
-fn sandbox_batch_request(request: &mut ApiBatchRequest, jobs_dir: &Path, id: &str) -> Result<()> {
+fn sandbox_batch_request(
+    request: &mut ApiBatchRequest,
+    jobs_dir: &Path,
+    id: &str,
+    owner_id: Option<&str>,
+) -> Result<()> {
     let base = jobs_dir.join("batch").join(id);
     std::fs::create_dir_all(&base)
         .with_context(|| format!("failed to create {}", base.display()))?;
-    request.input_dir = resolve_local_file(jobs_dir, &request.input_dir).with_context(|| {
-        format!(
-            "input_dir must live under the job workspace: {}",
-            request.input_dir.display()
-        )
-    })?;
+    request.input_dir =
+        resolve_owned_upload(jobs_dir, &request.input_dir, owner_id).with_context(|| {
+            format!(
+                "input_dir must live under the job workspace: {}",
+                request.input_dir.display()
+            )
+        })?;
     request.output_dir = base.join("out");
     sandbox_engine_paths(&mut request.template);
     Ok(())
@@ -1039,58 +1180,22 @@ fn sandbox_link_request(
     Ok(())
 }
 
-fn sandbox_chapter_import(
-    request: &mut ApiChapterImportRequest,
-    jobs_dir: &Path,
-    id: &str,
-) -> Result<()> {
-    let base = jobs_dir.join("chapter_import").join(id);
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("failed to create {}", base.display()))?;
-    request.input_path = resolve_local_file(jobs_dir, &request.input_path).with_context(|| {
-        format!(
-            "input_path must live under the job workspace: {}",
-            request.input_path.display()
-        )
-    })?;
-    request.output_dir = base.join("out");
-    request.manifest_path = Some(base.join("manifest.json"));
-    Ok(())
-}
-
-fn sandbox_chapter_export(
-    request: &mut ApiChapterExportRequest,
-    jobs_dir: &Path,
-    id: &str,
-) -> Result<()> {
-    let base = jobs_dir.join("chapter_export").join(id);
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("failed to create {}", base.display()))?;
-    request.input_dir = resolve_local_file(jobs_dir, &request.input_dir).with_context(|| {
-        format!(
-            "input_dir must live under the job workspace: {}",
-            request.input_dir.display()
-        )
-    })?;
-    request.output_file = base.join("chapter.cbz");
-    request.manifest_path = Some(base.join("manifest.json"));
-    Ok(())
-}
-
 fn sandbox_chapter_request(
     request: &mut ApiChapterColorizeRequest,
     jobs_dir: &Path,
     id: &str,
+    owner_id: Option<&str>,
 ) -> Result<()> {
     let base = jobs_dir.join("chapter").join(id);
     std::fs::create_dir_all(&base)
         .with_context(|| format!("failed to create {}", base.display()))?;
-    request.input_path = resolve_local_file(jobs_dir, &request.input_path).with_context(|| {
-        format!(
-            "input_path must live under the job workspace: {}",
-            request.input_path.display()
-        )
-    })?;
+    request.input_path = resolve_owned_upload(jobs_dir, &request.input_path, owner_id)
+        .with_context(|| {
+            format!(
+                "input_path must live under the job workspace: {}",
+                request.input_path.display()
+            )
+        })?;
     request.work_dir = base.join("work");
     request.output_dir = base.join("out");
     request.export_path = Some(base.join("chapter.cbz"));
@@ -1188,6 +1293,87 @@ fn authenticated_user(
         .enforce_rate_limit(&user.id, requests_per_minute, 60)
         .map_err(|error| ApiError::with_status(StatusCode::TOO_MANY_REQUESTS, error))?;
     Ok(user)
+}
+
+fn request_owner(
+    state: &ApiState,
+    user: Option<&Extension<RequestUser>>,
+) -> std::result::Result<Option<String>, ApiError> {
+    if !state.sandbox_jobs {
+        return Ok(None);
+    }
+    user.map(|user| Some(user.0 .0.id.clone())).ok_or_else(|| {
+        ApiError::with_status(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("authenticated user context is missing"),
+        )
+    })
+}
+
+fn job_visible_to(job: &ApiJob, user: Option<&Extension<RequestUser>>) -> bool {
+    match user {
+        None => job.owner_id.is_none(),
+        Some(user) => {
+            user.0 .0.tier == mangahue_production::UserTier::Admin
+                || job.owner_id.as_deref() == Some(user.0 .0.id.as_str())
+        }
+    }
+}
+
+async fn authorized_job(
+    state: &ApiState,
+    id: &str,
+    user: Option<&Extension<RequestUser>>,
+) -> std::result::Result<ApiJob, ApiError> {
+    let job = get_job_by_id(state, id).await?;
+    if state.sandbox_jobs && !job_visible_to(&job, user) {
+        return Err(ApiError::with_status(
+            StatusCode::NOT_FOUND,
+            anyhow!("job not found"),
+        ));
+    }
+    Ok(job)
+}
+
+async fn reserve_web_job(
+    state: &ApiState,
+    owner_id: Option<&str>,
+    requested_pages: usize,
+    job_id: &str,
+) -> std::result::Result<(), ApiError> {
+    let Some(owner_id) = owner_id else {
+        return Ok(());
+    };
+    let snapshot = state
+        .production
+        .enforce_job_quota(owner_id, requested_pages.max(1) as u64)
+        .map_err(|error| ApiError::with_status(StatusCode::TOO_MANY_REQUESTS, error))?;
+    let active_web_jobs = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| {
+            job.owner_id.as_deref() == Some(owner_id)
+                && matches!(job.status, ApiJobStatus::Queued | ApiJobStatus::Running)
+        })
+        .count() as u64;
+    if active_web_jobs >= snapshot.policy.max_concurrent_jobs {
+        return Err(ApiError::with_status(
+            StatusCode::TOO_MANY_REQUESTS,
+            anyhow!("concurrent job quota exhausted"),
+        ));
+    }
+    state.production.record_usage(
+        owner_id,
+        "pages",
+        requested_pages.max(1) as u64,
+        Some(job_id),
+    )?;
+    state
+        .production
+        .record_usage(owner_id, "jobs", 1, Some(job_id))?;
+    Ok(())
 }
 
 async fn run_doctor_default(State(state): State<ApiState>) -> Json<DoctorReport> {
@@ -1361,9 +1547,22 @@ async fn gpu_colorize(
 
 async fn create_colorize_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     Json(mut payload): Json<ApiColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
+    let owner_id = request_owner(&state, user.as_ref())?;
     let id = Uuid::new_v4().to_string();
+    if state.sandbox_jobs {
+        sandbox_colorize_request(
+            &mut payload.request,
+            &state.jobs_dir,
+            &id,
+            owner_id.as_deref(),
+        )?;
+    }
+    apply_engine_defaults(&mut payload.request, &state)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
+    reserve_web_job(&state, owner_id.as_deref(), 1, &id).await?;
     let cancel_token = Arc::new(AtomicBool::new(false));
     let (event_tx, _) = broadcast::channel::<String>(32);
     state
@@ -1379,10 +1578,6 @@ async fn create_colorize_job(
 
     payload.request.cancel_token = Some(cancel_token.clone());
     payload.request.cache_dir = Some(state.jobs_dir.clone());
-
-    if state.sandbox_jobs {
-        sandbox_colorize_request(&mut payload.request, &state.jobs_dir, &id)?;
-    }
 
     // Progressive rendering: create an unbounded mpsc channel so the
     // orchestrator's blocking task can push per-tile progress updates
@@ -1426,6 +1621,7 @@ async fn create_colorize_job(
         id.clone(),
         ApiJobKind::Page,
         Some(payload.request.output_path.clone()),
+        owner_id,
     );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
@@ -1433,9 +1629,12 @@ async fn create_colorize_job(
 
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
+    let job_slots = state.job_slots.clone();
+    let cleanup_cancel_tokens = state.cancel_tokens.clone();
+    let cleanup_event_channels = state.event_channels.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    tokio::task::spawn_blocking(move || {
+    spawn_gated_blocking(job_slots, move || {
         let _ = event_tx.send(r#"{"status":"running","progress":0}"#.to_string());
         update_job_status_blocking(
             &runtime,
@@ -1499,6 +1698,12 @@ async fn create_colorize_job(
                 );
             }
         }
+        cleanup_job_runtime_blocking(
+            &runtime,
+            &cleanup_cancel_tokens,
+            &cleanup_event_channels,
+            &id,
+        );
     });
 
     Ok(Json(job))
@@ -1506,24 +1711,30 @@ async fn create_colorize_job(
 
 async fn create_batch_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     Json(mut payload): Json<ApiBatchRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
+    let owner_id = request_owner(&state, user.as_ref())?;
     let id = Uuid::new_v4().to_string();
     if state.sandbox_jobs {
-        sandbox_batch_request(&mut payload, &state.jobs_dir, &id)?;
+        sandbox_batch_request(&mut payload, &state.jobs_dir, &id, owner_id.as_deref())?;
     }
+    apply_engine_defaults(&mut payload.template, &state)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
     let job = ApiJob::new(
         id.clone(),
         ApiJobKind::Batch,
         Some(payload.output_dir.clone()),
+        owner_id,
     );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
+    let job_slots = state.job_slots.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    tokio::task::spawn_blocking(move || {
+    spawn_gated_blocking(job_slots, move || {
         update_job_status_blocking(
             &runtime,
             &jobs,
@@ -1615,8 +1826,10 @@ fn clamp_link_limits(max_pages: &mut usize, max_bytes_per_page: &mut u64) {
 
 async fn create_link_colorize_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     Json(mut payload): Json<ApiLinkColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
+    let owner_id = request_owner(&state, user.as_ref())?;
     validate_public_source_url(&payload.source_url)
         .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
     clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
@@ -1624,6 +1837,9 @@ async fn create_link_colorize_job(
     if state.sandbox_jobs {
         sandbox_link_request(&mut payload, &state.jobs_dir, &id)?;
     }
+    apply_engine_defaults(&mut payload.template, &state)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
+    reserve_web_job(&state, owner_id.as_deref(), payload.max_pages, &id).await?;
     let cancel_token = Arc::new(AtomicBool::new(false));
     let (event_tx, _) = broadcast::channel::<String>(64);
     state
@@ -1642,15 +1858,19 @@ async fn create_link_colorize_job(
         id.clone(),
         ApiJobKind::Link,
         Some(payload.output_dir.clone()),
+        owner_id,
     );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
     let _ = event_tx.send(r#"{"status":"queued","stage":"queued","progress":0}"#.to_string());
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
+    let job_slots = state.job_slots.clone();
+    let cleanup_cancel_tokens = state.cancel_tokens.clone();
+    let cleanup_event_channels = state.event_channels.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    tokio::task::spawn_blocking(move || {
+    spawn_gated_blocking(job_slots, move || {
         let _ =
             event_tx.send(r#"{"status":"running","stage":"downloading","progress":2}"#.to_string());
         update_job_status_blocking(
@@ -1720,19 +1940,21 @@ async fn create_link_colorize_job(
                 );
             }
         }
+        cleanup_job_runtime_blocking(
+            &runtime,
+            &cleanup_cancel_tokens,
+            &cleanup_event_channels,
+            &id,
+        );
     });
 
     Ok(Json(job))
 }
 
 async fn import_chapter(
-    State(state): State<ApiState>,
     Json(mut payload): Json<ApiChapterImportRequest>,
 ) -> Result<Json<ChapterManifest>, ApiError> {
     clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
-    if state.sandbox_jobs {
-        sandbox_chapter_import(&mut payload, &state.jobs_dir, &Uuid::new_v4().to_string())?;
-    }
     let manifest = tokio::task::spawn_blocking(move || {
         let manifest = import_chapter_to_dir(
             &payload.input_path,
@@ -1755,12 +1977,8 @@ async fn import_chapter(
 }
 
 async fn export_chapter(
-    State(state): State<ApiState>,
-    Json(mut payload): Json<ApiChapterExportRequest>,
+    Json(payload): Json<ApiChapterExportRequest>,
 ) -> Result<Json<ChapterManifest>, ApiError> {
-    if state.sandbox_jobs {
-        sandbox_chapter_export(&mut payload, &state.jobs_dir, &Uuid::new_v4().to_string())?;
-    }
     let manifest = tokio::task::spawn_blocking(move || {
         let manifest = export_chapter_archive(&payload.input_dir, &payload.output_file)?;
         if let Some(manifest_path) = payload.manifest_path {
@@ -1775,12 +1993,18 @@ async fn export_chapter(
 
 async fn create_chapter_colorize_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     Json(mut payload): Json<ApiChapterColorizeRequest>,
 ) -> Result<Json<ApiJob>, ApiError> {
+    let owner_id = request_owner(&state, user.as_ref())?;
+    clamp_link_limits(&mut payload.max_pages, &mut payload.max_bytes_per_page);
     let id = Uuid::new_v4().to_string();
     if state.sandbox_jobs {
-        sandbox_chapter_request(&mut payload, &state.jobs_dir, &id)?;
+        sandbox_chapter_request(&mut payload, &state.jobs_dir, &id, owner_id.as_deref())?;
     }
+    apply_engine_defaults(&mut payload.template, &state)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
+    reserve_web_job(&state, owner_id.as_deref(), payload.max_pages, &id).await?;
     let cancel_token = Arc::new(AtomicBool::new(false));
     let (event_tx, _) = broadcast::channel::<String>(64);
     state
@@ -1831,15 +2055,19 @@ async fn create_chapter_colorize_job(
         id.clone(),
         ApiJobKind::Chapter,
         Some(payload.output_dir.clone()),
+        owner_id,
     );
     state.jobs.write().await.insert(id.clone(), job.clone());
     persist_job(&state.jobs_dir, &job)?;
     let _ = event_tx.send(r#"{"status":"queued","stage":"queued","progress":0}"#.to_string());
     let jobs = state.jobs.clone();
     let jobs_dir = state.jobs_dir.clone();
+    let job_slots = state.job_slots.clone();
+    let cleanup_cancel_tokens = state.cancel_tokens.clone();
+    let cleanup_event_channels = state.event_channels.clone();
     let runtime = tokio::runtime::Handle::current();
 
-    tokio::task::spawn_blocking(move || {
+    spawn_gated_blocking(job_slots, move || {
         let _ = event_tx
             .send(r#"{"status":"running","stage":"preparing_chapter","progress":1}"#.to_string());
         update_job_status_blocking(
@@ -1934,6 +2162,12 @@ async fn create_chapter_colorize_job(
                 );
             }
         }
+        cleanup_job_runtime_blocking(
+            &runtime,
+            &cleanup_cancel_tokens,
+            &cleanup_event_channels,
+            &id,
+        );
     });
 
     Ok(Json(job))
@@ -1947,39 +2181,31 @@ async fn inspect_page(
 
 async fn get_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<ApiJob>, ApiError> {
-    let job = get_job_by_id(&state, &id).await?;
+    let job = authorized_job(&state, &id, user.as_ref()).await?;
     Ok(Json(job))
 }
 
-async fn list_jobs(State(state): State<ApiState>) -> Result<Json<Vec<ApiJob>>, ApiError> {
-    let mut jobs: HashMap<String, ApiJob> = HashMap::new();
-    if state.jobs_dir.exists() {
-        for entry in std::fs::read_dir(&state.jobs_dir)
-            .with_context(|| format!("failed to read {}", state.jobs_dir.display()))?
-        {
-            let entry = entry.map_err(anyhow::Error::from)?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(job) = serde_json::from_str::<ApiJob>(&text) {
-                    jobs.insert(job.id.clone(), job);
-                }
-            }
-        }
-    }
-    for (id, job) in state.jobs.read().await.iter() {
-        jobs.insert(id.clone(), job.clone());
-    }
-    let mut jobs: Vec<_> = jobs.into_values().collect();
+async fn list_jobs(
+    State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
+) -> Result<Json<Vec<ApiJob>>, ApiError> {
+    let mut jobs: Vec<_> = state
+        .jobs
+        .read()
+        .await
+        .values()
+        .filter(|job| !state.sandbox_jobs || job_visible_to(job, user.as_ref()))
+        .cloned()
+        .collect();
     jobs.sort_by(|a, b| {
         b.created_at
             .cmp(&a.created_at)
             .then_with(|| b.id.cmp(&a.id))
     });
+    jobs.truncate(250);
     Ok(Json(jobs))
 }
 
@@ -1992,9 +2218,22 @@ const FILE_EXT_WHITELIST: &[&str] = &[
 /// never be used to exfiltrate credentials or other host files.
 async fn get_local_file(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     Query(query): Query<ApiFileQuery>,
 ) -> Result<Response, ApiError> {
     let path = resolve_local_file(&state.file_root, &query.path)?;
+    if state.sandbox_jobs {
+        let job_id = query.job_id.as_deref().ok_or_else(|| {
+            ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!("job_id is required"))
+        })?;
+        let job = authorized_job(&state, job_id, user.as_ref()).await?;
+        if !job_references_path(&job, &path) {
+            return Err(ApiError::with_status(
+                StatusCode::FORBIDDEN,
+                anyhow!("file is not attached to this job"),
+            ));
+        }
+    }
     let allowed = path
         .extension()
         .and_then(|value| value.to_str())
@@ -2006,14 +2245,26 @@ async fn get_local_file(
             anyhow!("file type not served by the API"),
         ));
     }
-    let data = tokio::fs::read(&path)
+    let file = tokio::fs::File::open(&path)
         .await
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let mut response = Response::new(Body::from(data));
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let bytes = file
+        .metadata()
+        .await
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(file)));
     let content_type = content_type_for(&path);
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Ok(value) = HeaderValue::from_str(&bytes.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=3600"),
+    );
     Ok(response)
 }
 
@@ -2021,9 +2272,11 @@ async fn get_local_file(
 /// path to pass to /api/colorize or /api/chapter/colorize.
 async fn upload_file(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let field = multipart
+    let owner_id = request_owner(&state, user.as_ref())?;
+    let mut field = multipart
         .next_field()
         .await
         .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(error)))?
@@ -2034,22 +2287,6 @@ async fn upload_file(
             )
         })?;
     let file_name = field.file_name().map(|name| name.to_string());
-    let data = field
-        .bytes()
-        .await
-        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(error)))?;
-    if data.is_empty() {
-        return Err(ApiError::with_status(
-            StatusCode::BAD_REQUEST,
-            anyhow!("empty upload"),
-        ));
-    }
-    if data.len() > 250 * 1024 * 1024 {
-        return Err(ApiError::with_status(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            anyhow!("upload exceeds 250 MB"),
-        ));
-    }
     let ext = file_name
         .as_deref()
         .and_then(|name| Path::new(name).extension().and_then(|value| value.to_str()))
@@ -2057,28 +2294,98 @@ async fn upload_file(
         .filter(|value| {
             matches!(
                 value.as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tiff" | "gif" | "zip" | "cbz"
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff" | "zip" | "cbz"
             )
         })
-        .unwrap_or_else(|| "png".to_string());
-    let dir = state.jobs_dir.join("uploads");
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        .ok_or_else(|| {
+            ApiError::with_status(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                anyhow!("upload must be an image, ZIP, or CBZ file"),
+            )
+        })?;
+    let dir = state
+        .jobs_dir
+        .join("uploads")
+        .join(owner_id.as_deref().unwrap_or("local"));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed to create {}", dir.display()))?;
     let name = format!("{}.{}", Uuid::new_v4(), ext);
     let path = dir.join(&name);
-    std::fs::write(&path, &data).with_context(|| format!("failed to write {}", path.display()))?;
+    let partial = dir.join(format!(".{name}.partial"));
+    let mut output = tokio::fs::File::create(&partial)
+        .await
+        .with_context(|| format!("failed to create {}", partial.display()))?;
+    let mut size = 0usize;
+    let mut signature = Vec::with_capacity(16);
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(error)))?
+    {
+        size = size.saturating_add(chunk.len());
+        if size > 250 * 1024 * 1024 {
+            drop(output);
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(ApiError::with_status(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                anyhow!("upload exceeds 250 MB"),
+            ));
+        }
+        if signature.len() < 16 {
+            let take = (16 - signature.len()).min(chunk.len());
+            signature.extend_from_slice(&chunk[..take]);
+        }
+        output
+            .write_all(&chunk)
+            .await
+            .with_context(|| format!("failed to write {}", partial.display()))?;
+    }
+    output
+        .flush()
+        .await
+        .with_context(|| format!("failed to flush {}", partial.display()))?;
+    drop(output);
+    if size == 0 || !upload_signature_matches(&ext, &signature) {
+        let _ = tokio::fs::remove_file(&partial).await;
+        return Err(ApiError::with_status(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            anyhow!("uploaded bytes do not match the file type"),
+        ));
+    }
+    tokio::fs::rename(&partial, &path)
+        .await
+        .with_context(|| format!("failed to finalize {}", path.display()))?;
     Ok(Json(serde_json::json!({
         "id": name,
         "path": path,
-        "size": data.len(),
+        "size": size,
         "kind": if matches!(ext.as_str(), "zip" | "cbz") { "chapter" } else { "page" },
     })))
 }
 
+fn upload_signature_matches(extension: &str, bytes: &[u8]) -> bool {
+    match extension {
+        "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        "bmp" => bytes.starts_with(b"BM"),
+        "tif" | "tiff" => bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"),
+        "zip" | "cbz" => {
+            bytes.starts_with(b"PK\x03\x04")
+                || bytes.starts_with(b"PK\x05\x06")
+                || bytes.starts_with(b"PK\x07\x08")
+        }
+        _ => false,
+    }
+}
+
 async fn get_job_result(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let job = get_job_by_id(&state, &id).await?;
+    let job = authorized_job(&state, &id, user.as_ref()).await?;
     Ok(Json(serde_json::json!({
         "id": job.id,
         "status": job.status,
@@ -2389,6 +2696,37 @@ fn load_optional_style(path: Option<&Path>) -> Result<mangahue_core::StyleProfil
     }
 }
 
+fn spawn_gated_blocking<F>(slots: Arc<Semaphore>, task: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    tokio::spawn(async move {
+        let permit = match slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                error!("job scheduler closed before work could start: {error}");
+                return;
+            }
+        };
+        if let Err(error) = tokio::task::spawn_blocking(task).await {
+            error!("job worker task failed: {error}");
+        }
+        drop(permit);
+    });
+}
+
+fn cleanup_job_runtime_blocking(
+    runtime: &tokio::runtime::Handle,
+    cancel_tokens: &Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
+    event_channels: &Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
+    id: &str,
+) {
+    runtime.block_on(async {
+        cancel_tokens.write().await.remove(id);
+        event_channels.write().await.remove(id);
+    });
+}
+
 fn update_job_status_blocking(
     runtime: &tokio::runtime::Handle,
     jobs: &Arc<RwLock<HashMap<String, ApiJob>>>,
@@ -2471,6 +2809,181 @@ fn safe_job_id(id: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
+fn spawn_transient_job_retention(
+    jobs: Arc<RwLock<HashMap<String, ApiJob>>>,
+    jobs_dir: PathBuf,
+    retention_hours: u64,
+) {
+    if retention_hours == 0 {
+        info!("transient job retention is disabled");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            match sweep_transient_jobs(&jobs, &jobs_dir, retention_hours).await {
+                Ok(removed) if removed > 0 => {
+                    info!(removed, "pruned expired transient jobs");
+                }
+                Ok(_) => {}
+                Err(error) => warn!("transient job retention failed: {error:#}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        }
+    });
+}
+
+async fn sweep_transient_jobs(
+    jobs: &Arc<RwLock<HashMap<String, ApiJob>>>,
+    jobs_dir: &Path,
+    retention_hours: u64,
+) -> Result<usize> {
+    let retention_seconds = retention_hours.saturating_mul(60 * 60);
+    let cutoff = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(i64::try_from(retention_seconds).unwrap_or(i64::MAX));
+    let expired = {
+        let mut jobs = jobs.write().await;
+        let expired_ids = jobs
+            .values()
+            .filter(|job| {
+                matches!(
+                    job.status,
+                    ApiJobStatus::Complete | ApiJobStatus::Cancelled | ApiJobStatus::Failed
+                ) && chrono::DateTime::parse_from_rfc3339(&job.updated_at)
+                    .map(|updated| updated.timestamp() < cutoff)
+                    .unwrap_or(false)
+            })
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
+        expired_ids
+            .into_iter()
+            .filter_map(|id| jobs.remove(&id))
+            .collect::<Vec<_>>()
+    };
+    let jobs_dir = jobs_dir.to_path_buf();
+    let removed = expired.len();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        for job in expired {
+            remove_expired_job_files(&jobs_dir, &job)?;
+        }
+        prune_old_uploads(
+            &jobs_dir.join("uploads"),
+            std::time::Duration::from_secs(retention_seconds),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(removed)
+}
+
+fn remove_expired_job_files(jobs_dir: &Path, job: &ApiJob) -> Result<()> {
+    if !safe_job_id(&job.id) {
+        anyhow::bail!("refusing to remove files for unsafe job id {:?}", job.id);
+    }
+    remove_path_if_present(&jobs_dir.join(format!("{}.json", job.id)))?;
+    for category in ["batch", "link", "chapter"] {
+        remove_path_if_present(&jobs_dir.join(category).join(&job.id))?;
+    }
+    if let Some(output_path) = job.output_path.as_ref() {
+        if output_path.starts_with(jobs_dir) && output_path != jobs_dir {
+            remove_path_if_present(output_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path_if_present(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("failed to remove expired path {}", path.display()))
+}
+
+fn prune_old_uploads(root: &Path, retention: std::time::Duration) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root).min_depth(1).into_iter() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!("could not inspect upload during retention: {error}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age > retention)
+            .unwrap_or(false);
+        if old_enough {
+            remove_path_if_present(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn recover_job_manifests(jobs_dir: &Path) -> Result<HashMap<String, ApiJob>> {
+    let mut jobs = HashMap::new();
+    for entry in std::fs::read_dir(jobs_dir)
+        .with_context(|| format!("failed to read {}", jobs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!(path = %path.display(), "could not read job manifest: {error}");
+                continue;
+            }
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(path = %path.display(), "ignoring invalid JSON beside job manifests: {error}");
+                continue;
+            }
+        };
+        if value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            continue;
+        }
+        let mut job = match serde_json::from_value::<ApiJob>(value) {
+            Ok(job) => job,
+            Err(error) => {
+                warn!(path = %path.display(), "ignoring invalid job manifest: {error}");
+                continue;
+            }
+        };
+        if matches!(job.status, ApiJobStatus::Queued | ApiJobStatus::Running) {
+            job.status = ApiJobStatus::Failed;
+            job.progress.stage = "interrupted".to_string();
+            job.error = Some("server restarted before this job completed".to_string());
+            job.updated_at = chrono::Utc::now().to_rfc3339();
+            persist_job(jobs_dir, &job)?;
+        }
+        jobs.insert(job.id.clone(), job);
+    }
+    Ok(jobs)
+}
+
 fn persist_job(jobs_dir: &std::path::Path, job: &ApiJob) -> Result<()> {
     if !safe_job_id(&job.id) {
         anyhow::bail!("refusing to persist job with unsafe id {:?}", job.id);
@@ -2478,8 +2991,25 @@ fn persist_job(jobs_dir: &std::path::Path, job: &ApiJob) -> Result<()> {
     std::fs::create_dir_all(jobs_dir)
         .with_context(|| format!("failed to create {}", jobs_dir.display()))?;
     let path = jobs_dir.join(format!("{}.json", job.id));
-    std::fs::write(&path, serde_json::to_string_pretty(job)?)
-        .with_context(|| format!("failed to write job manifest {}", path.display()))
+    let temporary = jobs_dir.join(format!(".{}.{}.tmp", job.id, Uuid::new_v4()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(job)?)
+        .with_context(|| format!("failed to write job manifest {}", temporary.display()))?;
+    if let Err(first_error) = std::fs::rename(&temporary, &path) {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to replace job manifest {}", path.display()))?;
+            std::fs::rename(&temporary, &path).with_context(|| {
+                format!(
+                    "failed to finalize job manifest {} after rename error: {first_error}",
+                    path.display()
+                )
+            })?;
+        } else {
+            return Err(first_error)
+                .with_context(|| format!("failed to finalize job manifest {}", path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn read_job(jobs_dir: &std::path::Path, id: &str) -> Result<ApiJob> {
@@ -2690,6 +3220,43 @@ fn run_link_colorize_payload(
 
 fn default_continue_on_error() -> bool {
     true
+}
+
+fn default_max_concurrent_jobs() -> usize {
+    1
+}
+
+fn default_job_retention_hours() -> u64 {
+    7 * 24
+}
+
+fn default_model_path() -> PathBuf {
+    PathBuf::from("models/ddcolor-tiny-fp16.onnx")
+}
+
+fn default_server_config_path() -> PathBuf {
+    PathBuf::from("configs/engine.studio.yaml")
+}
+
+fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
+    if !mangahue_inference::is_ddcolor_onnx_model(model_path) {
+        return Ok(());
+    }
+    let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let output = Command::new(&python)
+        .args([
+            "-c",
+            "import numpy, onnxruntime, PIL, mangahue_train.ddcolor_onnx_worker",
+        ])
+        .output()
+        .with_context(|| format!("failed to start inference Python runtime '{python}'"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "inference Python runtime is incomplete: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn default_true() -> bool {
@@ -3000,6 +3567,14 @@ fn aggregate_doctor_status(checks: &[DoctorCheck]) -> DoctorStatus {
 }
 
 fn resolve_local_file(root: &Path, path: &Path) -> Result<PathBuf> {
+    let resolved = resolve_path_under(root, path)?;
+    if !resolved.is_file() {
+        anyhow::bail!("{} is not a file", resolved.display());
+    }
+    Ok(resolved)
+}
+
+fn resolve_path_under(root: &Path, path: &Path) -> Result<PathBuf> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = if path.is_absolute() {
         path.to_path_buf()
@@ -3016,10 +3591,54 @@ fn resolve_local_file(root: &Path, path: &Path) -> Result<PathBuf> {
             root.display()
         );
     }
-    if !resolved.is_file() {
-        anyhow::bail!("{} is not a file", resolved.display());
+    Ok(resolved)
+}
+
+fn resolve_owned_upload(root: &Path, path: &Path, owner_id: Option<&str>) -> Result<PathBuf> {
+    let resolved = resolve_path_under(root, path)?;
+    if let Some(owner_id) = owner_id {
+        let owner_root = root
+            .join("uploads")
+            .join(owner_id)
+            .canonicalize()
+            .with_context(|| "owned upload directory is missing")?;
+        if !resolved.starts_with(&owner_root) {
+            anyhow::bail!("input does not belong to the authenticated user");
+        }
     }
     Ok(resolved)
+}
+
+fn job_references_path(job: &ApiJob, resolved: &Path) -> bool {
+    fn same_file(candidate: &Path, resolved: &Path) -> bool {
+        candidate
+            .canonicalize()
+            .map(|candidate| candidate == resolved)
+            .unwrap_or(false)
+    }
+
+    fn value_references_path(value: &serde_json::Value, resolved: &Path) -> bool {
+        match value {
+            serde_json::Value::String(candidate) => same_file(Path::new(candidate), resolved),
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| value_references_path(value, resolved)),
+            serde_json::Value::Object(values) => values
+                .values()
+                .any(|value| value_references_path(value, resolved)),
+            _ => false,
+        }
+    }
+
+    job.output_path
+        .as_deref()
+        .map(|path| same_file(path, resolved))
+        .unwrap_or(false)
+        || job
+            .result
+            .as_ref()
+            .map(|value| value_references_path(value, resolved))
+            .unwrap_or(false)
 }
 
 fn safe_url_slug(value: &str) -> String {
@@ -3104,8 +3723,10 @@ pub fn planned_routes() -> &'static [&'static str] {
 
 async fn job_events_sse(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     AxumPath(id): AxumPath<String>,
-) -> Sse<impl Stream<Item = anyhow::Result<Event>>> {
+) -> Result<Sse<impl Stream<Item = anyhow::Result<Event>>>, ApiError> {
+    authorized_job(&state, &id, user.as_ref()).await?;
     let rx = {
         let channels = state.event_channels.read().await;
         match channels.get(&id).cloned() {
@@ -3121,13 +3742,15 @@ async fn job_events_sse(
         Ok(data) => Ok(Event::default().data(data)),
         Err(_) => Ok(Event::default().data(r#"{"status":"dropped"}"#)),
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 async fn cancel_job(
     State(state): State<ApiState>,
+    user: Option<Extension<RequestUser>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    authorized_job(&state, &id, user.as_ref()).await?;
     let token = state.cancel_tokens.read().await.get(&id).cloned();
     match token {
         Some(toggle) => {
@@ -3169,6 +3792,7 @@ mod tests {
             "job_1".to_string(),
             ApiJobKind::Page,
             Some(PathBuf::from("out.png")),
+            None,
         );
         job.status = ApiJobStatus::Complete;
         job.report_url = Some("/api/jobs/job_1/result".to_string());
@@ -3178,6 +3802,143 @@ mod tests {
         assert_eq!(loaded.id, job.id);
         assert_eq!(loaded.status, ApiJobStatus::Complete);
         assert_eq!(loaded.result.unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn recovery_marks_interrupted_jobs_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut job = ApiJob::new("running_job".to_string(), ApiJobKind::Chapter, None, None);
+        job.status = ApiJobStatus::Running;
+        persist_job(dir.path(), &job).unwrap();
+
+        let recovered = recover_job_manifests(dir.path()).unwrap();
+        let recovered = recovered.get("running_job").unwrap();
+        assert_eq!(recovered.status, ApiJobStatus::Failed);
+        assert_eq!(recovered.progress.stage, "interrupted");
+    }
+
+    #[test]
+    fn recovery_ignores_unrelated_json_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::json!({ "pages": 12, "status": "complete" }).to_string(),
+        )
+        .unwrap();
+
+        let recovered = recover_job_manifests(dir.path()).unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retention_removes_expired_terminal_jobs_and_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("link").join("expired");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        std::fs::write(output_dir.join("page.png"), b"old output").unwrap();
+        let mut job = ApiJob::new(
+            "expired".to_string(),
+            ApiJobKind::Link,
+            Some(output_dir.clone()),
+            None,
+        );
+        job.status = ApiJobStatus::Complete;
+        job.updated_at = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        persist_job(dir.path(), &job).unwrap();
+        let jobs = Arc::new(RwLock::new(HashMap::from([(job.id.clone(), job)])));
+
+        let removed = sweep_transient_jobs(&jobs, dir.path(), 1).await.unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(jobs.read().await.is_empty());
+        assert!(!dir.path().join("expired.json").exists());
+        assert!(!output_dir.exists());
+    }
+
+    #[test]
+    fn upload_signatures_reject_mismatched_extensions() {
+        assert!(upload_signature_matches("png", b"\x89PNG\r\n\x1a\nrest"));
+        assert!(upload_signature_matches("cbz", b"PK\x03\x04rest"));
+        assert!(!upload_signature_matches("png", b"PK\x03\x04rest"));
+        assert!(!upload_signature_matches("jpg", b"not an image"));
+    }
+
+    #[test]
+    fn public_engine_policy_forces_trusted_model_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let styles_dir = dir.path().join("styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        let style = styles_dir.join("trusted.yaml");
+        std::fs::write(&style, "id: trusted\nname: Trusted\n").unwrap();
+        let state = ApiState {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            jobs_dir: dir.path().join("jobs"),
+            styles_dir,
+            studio_dir: dir.path().join("studio"),
+            cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            job_slots: Arc::new(Semaphore::new(1)),
+            max_concurrent_jobs: 1,
+            job_retention_hours: 168,
+            default_model_path: dir.path().join("trusted.onnx"),
+            default_config_path: dir.path().join("trusted.yaml"),
+            production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
+            file_root: dir.path().join("jobs"),
+            sandbox_jobs: true,
+            allowed_origins: vec![],
+        };
+        let mut request = ColorizeRequest {
+            model_path: Some(PathBuf::from("attacker.pkl")),
+            config_path: Some(PathBuf::from("attacker.yaml")),
+            style_path: Some(style),
+            use_mock_backend: true,
+            ..ColorizeRequest::default()
+        };
+
+        sandbox_engine_paths(&mut request);
+        apply_engine_defaults(&mut request, &state).unwrap();
+
+        assert_eq!(
+            request.model_path.as_deref(),
+            Some(state.default_model_path.as_path())
+        );
+        assert_eq!(
+            request.config_path.as_deref(),
+            Some(state.default_config_path.as_path())
+        );
+        assert!(!request.use_mock_backend);
+        assert!(request
+            .style_path
+            .unwrap()
+            .starts_with(state.styles_dir.canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn job_visibility_is_owner_scoped() {
+        let owned = ApiJob::new(
+            "owned".to_string(),
+            ApiJobKind::Page,
+            None,
+            Some("artist-1".to_string()),
+        );
+        let artist = Extension(RequestUser(UserAccount {
+            id: "artist-2".to_string(),
+            email: "artist@example.com".to_string(),
+            display_name: "Artist".to_string(),
+            tier: mangahue_production::UserTier::Free,
+            active: true,
+            created_at: 0,
+        }));
+        let admin = Extension(RequestUser(UserAccount {
+            id: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            display_name: "Admin".to_string(),
+            tier: mangahue_production::UserTier::Admin,
+            active: true,
+            created_at: 0,
+        }));
+        assert!(!job_visible_to(&owned, Some(&artist)));
+        assert!(job_visible_to(&owned, Some(&admin)));
     }
 
     #[test]
@@ -3206,6 +3967,11 @@ mod tests {
             studio_dir: dir.path().join("studio"),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
+            job_slots: Arc::new(Semaphore::new(1)),
+            max_concurrent_jobs: 1,
+            job_retention_hours: 168,
+            default_model_path: dir.path().join("model.onnx"),
+            default_config_path: dir.path().join("engine.yaml"),
             production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
             file_root: dir.path().join("jobs"),
             sandbox_jobs: true,
@@ -3224,6 +3990,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            health
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|value| value.to_str().ok()),
+            Some("nosniff")
+        );
 
         let unauthenticated = app
             .clone()

@@ -1,67 +1,87 @@
+name: mangahue
+
 services:
   api:
-    build: .
+    build:
+      context: .
+      target: runtime-small
+    image: mangahue:${MANGAHUE_TAG:-local}
     restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
     ports:
-      - "7878:7878"
+      - "${MANGAHUE_BIND:-127.0.0.1}:${API_PORT:-7878}:7878"
+    environment:
+      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
+      MANGAHUE_MAX_CONCURRENT_JOBS: ${MANGAHUE_MAX_CONCURRENT_JOBS:-1}
+      MANGAHUE_JOB_RETENTION_HOURS: ${MANGAHUE_JOB_RETENTION_HOURS:-168}
+      MANGAHUE_DEFAULT_MODEL: /app/models/ddcolor-tiny-fp16.onnx
+      MANGAHUE_DEFAULT_CONFIG: /app/configs/engine.studio.yaml
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-900}
+      OMP_NUM_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      XDG_CACHE_HOME: /tmp/cache
     volumes:
       - mangahue-data:/data
       - ./models:/app/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: ${MANGAHUE_API_MEMORY:-4608m}
+    cpus: ${MANGAHUE_API_CPUS:-2.0}
+    logging:
+      driver: json-file
+      options:
+        max-size: 25m
+        max-file: "3"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7878/health')"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7878/health"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 45s
 
   worker:
-    build: .
+    profiles: ["durable"]
+    image: mangahue:${MANGAHUE_TAG:-local}
     restart: unless-stopped
+    init: true
     entrypoint: ["mangahue-worker"]
-    command: ["--database", "/data/production.db", "--object-store", "/data/objects", "--worker-id", "gpu-worker-1"]
+    command:
+      - "--database"
+      - "/data/production.db"
+      - "--object-store"
+      - "/data/objects"
+      - "--worker-id"
+      - "${WORKER_ID:-cpu-worker-1}"
+    environment:
+      RUST_LOG: ${RUST_LOG:-mangahue=info}
+      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-900}
+      OMP_NUM_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
+      XDG_CACHE_HOME: /tmp/cache
     volumes:
       - mangahue-data:/data
       - ./models:/app/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 192
+    mem_limit: ${MANGAHUE_WORKER_MEMORY:-1536m}
+    cpus: ${MANGAHUE_WORKER_CPUS:-1.0}
     depends_on:
       api:
         condition: service_healthy
-
-  telegram:
-    build: .
-    restart: unless-stopped
-    profiles: ["telegram"]
-    entrypoint: ["mangahue-telegram"]
-    command: ["--work-dir", "/data/telegram", "--max-pages", "32", "--pyramid", "--hint-propagate"]
-    environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-    volumes:
-      - mangahue-data:/data
-      - ./models:/app/models:ro
-
-  telegram-small:
-    build: .
-    restart: unless-stopped
-    profiles: ["telegram-small"]
-    entrypoint: ["mangahue-telegram"]
-    command:
-      - "--work-dir"
-      - "/data/telegram"
-      - "--max-pages"
-      - "32"
-      - "--max-concurrent-jobs"
-      - "1"
-      - "--model"
-      - "/app/models/manga-onnx/manga-colorize-fp16.onnx"
-      - "--preset"
-      - "/app/configs/engine.onnx-small.yaml"
-      - "--hint-propagate"
-    environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
-      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
-    volumes:
-      - mangahue-data:/data
-      - ${MANGAHUE_MODEL_DIR:-./models}:/app/models:ro
 
 volumes:
   mangahue-data:

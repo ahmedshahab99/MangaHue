@@ -765,6 +765,10 @@ impl MangaHueEngine {
             emit_progress(&progress, "inference_done", 4, 6, None);
         }
 
+        if check_cancel(&cancel) {
+            return Err(anyhow!("colorization cancelled after inference"));
+        }
+
         let mut merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
 
@@ -847,6 +851,9 @@ impl MangaHueEngine {
             config: &config.postprocess,
             reference_image: reference_image.as_ref(),
         })?;
+        if check_cancel(&cancel) {
+            return Err(anyhow!("colorization cancelled during postprocess"));
+        }
         report.add_stage_report(
             StageReport::new("postprocess")
                 .metric(

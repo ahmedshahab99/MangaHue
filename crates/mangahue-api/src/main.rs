@@ -32,6 +32,22 @@ struct Args {
         help = "Additional CORS origin allowed to call the API (repeatable)"
     )]
     cors_origin: Vec<String>,
+    #[arg(long, default_value_t = 1, env = "MANGAHUE_MAX_CONCURRENT_JOBS")]
+    max_concurrent_jobs: usize,
+    #[arg(long, default_value_t = 168, env = "MANGAHUE_JOB_RETENTION_HOURS")]
+    job_retention_hours: u64,
+    #[arg(
+        long,
+        default_value = "models/ddcolor-tiny-fp16.onnx",
+        env = "MANGAHUE_DEFAULT_MODEL"
+    )]
+    default_model: PathBuf,
+    #[arg(
+        long,
+        default_value = "configs/engine.studio.yaml",
+        env = "MANGAHUE_DEFAULT_CONFIG"
+    )]
+    default_config: PathBuf,
 }
 
 #[tokio::main]
@@ -56,6 +72,10 @@ async fn main() -> Result<()> {
         public_api: args.public_api,
         file_root,
         allowed_origins: args.cors_origin,
+        max_concurrent_jobs: args.max_concurrent_jobs,
+        job_retention_hours: args.job_retention_hours,
+        default_model_path: args.default_model,
+        default_config_path: args.default_config,
     })
     .await
 }
