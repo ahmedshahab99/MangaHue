@@ -74,9 +74,12 @@ from typing import Any
 import numpy as np
 import onnx
 import onnxruntime as ort
-from onnx import AttributeProto, TensorProto, checker, numpy_helper, shape_inference
+from onnx import AttributeProto, TensorProto, checker, numpy_helper
 from onnxruntime.quantization import QuantType, quantize_dynamic, quantize_static
-from onnxruntime.quantization.calibration import CalibrationDataReader
+try:
+    from onnxruntime.quantization.calibration import CalibrationDataReader  # type: ignore[attr-defined]
+except ImportError:  # onnxruntime >= 1.28 moved it
+    from onnxruntime.quantization import CalibrationDataReader
 from PIL import Image
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
@@ -151,6 +154,28 @@ def has_fp16(model: onnx.ModelProto) -> bool:
     return False
 
 
+def _rewrite_fp16_casts(graph: onnx.GraphProto) -> int:
+    """Rewrite every Cast(to=fp16) node to Cast(to=fp32), recursing into subgraphs.
+
+    Mixed-precision exports (like this GAN) cast tensors to fp16 *inside* the
+    graph; converting initializers alone leaves those Casts emitting fp16 into
+    fp32-typed consumers, which ORT rejects at session load.
+    """
+    count = 0
+    for node in graph.node:
+        for attribute in node.attribute:
+            if attribute.type == AttributeProto.GRAPH:
+                count += _rewrite_fp16_casts(attribute.g)
+            elif attribute.type == AttributeProto.GRAPHS:
+                for subgraph in attribute.graphs:
+                    count += _rewrite_fp16_casts(subgraph)
+        for attribute in node.attribute:
+            if attribute.name == "to" and attribute.type == AttributeProto.INT and attribute.i == TensorProto.FLOAT16:
+                attribute.i = TensorProto.FLOAT
+                count += 1
+    return count
+
+
 def to_fp32(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
     """Cast every float16 tensor in the graph to float32 in place.
 
@@ -177,12 +202,12 @@ def to_fp32(model: onnx.ModelProto) -> tuple[onnx.ModelProto, int]:
         if tensor_type.elem_type == TensorProto.FLOAT16:
             tensor_type.elem_type = TensorProto.FLOAT
             count += 1
-    try:
-        # Rebuild value_info so no stale fp16 metadata survives.
-        return shape_inference.infer_shapes(model), count
-    except Exception as exc:
-        print(f"warning: shape inference after fp16->fp32 conversion failed: {exc}")
-        return model, count
+    count += _rewrite_fp16_casts(graph)
+    # value_info types were rewritten in place above and Cast nodes now emit
+    # fp32, so the graph is consistent without running shape_inference (which
+    # can balloon memory on large GAN graphs by materializing every
+    # intermediate); ORT re-infers shapes at session load.
+    return model, count
 
 
 @contextmanager
