@@ -157,7 +157,10 @@ pub fn scene_palette(palette: &[ColorRgb], scene: &SceneProfile, keep: usize) ->
 
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
 
-    let mut chosen: Vec<ColorRgb> = Vec::with_capacity(keep);
+    // The first nine entries are stable semantic roles used by the face and
+    // material directors: paper (0-1), skin (2-5), hair (6-8). Scene
+    // adaptation may rank accents, but it must never reorder these roles.
+    let mut chosen: Vec<ColorRgb> = palette.iter().take(9.min(keep)).copied().collect();
     for (_, color) in scored {
         if chosen.len() >= keep {
             break;
@@ -232,5 +235,22 @@ mod tests {
         let result = scene_palette(&palette, &scene, 4);
         assert!(result.len() >= 4, "got {}", result.len());
         assert!(result.contains(&ColorRgb::new(66, 103, 214)));
+    }
+
+    #[test]
+    fn scene_palette_preserves_semantic_slot_order() {
+        let palette = (0..12)
+            .map(|index| ColorRgb::new(index, 20 + index, 40 + index))
+            .collect::<Vec<_>>();
+        let scene = SceneProfile {
+            lighting: SceneLighting::Day,
+            warmth: 0.0,
+            brightness: 0.8,
+            contrast: 48.0,
+        };
+
+        let result = scene_palette(&palette, &scene, 10);
+
+        assert_eq!(&result[..9], &palette[..9]);
     }
 }

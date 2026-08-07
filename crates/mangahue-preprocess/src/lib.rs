@@ -3,7 +3,7 @@ use image::{DynamicImage, GrayImage, Luma};
 use mangahue_config::PreprocessSection;
 use mangahue_core::BoundingBox;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Named constants (replacing magic numbers)
@@ -93,7 +93,7 @@ impl Default for AdvancedPreprocessConfig {
             sauvola_k: 0.5,
             min_bubble_area: 1000,
             bubble_circularity_min: 0.7,
-            bubble_circularity_max: 1.3,
+            bubble_circularity_max: 1.8,
             min_text_stroke_width: 1,
             max_text_stroke_width: 4,
             background_margin: BACKGROUND_MARGIN,
@@ -718,27 +718,23 @@ pub fn detect_speech_bubbles_basic(
             if area < advanced.min_bubble_area as f64 {
                 return false;
             }
-            let perimeter = component_perimeter(c, width, height);
+            let bbox = component_bbox(c);
+            let perimeter = outer_component_perimeter(c, bbox);
             let c_val = circularity(perimeter, area);
+            let text = enclosed_text_evidence(line_mask, c, bbox);
             c_val >= advanced.bubble_circularity_min as f64
                 && c_val <= advanced.bubble_circularity_max as f64
+                && text.glyphs >= 6
+                && text.lines >= 2
         })
         .cloned()
         .collect();
 
     let contour_count = contour_components.len();
 
-    // Fall back to the original flood-fill result if contour check finds
-    // nothing.
-    let selected: &[Vec<(u32, u32)>] = if contour_components.is_empty() {
-        &candidates
-    } else {
-        &contour_components
-    };
-
     let mut bubble_mask = GrayImage::new(width, height);
     let mut regions = 0usize;
-    for component in selected {
+    for component in &contour_components {
         for &(px, py) in component {
             bubble_mask.put_pixel(px, py, Luma([255]));
         }
@@ -748,25 +744,146 @@ pub fn detect_speech_bubbles_basic(
     (bubble_mask, regions, contour_count)
 }
 
-/// Counts the 4-connected boundary length of a component.
-fn component_perimeter(points: &[(u32, u32)], width: u32, height: u32) -> f64 {
-    let set: HashSet<(u32, u32)> = points.iter().copied().collect();
-    let mut perimeter = 0f64;
+/// Counts only the outer 4-connected boundary. Ink glyphs create holes in a
+/// white bubble; counting those holes as contour made real dialogue balloons
+/// look irregular and triggered the unsafe all-candidates fallback.
+fn outer_component_perimeter(points: &[(u32, u32)], bbox: BoundingBox) -> f64 {
+    let local_width = bbox.width as usize + 2;
+    let local_height = bbox.height as usize + 2;
+    let mut component = vec![false; local_width * local_height];
     for &(x, y) in points {
-        if x == 0 || !set.contains(&(x - 1, y)) {
-            perimeter += 1.0;
+        let lx = (x - bbox.x) as usize + 1;
+        let ly = (y - bbox.y) as usize + 1;
+        component[ly * local_width + lx] = true;
+    }
+
+    let mut exterior = vec![false; component.len()];
+    let mut queue = VecDeque::from([(0usize, 0usize)]);
+    exterior[0] = true;
+    while let Some((x, y)) = queue.pop_front() {
+        let neighbors = [
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ];
+        for (nx, ny) in neighbors {
+            if nx >= local_width || ny >= local_height {
+                continue;
+            }
+            let index = ny * local_width + nx;
+            if component[index] || exterior[index] {
+                continue;
+            }
+            exterior[index] = true;
+            queue.push_back((nx, ny));
         }
-        if x + 1 >= width || !set.contains(&(x + 1, y)) {
-            perimeter += 1.0;
-        }
-        if y == 0 || !set.contains(&(x, y - 1)) {
-            perimeter += 1.0;
-        }
-        if y + 1 >= height || !set.contains(&(x, y + 1)) {
-            perimeter += 1.0;
+    }
+
+    let mut perimeter = 0.0;
+    for y in 1..local_height - 1 {
+        for x in 1..local_width - 1 {
+            if !component[y * local_width + x] {
+                continue;
+            }
+            for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                if exterior[ny * local_width + nx] {
+                    perimeter += 1.0;
+                }
+            }
         }
     }
     perimeter
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TextEvidence {
+    glyphs: usize,
+    lines: usize,
+}
+
+/// Finds small ink islands enclosed by the candidate's white interior. Text
+/// yields many similarly sized islands arranged on multiple baselines; facial
+/// features and clothing seams normally do not.
+fn enclosed_text_evidence(
+    line_mask: &GrayImage,
+    _points: &[(u32, u32)],
+    bbox: BoundingBox,
+) -> TextEvidence {
+    if bbox.width < 8 || bbox.height < 8 {
+        return TextEvidence::default();
+    }
+    let width = bbox.width as usize;
+    let height = bbox.height as usize;
+    let mut eligible = vec![false; width * height];
+
+    for y in bbox.y + 1..bbox.bottom().saturating_sub(1) {
+        for x in bbox.x + 1..bbox.right().saturating_sub(1) {
+            if line_mask.get_pixel(x, y)[0] >= 96 {
+                eligible[(y - bbox.y) as usize * width + (x - bbox.x) as usize] = true;
+            }
+        }
+    }
+
+    let mut visited = vec![false; eligible.len()];
+    let mut centers = Vec::<u32>::new();
+    let max_glyph_width = (bbox.width / 4).max(5);
+    let max_glyph_height = (bbox.height / 3).max(7);
+    for local_y in 0..bbox.height {
+        for local_x in 0..bbox.width {
+            let start = local_y as usize * width + local_x as usize;
+            if !eligible[start] || visited[start] {
+                continue;
+            }
+            let mut queue = VecDeque::from([(local_x, local_y)]);
+            visited[start] = true;
+            let mut count = 0u32;
+            let mut min_x = local_x;
+            let mut max_x = local_x;
+            let mut min_y = local_y;
+            let mut max_y = local_y;
+            while let Some((x, y)) = queue.pop_front() {
+                count += 1;
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+                for ny in y.saturating_sub(1)..=(y + 1).min(bbox.height - 1) {
+                    for nx in x.saturating_sub(1)..=(x + 1).min(bbox.width - 1) {
+                        let index = ny as usize * width + nx as usize;
+                        if eligible[index] && !visited[index] {
+                            visited[index] = true;
+                            queue.push_back((nx, ny));
+                        }
+                    }
+                }
+            }
+            let glyph_width = max_x - min_x + 1;
+            let glyph_height = max_y - min_y + 1;
+            if count >= 2 && glyph_width <= max_glyph_width && glyph_height <= max_glyph_height {
+                centers.push(bbox.y + (min_y + max_y) / 2);
+            }
+        }
+    }
+
+    centers.sort_unstable();
+    let line_tolerance = (bbox.height / 24).clamp(3, 12);
+    let mut lines = Vec::<(u32, usize)>::new();
+    for center in &centers {
+        if let Some((mean, count)) = lines
+            .iter_mut()
+            .find(|(mean, _)| mean.abs_diff(*center) <= line_tolerance)
+        {
+            *mean = ((*mean as usize * *count + *center as usize) / (*count + 1)) as u32;
+            *count += 1;
+        } else {
+            lines.push((*center, 1));
+        }
+    }
+    TextEvidence {
+        glyphs: centers.len(),
+        lines: lines.into_iter().filter(|(_, count)| *count >= 2).count(),
+    }
 }
 
 /// Circularity metric: `perimeter² / (4π · area)`.
@@ -1157,5 +1274,73 @@ mod tests {
         let result = preprocess_page(&img, &config.preprocess, &advanced).unwrap();
         assert_eq!(result.clean_lineart.dimensions(), (32, 24));
         assert_eq!(result.line_mask.dimensions(), (32, 24));
+    }
+
+    #[test]
+    fn speech_bubble_requires_multiline_text_evidence() {
+        let mut gray = GrayImage::from_pixel(200, 300, Luma([255]));
+        let mut lines = GrayImage::new(200, 300);
+        draw_box(&mut gray, &mut lines, 65, 35, 134, 104);
+        for y in [52, 70, 88] {
+            draw_glyph(&mut gray, &mut lines, 82, y);
+            draw_glyph(&mut gray, &mut lines, 102, y);
+        }
+
+        let (mask, regions, contours) =
+            detect_speech_bubbles_basic(&gray, &lines, &AdvancedPreprocessConfig::default());
+
+        assert_eq!(regions, 1);
+        assert_eq!(contours, 1);
+        assert_eq!(mask.get_pixel(75, 45)[0], 255);
+        assert_eq!(mask.get_pixel(10, 10)[0], 0);
+    }
+
+    #[test]
+    fn bright_face_cavity_is_not_a_speech_bubble() {
+        let mut gray = GrayImage::from_pixel(200, 300, Luma([255]));
+        let mut lines = GrayImage::new(200, 300);
+        draw_box(&mut gray, &mut lines, 65, 35, 134, 104);
+        draw_glyph(&mut gray, &mut lines, 82, 58);
+        draw_glyph(&mut gray, &mut lines, 104, 58);
+        draw_glyph(&mut gray, &mut lines, 93, 75);
+        draw_glyph(&mut gray, &mut lines, 93, 90);
+
+        let (mask, regions, contours) =
+            detect_speech_bubbles_basic(&gray, &lines, &AdvancedPreprocessConfig::default());
+
+        assert_eq!(regions, 0);
+        assert_eq!(contours, 0);
+        assert!(mask.pixels().all(|pixel| pixel[0] == 0));
+    }
+
+    fn draw_box(
+        gray: &mut GrayImage,
+        lines: &mut GrayImage,
+        min_x: u32,
+        min_y: u32,
+        max_x: u32,
+        max_y: u32,
+    ) {
+        for x in min_x..=max_x {
+            gray.put_pixel(x, min_y, Luma([0]));
+            gray.put_pixel(x, max_y, Luma([0]));
+            lines.put_pixel(x, min_y, Luma([255]));
+            lines.put_pixel(x, max_y, Luma([255]));
+        }
+        for y in min_y..=max_y {
+            gray.put_pixel(min_x, y, Luma([0]));
+            gray.put_pixel(max_x, y, Luma([0]));
+            lines.put_pixel(min_x, y, Luma([255]));
+            lines.put_pixel(max_x, y, Luma([255]));
+        }
+    }
+
+    fn draw_glyph(gray: &mut GrayImage, lines: &mut GrayImage, x: u32, y: u32) {
+        for py in y..y + 6 {
+            for px in x..x + 3 {
+                gray.put_pixel(px, py, Luma([0]));
+                lines.put_pixel(px, py, Luma([255]));
+            }
+        }
     }
 }

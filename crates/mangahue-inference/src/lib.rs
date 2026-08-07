@@ -173,6 +173,19 @@ pub fn is_reference_cgan_model_dir(path: impl AsRef<Path>) -> bool {
     path.as_ref().join("074000_gray.pt").is_file()
 }
 
+pub fn is_openvino_studio_model_dir(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.join("unet").join("openvino_model.xml").is_file()
+        && path
+            .join("vae_encoder")
+            .join("openvino_model.xml")
+            .is_file()
+        && path
+            .join("vae_decoder")
+            .join("openvino_model.xml")
+            .is_file()
+}
+
 pub fn is_anime_face_model_dir(path: impl AsRef<Path>) -> bool {
     path.as_ref().join("lbpcascade_animeface.xml").is_file()
 }
@@ -598,6 +611,190 @@ impl ColorizationBackend for ReferenceCganBackend {
         image::open(&output_path)
             .map(|image| image.to_rgb8())
             .map_err(|error| EngineError::Inference(format!("reference cGAN output: {error}")))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenVinoStudioWorkerLaunch {
+    python: String,
+    model_root: PathBuf,
+    long_edge: u32,
+    steps: u32,
+    strength: f32,
+    worker_threads: usize,
+}
+
+impl OpenVinoStudioWorkerLaunch {
+    fn spawn(&self) -> Result<PretrainedWorkerProcess> {
+        let mut command = Command::new(&self.python);
+        command
+            .arg("-u")
+            .arg("-m")
+            .arg("mangahue_train.studio_openvino_worker")
+            .arg("--model-root")
+            .arg(&self.model_root)
+            .arg("--long-edge")
+            .arg(self.long_edge.to_string())
+            .arg("--steps")
+            .arg(self.steps.to_string())
+            .arg("--strength")
+            .arg(self.strength.to_string())
+            .arg("--threads")
+            .arg(self.worker_threads.to_string())
+            .arg("--serve")
+            .env("OMP_NUM_THREADS", self.worker_threads.to_string())
+            .env("MKL_NUM_THREADS", self.worker_threads.to_string())
+            .env("MALLOC_ARENA_MAX", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        apply_worker_pythonpath(&mut command, &self.python);
+        let child = command.spawn().with_context(|| {
+            format!(
+                "failed to launch OpenVINO Studio worker with '{}'",
+                self.python
+            )
+        })?;
+        let mut process =
+            attach_worker_process(child, "openvino-studio-worker", configured_worker_timeout())?;
+        wait_for_worker_ready(&mut process, "OpenVINO Studio worker")?;
+        Ok(process)
+    }
+}
+
+#[derive(Debug)]
+pub struct OpenVinoStudioBackend {
+    launch: OpenVinoStudioWorkerLaunch,
+    process: Mutex<PretrainedWorkerProcess>,
+}
+
+impl OpenVinoStudioBackend {
+    pub fn new(model_root: impl AsRef<Path>, input_size: u32) -> Result<Self> {
+        let requested = model_root.as_ref();
+        let model_root = requested.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve OpenVINO Studio model {}",
+                requested.display()
+            )
+        })?;
+        if !is_openvino_studio_model_dir(&model_root) {
+            anyhow::bail!(
+                "OpenVINO Studio model directory is incomplete: {}",
+                model_root.display()
+            );
+        }
+        let python = std::env::var("MANGAHUE_STUDIO_PYTHON")
+            .or_else(|_| std::env::var("MANGAHUE_PYTHON"))
+            .unwrap_or_else(|_| "python".to_string());
+        let worker_threads = std::env::var("MANGAHUE_MODEL_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let steps = std::env::var("MANGAHUE_STUDIO_STEPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(4)
+            .clamp(2, 12);
+        let strength = std::env::var("MANGAHUE_STUDIO_STRENGTH")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.38)
+            .clamp(0.05, 1.0);
+        let long_edge = input_size.clamp(256, 768).next_multiple_of(64);
+        let launch = OpenVinoStudioWorkerLaunch {
+            python,
+            model_root,
+            long_edge,
+            steps,
+            strength,
+            worker_threads,
+        };
+        let process = launch.spawn()?;
+        Ok(Self {
+            launch,
+            process: Mutex::new(process),
+        })
+    }
+
+    pub fn shared(model_root: impl AsRef<Path>, input_size: u32) -> Result<Arc<Self>> {
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<OpenVinoStudioBackend>>>> =
+            OnceLock::new();
+        let canonical = model_root.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve OpenVINO Studio model {}",
+                model_root.as_ref().display()
+            )
+        })?;
+        let key = format!("{}|{}", canonical.display(), input_size);
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|error| anyhow!("OpenVINO Studio registry poisoned: {error}"))?;
+        if let Some(worker) = workers.get(&key) {
+            return Ok(Arc::clone(worker));
+        }
+        let worker = Arc::new(Self::new(&canonical, input_size)?);
+        workers.insert(key, Arc::clone(&worker));
+        evict_idle_workers(&mut workers, 1);
+        Ok(worker)
+    }
+}
+
+impl ColorizationBackend for OpenVinoStudioBackend {
+    fn name(&self) -> &str {
+        "openvino-lcm-studio"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        true
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let temp = tempfile::tempdir()
+            .map_err(|error| EngineError::Inference(format!("Studio temp dir: {error}")))?;
+        let lineart_path = temp.path().join("lineart.png");
+        let output_path = temp.path().join("output.png");
+        input
+            .lineart
+            .save(&lineart_path)
+            .map_err(|error| EngineError::Inference(format!("Studio input save: {error}")))?;
+        let request = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "lineart": lineart_path,
+            "output": output_path,
+        });
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|error| EngineError::Inference(format!("Studio worker lock: {error}")))?;
+        let response = match exchange_worker_request(&mut process, &request) {
+            Ok(response) => response,
+            Err(first_error) => {
+                *process = self.launch.spawn().map_err(|restart_error| {
+                    EngineError::Inference(format!(
+                        "Studio worker failed ({first_error}) and restart failed: {restart_error}"
+                    ))
+                })?;
+                exchange_worker_request(&mut process, &request).map_err(|second_error| {
+                    EngineError::Inference(format!(
+                        "Studio worker failed after restart: {second_error}"
+                    ))
+                })?
+            }
+        };
+        if response.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+            return Err(EngineError::Inference(format!(
+                "OpenVINO Studio failed: {}",
+                response
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown error")
+            )));
+        }
+        image::open(&output_path)
+            .map(|image| image.to_rgb8())
+            .map_err(|error| EngineError::Inference(format!("Studio output: {error}")))
     }
 }
 
@@ -1801,6 +1998,25 @@ impl ColorizationBackend for OnnxColorizationBackend {
 #[cfg(feature = "native-onnx")]
 use ort::{session::Session, value::Tensor};
 
+/// Build an ONNX session tuned for the host: graph optimizations on and a
+/// bounded intra-op thread pool (2 threads matches the 2-core VPS and the
+/// previous Python worker's settings; override with MANGAHUE_MODEL_THREADS).
+#[cfg(feature = "native-onnx")]
+fn native_session_builder() -> Result<ort::session::builder::SessionBuilder> {
+    let threads = std::env::var("MANGAHUE_MODEL_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(2)
+        .clamp(1, 8);
+    let builder = Session::builder()
+        .map_err(|e| anyhow!("failed to create ONNX session: {e}"))?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
+        .map_err(|e| anyhow!("failed to set ONNX graph optimization level: {e}"))?
+        .with_intra_threads(threads)
+        .map_err(|e| anyhow!("failed to set ONNX intra-op threads: {e}"))?;
+    Ok(builder)
+}
+
 #[cfg(feature = "native-onnx")]
 #[derive(Debug)]
 pub struct RustOnnxBackend {
@@ -1859,8 +2075,8 @@ impl RustOnnxBackend {
     pub fn new(model_path: impl AsRef<Path>, metadata_path: impl AsRef<Path>) -> Result<Self> {
         let metadata = ModelMetadata::load(metadata_path)?;
         let model_path = model_path.as_ref();
-        let session = Session::builder()
-            .map_err(|e| anyhow!("failed to create ONNX session: {e}"))?
+        let mut builder = native_session_builder()?;
+        let session = builder
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("failed to load ONNX model {}: {e}", model_path.display()))?;
         let input_name = metadata
@@ -1945,6 +2161,267 @@ impl ColorizationBackend for RustOnnxBackend {
         }
         apply_purple_correction(&mut image, &input.lineart);
         Ok(image)
+    }
+}
+
+/// Native Rust DDColor backend — a faithful port of the Python
+/// `ddcolor_onnx_worker.py` sidecar so DDColor ONNX models run entirely
+/// inside the process: no Python runtime, no IPC, no extra working set.
+///
+/// Contract (verified against the shipped ddcolor-*.metadata.json files):
+///   input  "input"  [1, 3, 512, 512]  neutral sRGB (gray via CIE L*)
+///   output "output" [1, 2, 512, 512]  CIE L*a*b* a/b planes (tanh or scaled)
+#[cfg(feature = "native-onnx")]
+pub struct NativeDdColorOnnxBackend {
+    session: Mutex<Session>,
+    ab_scale: f32,
+    input_name: String,
+    output_name: String,
+}
+
+#[cfg(feature = "native-onnx")]
+const DDCOLOR_MODEL_SIZE: u32 = 512;
+
+#[cfg(feature = "native-onnx")]
+const CIE_DELTA: f32 = 6.0 / 29.0;
+
+#[cfg(feature = "native-onnx")]
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(feature = "native-onnx")]
+fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// CIE 1931 L* from an sRGB pixel, matching the Python worker exactly.
+#[cfg(feature = "native-onnx")]
+fn rgb_to_lab_l(r: f32, g: f32, b: f32) -> f32 {
+    let lr = srgb_to_linear(r);
+    let lg = srgb_to_linear(g);
+    let lb = srgb_to_linear(b);
+    let y = 0.2126729 * lr + 0.7151522 * lg + 0.0721750 * lb;
+    let delta = CIE_DELTA;
+    let f = if y > delta * delta * delta {
+        y.cbrt()
+    } else {
+        y / (3.0 * delta * delta) + 4.0 / 29.0
+    };
+    116.0 * f - 16.0
+}
+
+#[cfg(feature = "native-onnx")]
+fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    let fy = (l + 16.0) / 116.0;
+    let fx = fy + a / 500.0;
+    let fz = fy - b / 200.0;
+    let delta = CIE_DELTA;
+    let inv = |t: f32| -> f32 {
+        if t > delta {
+            t * t * t
+        } else {
+            3.0 * delta * delta * (t - 4.0 / 29.0)
+        }
+    };
+    let x = inv(fx) * 0.95047;
+    let y = inv(fy);
+    let z = inv(fz) * 1.08883;
+    let r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
+    let g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+    let bl = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
+    (linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(bl))
+}
+
+/// Saturating warmup input: raw tanh graphs report |ab| <= ~1; graphs with
+/// the scale baked in report far above 2. Mirrors the Python calibration.
+#[cfg(feature = "native-onnx")]
+fn calibrate_ab_scale(
+    session: &mut Session,
+    input_name: &str,
+    output_name: &str,
+) -> std::result::Result<f32, EngineError> {
+    let n = (DDCOLOR_MODEL_SIZE * DDCOLOR_MODEL_SIZE) as usize;
+    let mut pattern = vec![0.0f32; 3 * n];
+    let half = (DDCOLOR_MODEL_SIZE / 2) as usize;
+    // channel 0 (R): top half red; channel 1 (G): bottom half green
+    for i in 0..(half * DDCOLOR_MODEL_SIZE as usize) {
+        pattern[i] = 1.0;
+    }
+    for i in (half * DDCOLOR_MODEL_SIZE as usize)..n {
+        pattern[n + i] = 1.0;
+    }
+    let array = ndarray::Array4::from_shape_vec(
+        (
+            1,
+            3,
+            DDCOLOR_MODEL_SIZE as usize,
+            DDCOLOR_MODEL_SIZE as usize,
+        ),
+        pattern,
+    )
+    .map_err(|e| EngineError::Inference(format!("calibration tensor shape error: {e}")))?;
+    let tensor = Tensor::from_array(array)
+        .map_err(|e| EngineError::Inference(format!("failed to create calibration tensor: {e}")))?;
+    let outputs = session
+        .run(ort::inputs![input_name.to_string() => tensor])
+        .map_err(|e| EngineError::Inference(format!("calibration inference failed: {e}")))?;
+    let (_, data) = outputs[output_name]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| {
+            EngineError::Inference(format!("calibration output extraction failed: {e}"))
+        })?;
+    let peak = data.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    Ok(if peak <= 2.0 { 110.0 } else { 1.0 })
+}
+
+#[cfg(feature = "native-onnx")]
+impl NativeDdColorOnnxBackend {
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+        let mut builder = native_session_builder()?;
+        let session = builder.commit_from_file(model_path.as_ref()).map_err(|e| {
+            anyhow!(
+                "failed to load DDColor ONNX model {}: {e}",
+                model_path.as_ref().display()
+            )
+        })?;
+        let mut session = session;
+        let input_name = "input".to_string();
+        let output_name = "output".to_string();
+        let ab_scale = calibrate_ab_scale(&mut session, &input_name, &output_name)?;
+        Ok(Self {
+            session: Mutex::new(session),
+            ab_scale,
+            input_name,
+            output_name,
+        })
+    }
+}
+
+#[cfg(feature = "native-onnx")]
+impl ColorizationBackend for NativeDdColorOnnxBackend {
+    fn name(&self) -> &str {
+        "ddcolor-native-rust"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        true
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let (w, h) = input.lineart.dimensions();
+        let gray = input.lineart.clone();
+
+        // Resize to the model's native 512x512 (Lanczos3 approximates the
+        // Python worker's bicubic), then build the neutral-RGB tensor.
+        let resized = image::imageops::resize(
+            &gray,
+            DDCOLOR_MODEL_SIZE,
+            DDCOLOR_MODEL_SIZE,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let n = (DDCOLOR_MODEL_SIZE * DDCOLOR_MODEL_SIZE) as usize;
+        let mut tensor_data = Vec::with_capacity(3 * n);
+        for _ in 0..3 {
+            tensor_data.extend((0..n).map(|_| 0.0f32));
+        }
+        for y in 0..DDCOLOR_MODEL_SIZE {
+            for x in 0..DDCOLOR_MODEL_SIZE {
+                let g = resized.get_pixel(x, y)[0] as f32 / 255.0;
+                let l = rgb_to_lab_l(g, g, g);
+                let (nr, ng, nb) = lab_to_rgb(l, 0.0, 0.0);
+                let idx = (y * DDCOLOR_MODEL_SIZE + x) as usize;
+                tensor_data[idx] = nr;
+                tensor_data[n + idx] = ng;
+                tensor_data[2 * n + idx] = nb;
+            }
+        }
+        let array = ndarray::Array4::from_shape_vec(
+            (
+                1,
+                3,
+                DDCOLOR_MODEL_SIZE as usize,
+                DDCOLOR_MODEL_SIZE as usize,
+            ),
+            tensor_data,
+        )
+        .map_err(|e| EngineError::Inference(format!("tensor shape error: {e}")))?;
+        let tensor = Tensor::from_array(array)
+            .map_err(|e| EngineError::Inference(format!("failed to create tensor: {e}")))?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
+        let in_name = self.input_name.clone();
+        let out_name = self.output_name.clone();
+        let outputs = session
+            .run(ort::inputs![in_name => tensor])
+            .map_err(|e| EngineError::Inference(format!("DDColor inference failed: {e}")))?;
+        let (_, output_data) = outputs[out_name.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
+
+        // a/b planes at model resolution, scaled per the calibrated convention.
+        let scale = self.ab_scale;
+        let mut a_resized = image::GrayImage::new(w, h);
+        let mut b_resized = image::GrayImage::new(w, h);
+        let plane = n;
+        {
+            let mut a_model = image::GrayImage::new(DDCOLOR_MODEL_SIZE, DDCOLOR_MODEL_SIZE);
+            let mut b_model = image::GrayImage::new(DDCOLOR_MODEL_SIZE, DDCOLOR_MODEL_SIZE);
+            for i in 0..n {
+                let a = (output_data[i] * scale).clamp(-127.0, 127.0);
+                let b = (output_data[plane + i] * scale).clamp(-127.0, 127.0);
+                let x = (i % DDCOLOR_MODEL_SIZE as usize) as u32;
+                let y = (i / DDCOLOR_MODEL_SIZE as usize) as u32;
+                a_model.put_pixel(
+                    x,
+                    y,
+                    image::Luma([((a + 127.0).round() as u16).min(254) as u8]),
+                );
+                b_model.put_pixel(
+                    x,
+                    y,
+                    image::Luma([((b + 127.0).round() as u16).min(254) as u8]),
+                );
+            }
+            // Bilinear (Triangle) matches the Python worker's PIL BILINEAR.
+            a_resized =
+                image::imageops::resize(&a_model, w, h, image::imageops::FilterType::Triangle);
+            b_resized =
+                image::imageops::resize(&b_model, w, h, image::imageops::FilterType::Triangle);
+        }
+
+        // Merge a/b with the ORIGINAL tile's L* and convert back to sRGB.
+        let mut out = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let g = gray.get_pixel(x, y)[0] as f32 / 255.0;
+                let l = rgb_to_lab_l(g, g, g);
+                let a = (a_resized.get_pixel(x, y)[0] as f32) - 127.0;
+                let b = (b_resized.get_pixel(x, y)[0] as f32) - 127.0;
+                let (r, g2, bl) = lab_to_rgb(l, a, b);
+                out.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        (r.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (g2.clamp(0.0, 1.0) * 255.0).round() as u8,
+                        (bl.clamp(0.0, 1.0) * 255.0).round() as u8,
+                    ]),
+                );
+            }
+        }
+        Ok(out)
     }
 }
 

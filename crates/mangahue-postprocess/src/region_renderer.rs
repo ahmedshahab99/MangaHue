@@ -223,8 +223,17 @@ pub(crate) fn render_region_graph(
     propagate_graph_colors(&mut colors, &stats, &adjacency);
     let semantic_adjacency =
         build_cross_ink_adjacency(&roots, &root_to_region, &stats, line_mask, width, height);
-    let mut semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
+    let face_cavity = detect_face_cavity_field(original_gray, line_mask);
+    let face_support = summarize_face_support(&roots, &root_to_region, &face_cavity, stats.len());
+    let mut semantics = infer_region_semantics(
+        &stats,
+        &colors,
+        original_gray,
+        line_mask,
+        Some(&face_support),
+    );
     propagate_region_semantics(&mut semantics, &stats, &semantic_adjacency);
+    let propagated_semantics = semantics.clone();
 
     // Chroma Diversity Director: after propagation, ensure adjacent regions
     // hold perceptually distinct hues (kills the flat single-hue collapse).
@@ -232,11 +241,22 @@ pub(crate) fn render_region_graph(
     // Re-evaluate semantics with the FINAL region hues: skin classification
     // must not force the render's skin treatment onto regions the director
     // deliberately moved away from the warm sector (backgrounds, clothing).
-    let semantics = infer_region_semantics(&stats, &colors, original_gray, line_mask);
+    let mut semantics = infer_region_semantics(
+        &stats,
+        &colors,
+        original_gray,
+        line_mask,
+        Some(&face_support),
+    );
+    for (semantic, propagated) in semantics.iter_mut().zip(propagated_semantics) {
+        if propagated.skin > semantic.skin {
+            semantic.skin = propagated.skin;
+        }
+        semantic.skin_seed |= propagated.skin_seed;
+    }
 
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
-    let face_cavity = detect_face_cavity_field(original_gray, line_mask);
     let mut report = RegionRenderReport {
         regions: stats.iter().filter(|region| region.count >= 20).count() as u64,
         seeded_regions: seed_derived,
@@ -454,16 +474,50 @@ fn measure_cavity_ellipse(
     )
 }
 
+fn summarize_face_support(
+    roots: &[u32],
+    root_to_region: &HashMap<u32, usize>,
+    face_cavity: &[f32],
+    region_count: usize,
+) -> Vec<f32> {
+    let mut strongest = vec![0.0_f32; region_count];
+    let mut supported_pixels = vec![0_u32; region_count];
+    for (index, score) in face_cavity.iter().copied().enumerate() {
+        if score <= 0.08 {
+            continue;
+        }
+        let Some(region) = roots
+            .get(index)
+            .and_then(|root| root_to_region.get(root))
+            .copied()
+        else {
+            continue;
+        };
+        strongest[region] = strongest[region].max(score);
+        supported_pixels[region] += 1;
+    }
+    for (score, pixels) in strongest.iter_mut().zip(supported_pixels) {
+        if pixels < 64 {
+            *score = 0.0;
+        }
+    }
+    strongest
+}
+
 fn infer_region_semantics(
     stats: &[RegionStats],
     colors: &[RegionColor],
     original_gray: &GrayImage,
     line_mask: &GrayImage,
+    face_support: Option<&[f32]>,
 ) -> Vec<RegionSemantic> {
+    let page_area = original_gray.width() as u64 * original_gray.height() as u64;
+    let max_skin_area = (page_area * 36 / 100).max(40_000);
     stats
         .iter()
         .zip(colors)
-        .map(|(region, color)| {
+        .enumerate()
+        .map(|(index, (region, color))| {
             if region.count < 20 {
                 return RegionSemantic::default();
             }
@@ -508,9 +562,26 @@ fn infer_region_semantics(
             // region's FINAL hue must still be warm (the diversity director
             // moves backgrounds/clothing away from the warm sector).
             let warm_sector = color.red > 2.0 && color.blue < 2.0;
-            let skin_shape = !elongated && region.count <= 40_000 && luma < 251.0 && warm_sector;
-            let mut skin = if plausible_skin && skin_shape {
-                warm_evidence.max(graph_warmth * color.confidence) * 0.94
+            let face_connected = face_support
+                .and_then(|support| support.get(index))
+                .copied()
+                .unwrap_or(0.0)
+                > 0.12;
+            let compact_skin = !elongated && region.count <= 40_000;
+            let body_skin = face_connected
+                && u64::from(region.count) <= max_skin_area
+                && width / height.max(1.0) <= 3.2
+                && height / width.max(1.0) <= 3.2;
+            let skin_shape = luma < 251.0 && (compact_skin || body_skin);
+            let semantic_skin_evidence = if face_connected {
+                warm_evidence.max(graph_warmth).max(0.72)
+            } else {
+                warm_evidence.max(graph_warmth * color.confidence)
+            };
+            let mut skin = if skin_shape
+                && ((plausible_skin && warm_sector) || (body_skin && texture < 16.0))
+            {
+                semantic_skin_evidence * 0.94
             } else {
                 0.0
             };
@@ -1016,21 +1087,24 @@ fn chroma_diversity_director(
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|a, b| stats[*b].count.cmp(&stats[*a].count).then_with(|| b.cmp(a)));
 
-    // Candidate hues per region: current + palette + golden-angle rotations
-    // of the current hue (137.5 deg steps give maximal perceptual spread).
-    let golden_angle = 137.5077_f32.to_radians();
+    // Candidate hues come only from the artist-approved palette. Earlier
+    // versions rotated hues by the golden angle, which could turn a valid
+    // warm body draft lime green even when green was absent from the style.
     let mut candidates: Vec<Vec<(f32, f32)>> = Vec::with_capacity(n);
-    for color in colors.iter().take(n) {
+    for (index, color) in colors.iter().take(n).enumerate() {
+        let skin_region = semantics[index].skin > 0.42;
         let current = (color.red, color.blue);
-        let mut set: Vec<(f32, f32)> = vec![current];
-        for &(_, pr, pb) in palette {
-            set.push((pr, pb));
+        let mut set: Vec<(f32, f32)> = Vec::new();
+        if !skin_region || natural_skin_chroma(current.0, current.1) {
+            set.push(current);
         }
-        let base = current;
-        for k in 1..=5 {
-            let angle = golden_angle * k as f32;
-            let (s, c) = angle.sin_cos();
-            set.push((base.0 * c - base.1 * s, base.0 * s + base.1 * c));
+        for &(_, pr, pb) in palette {
+            if !skin_region || natural_skin_chroma(pr, pb) {
+                set.push((pr, pb));
+            }
+        }
+        if set.is_empty() {
+            set.push((28.0, -22.0));
         }
         // De-duplicate near-identical candidates.
         let mut unique: Vec<(f32, f32)> = Vec::with_capacity(set.len());
@@ -1055,7 +1129,7 @@ fn chroma_diversity_director(
         let luma_cost = ((mean_luma - cand_luma) / 40.0).abs();
 
         // Skin regions must stay in the warm sector (red > 0, blue < 0).
-        let skin_sector = cand.0 > 2.0 && cand.1 < 2.0;
+        let skin_sector = natural_skin_chroma(cand.0, cand.1);
         let semantic_cost = if semantic.skin > 0.42 {
             if skin_sector {
                 0.0
@@ -1090,7 +1164,11 @@ fn chroma_diversity_director(
         // nearly every pixel, so most regions reach conf 0.9+ and would
         // otherwise freeze the page into the model's single warm cast.
         // Faces stay warm; everything else is free for the director.
-        if colors[index].seeded && colors[index].confidence >= 0.7 && semantics[index].skin > 0.42 {
+        if colors[index].seeded
+            && colors[index].confidence >= 0.7
+            && semantics[index].skin > 0.42
+            && natural_skin_chroma(colors[index].red, colors[index].blue)
+        {
             locked[index] = true;
         }
     }
@@ -1193,12 +1271,25 @@ fn chroma_diversity_director(
         if locked[index] {
             continue;
         }
+        if semantics[index].skin > 0.42
+            && natural_skin_chroma(assigned[index].red, assigned[index].blue)
+        {
+            colors[index].red = assigned[index].red;
+            colors[index].blue = assigned[index].blue;
+            colors[index].confidence = colors[index].confidence.max(0.68);
+            colors[index].seeded = true;
+            continue;
+        }
         let conf = colors[index].confidence;
         let blend = (0.55 + (1.0 - conf) * 0.4).clamp(0.55, 0.95);
         colors[index].red += (assigned[index].red - colors[index].red) * blend;
         colors[index].blue += (assigned[index].blue - colors[index].blue) * blend;
         colors[index].seeded = false;
     }
+}
+
+fn natural_skin_chroma(red: f32, blue: f32) -> bool {
+    (5.0..=72.0).contains(&red) && (-58.0..=4.0).contains(&blue)
 }
 
 fn rgb_luma_from_opponent(red: f32, blue: f32, luma: f32) -> f32 {
@@ -1260,12 +1351,8 @@ fn render_material_pixel(
     // region the diversity director moved to blue is not skin.
     let region_elongated =
         region_width > region_height * 1.42 || region_height > region_width * 1.42;
-    let observed_skin = region_red > 5.0
-        && region_blue < -3.0
-        && region.count <= 40_000
-        && !region_elongated
-        && red > 2.0
-        && blue < 2.0;
+    let observed_skin =
+        region_red > 5.0 && region_blue < -3.0 && !region_elongated && red > 2.0 && blue < 2.0;
     let face_skin = face_cavity > 0.12;
     let semantic_skin = semantic.skin > 0.42 && semantic.fabric < 0.45;
     let texture_limit = if observed_skin || semantic_skin {
@@ -1280,7 +1367,7 @@ fn render_material_pixel(
     // "bright non-skin stays neutral" guarantee.
     let skin = face_skin
         || ((semantic_skin || observed_skin)
-            && !region.touches_border
+            && (!region.touches_border || semantic.skin > 0.58)
             && fill_ratio > 0.2
             && texture < texture_limit);
     let dark_material = base_luma < 105.0;
@@ -1323,6 +1410,8 @@ fn render_material_pixel(
         let side_weight = ((local_x - 0.5).abs() * 2.0).clamp(0.0, 1.0);
         red += cheek_band * side_weight * 5.8;
         blue -= cheek_band * side_weight * 2.2;
+        red = red.clamp(16.0, 52.0);
+        blue = blue.clamp(-46.0, -8.0);
         let skin_depth = if face_skin { 28.0 } else { 29.0 };
         target_luma += highlight * 2.0 - skin_depth - shadow * 5.0 - ambient_occlusion * 8.5;
     } else if dark_material {
@@ -1635,6 +1724,7 @@ mod tests {
             &[RegionColor::default()],
             &original,
             &lines,
+            None,
         );
 
         assert_eq!(semantics[0].fabric, 0.0);
@@ -1782,5 +1872,125 @@ mod tests {
         );
 
         assert!(pixel[0] as i16 - pixel[2] as i16 >= 25);
+    }
+
+    #[test]
+    fn large_warm_body_region_is_classified_as_skin() {
+        let count = 120_000_u32;
+        let region = RegionStats {
+            count,
+            min_x: 100,
+            min_y: 100,
+            max_x: 399,
+            max_y: 599,
+            luma_sum: 180.0 * count as f64,
+            texture_sum: 5.0 * count as f64,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 20.0 * count as f64,
+            existing_blue_sum: -20.0 * count as f64,
+            bubble_count: 0,
+            touches_border: false,
+        };
+        let original = GrayImage::from_pixel(1_000, 1_000, Luma([180]));
+        let lines = GrayImage::new(1_000, 1_000);
+        let colors = [RegionColor {
+            red: 24.0,
+            blue: -22.0,
+            confidence: 0.7,
+            seeded: true,
+        }];
+
+        let semantics = infer_region_semantics(&[region], &colors, &original, &lines, Some(&[0.8]));
+
+        assert!(semantics[0].skin > 0.42, "{:?}", semantics[0]);
+    }
+
+    #[test]
+    fn large_warm_background_without_face_support_is_not_skin() {
+        let count = 120_000_u32;
+        let region = RegionStats {
+            count,
+            min_x: 100,
+            min_y: 100,
+            max_x: 399,
+            max_y: 599,
+            luma_sum: 180.0 * count as f64,
+            texture_sum: 5.0 * count as f64,
+            seed_weight: 0.0,
+            red_chroma_sum: 0.0,
+            blue_chroma_sum: 0.0,
+            existing_red_sum: 20.0 * count as f64,
+            existing_blue_sum: -20.0 * count as f64,
+            bubble_count: 0,
+            touches_border: false,
+        };
+        let original = GrayImage::from_pixel(1_000, 1_000, Luma([180]));
+        let lines = GrayImage::new(1_000, 1_000);
+        let colors = [RegionColor {
+            red: 24.0,
+            blue: -22.0,
+            confidence: 0.7,
+            seeded: true,
+        }];
+
+        let semantics = infer_region_semantics(&[region], &colors, &original, &lines, None);
+
+        assert!(semantics[0].skin < 0.1, "{:?}", semantics[0]);
+    }
+
+    #[test]
+    fn diversity_director_does_not_invent_non_palette_skin_hues() {
+        let region = RegionStats {
+            count: 4_000,
+            min_x: 10,
+            min_y: 10,
+            max_x: 89,
+            max_y: 89,
+            luma_sum: 720_000.0,
+            texture_sum: 12_000.0,
+            seed_weight: 500.0,
+            red_chroma_sum: 15_000.0,
+            blue_chroma_sum: -70_000.0,
+            existing_red_sum: 120_000.0,
+            existing_blue_sum: -560_000.0,
+            bubble_count: 0,
+            touches_border: false,
+        };
+        let stats = [region, region];
+        let mut colors = [
+            RegionColor {
+                red: 30.0,
+                blue: -140.0,
+                confidence: 0.82,
+                seeded: true,
+            },
+            RegionColor {
+                red: 24.0,
+                blue: -18.0,
+                confidence: 0.5,
+                seeded: false,
+            },
+        ];
+        let semantics = [
+            RegionSemantic {
+                skin: 0.9,
+                fabric: 0.0,
+                skin_seed: true,
+            },
+            RegionSemantic::default(),
+        ];
+        let adjacency = [vec![(1, 4.0)], vec![(0, 4.0)]];
+        let palette = [(182.0, 28.0, -24.0), (92.0, -8.0, 14.0)];
+
+        chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette);
+
+        assert!(natural_skin_chroma(colors[0].red, colors[0].blue));
+        assert!(
+            colors[0].blue > -60.0,
+            "skin stayed yellow: {:?}",
+            colors[0]
+        );
     }
 }

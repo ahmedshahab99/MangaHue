@@ -3,7 +3,7 @@ use image::{GrayImage, Luma, Rgb, RgbImage};
 use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
-    BoundingBox, CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport,
+    BoundingBox, CharacterProfile, ColorRgb, ImageSize, MangaPanel, ProcessingReport, StageReport,
     StyleProfile, TileInfo,
 };
 use mangahue_ensemble::{
@@ -267,7 +267,7 @@ impl MangaHueEngine {
             let path = mangahue_config::default_palettes_dir().join(format!("{name}.yaml"));
             if let Ok(colors) = mangahue_config::load_palette(&path) {
                 report.warn(format!("artist palette auto-selected: {name}"));
-                palette_style.palette = colors;
+                palette_style.palette = merge_artist_accents(&style.palette, &colors);
             } else {
                 report.warn(format!(
                     "auto palette {name} not found at {}; using style palette",
@@ -398,7 +398,7 @@ impl MangaHueEngine {
                             // semantic slots; fall back to natural defaults.
                             let skin = style
                                 .palette
-                                .first()
+                                .get(2)
                                 .map(|c| [c.r, c.g, c.b])
                                 .unwrap_or([242, 208, 182]);
                             let hair = style
@@ -1140,6 +1140,24 @@ fn load_style(style_path: Option<&Path>) -> Result<StyleProfile> {
     }
 }
 
+fn merge_artist_accents(base: &[ColorRgb], accents: &[ColorRgb]) -> Vec<ColorRgb> {
+    if base.len() < 9 {
+        return accents.to_vec();
+    }
+    let mut merged = Vec::with_capacity(base.len() + accents.len());
+    for color in base
+        .iter()
+        .take(9)
+        .chain(accents)
+        .chain(base.iter().skip(9))
+    {
+        if !merged.contains(color) {
+            merged.push(*color);
+        }
+    }
+    merged
+}
+
 fn load_characters(project_path: Option<&Path>, ids: &[String]) -> Result<Vec<CharacterProfile>> {
     match project_path {
         Some(path) => load_project_characters(path, ids),
@@ -1170,6 +1188,12 @@ fn select_backend_for_model(
     config: &EngineConfig,
     reference_image_path: Option<&Path>,
 ) -> Result<Box<dyn ColorizationBackend>> {
+    if mangahue_inference::is_openvino_studio_model_dir(model_path) {
+        return Ok(Box::new(mangahue_inference::OpenVinoStudioBackend::shared(
+            model_path,
+            config.inference.input_size,
+        )?));
+    }
     if mangahue_inference::is_anime_face_model_dir(model_path) {
         return Ok(Box::new(mangahue_inference::AnimeFaceBackend::shared(
             model_path,
@@ -1187,9 +1211,19 @@ fn select_backend_for_model(
         )?));
     }
     if mangahue_inference::is_ddcolor_onnx_model(model_path) {
-        return Ok(Box::new(mangahue_inference::DdColorOnnxBackend::shared(
-            model_path,
-        )?));
+        #[cfg(feature = "native-onnx")]
+        {
+            // Native Rust inference: no Python sidecar, no IPC.
+            return Ok(Box::new(mangahue_inference::NativeDdColorOnnxBackend::new(
+                model_path,
+            )?));
+        }
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            return Ok(Box::new(mangahue_inference::DdColorOnnxBackend::shared(
+                model_path,
+            )?));
+        }
     }
     if mangahue_inference::is_ddcolor_model_dir(model_path) {
         return Ok(Box::new(mangahue_inference::DdColorBackend::shared(
@@ -1586,6 +1620,19 @@ fn base64_encode_hash(digest: &[u8]) -> String {
 mod tests {
     use super::*;
     use image::{GrayImage, Luma};
+
+    #[test]
+    fn automatic_palette_preserves_semantic_roles() {
+        let base = (0..12)
+            .map(|index| ColorRgb::new(index, 40 + index, 80 + index))
+            .collect::<Vec<_>>();
+        let accents = vec![ColorRgb::new(200, 20, 40), ColorRgb::new(20, 80, 200)];
+
+        let merged = merge_artist_accents(&base, &accents);
+
+        assert_eq!(&merged[..9], &base[..9]);
+        assert_eq!(&merged[9..11], accents.as_slice());
+    }
 
     #[test]
     fn full_pipeline_runs_with_explicit_mock_backend() {

@@ -4,7 +4,9 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -136,16 +138,49 @@ def generate(
     import openvino_genai as ov_genai
 
     started = time.monotonic()
-    with Image.open(input_path) as source_file:
-        source = ImageOps.exif_transpose(source_file).convert("RGB")
-    canvas, transform = prepare_canvas(source, long_edge)
-
     properties: dict[str, str] = {}
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         properties["CACHE_DIR"] = str(cache_dir)
     pipeline = ov_genai.Image2ImagePipeline(str(model_root), "CPU", **properties)
     loaded_at = time.monotonic()
+    return _generate_with_pipeline(
+        pipeline,
+        ov,
+        input_path,
+        output_path,
+        long_edge=long_edge,
+        steps=steps,
+        strength=strength,
+        seed=seed,
+        prompt=prompt,
+        raw_output=raw_output,
+        started=started,
+        loaded_at=loaded_at,
+    )
+
+
+def _generate_with_pipeline(
+    pipeline,
+    ov,
+    input_path: Path,
+    output_path: Path,
+    *,
+    long_edge: int,
+    steps: int,
+    strength: float,
+    seed: int,
+    prompt: str,
+    raw_output: Path | None,
+    started: float | None = None,
+    loaded_at: float | None = None,
+) -> dict[str, object]:
+    started = time.monotonic() if started is None else started
+    loaded_at = time.monotonic() if loaded_at is None else loaded_at
+    with Image.open(input_path) as source_file:
+        source = ImageOps.exif_transpose(source_file).convert("RGB")
+    canvas, transform = prepare_canvas(source, long_edge)
+
     tensor = ov.Tensor(np.asarray(canvas, dtype=np.uint8)[None, ...])
     result = pipeline.generate(
         prompt,
@@ -192,11 +227,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=7391)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="Keep the model loaded and serve JSON-line requests on stdin",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
+def _validate_args(args: argparse.Namespace) -> None:
     if args.long_edge < 256:
         raise ValueError("--long-edge must be at least 256")
     if args.steps < 2 or args.steps > 12:
@@ -206,8 +245,71 @@ def main() -> None:
     if not args.model_root.joinpath("unet", "openvino_model.xml").is_file():
         raise FileNotFoundError(f"invalid OpenVINO diffusion model: {args.model_root}")
 
+
+def _serve(args: argparse.Namespace) -> None:
+    import openvino as ov
+    import openvino_genai as ov_genai
+
+    properties: dict[str, str] = {}
+    if args.cache_dir is not None:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
+        properties["CACHE_DIR"] = str(args.cache_dir.resolve())
+    pipeline = ov_genai.Image2ImagePipeline(
+        str(args.model_root.resolve()),
+        "CPU",
+        **properties,
+    )
+    print(
+        json.dumps(
+            {
+                "status": "ready",
+                "backend": "openvino-lcm-studio",
+                "long_edge": args.long_edge,
+                "steps": args.steps,
+            }
+        ),
+        flush=True,
+    )
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+            response = _generate_with_pipeline(
+                pipeline,
+                ov,
+                Path(request["lineart"]).resolve(),
+                Path(request["output"]).resolve(),
+                long_edge=int(request.get("long_edge", args.long_edge)),
+                steps=int(request.get("steps", args.steps)),
+                strength=float(request.get("strength", args.strength)),
+                seed=int(request.get("seed", args.seed)),
+                prompt=str(request.get("prompt", args.prompt)),
+                raw_output=(
+                    Path(request["raw_output"]).resolve()
+                    if request.get("raw_output")
+                    else None
+                ),
+            )
+            response["id"] = request.get("id")
+        except Exception as error:
+            response = {
+                "ok": False,
+                "error": str(error),
+                "traceback": traceback.format_exc(limit=8),
+            }
+        print(json.dumps(response), flush=True)
+
+
+def main() -> None:
+    args = _parse_args()
+    _validate_args(args)
+
     os.environ.setdefault("OMP_NUM_THREADS", str(max(1, args.threads)))
     os.environ.setdefault("MKL_NUM_THREADS", str(max(1, args.threads)))
+    if args.serve:
+        _serve(args)
+        return
     result = generate(
         args.model_root.resolve(),
         args.input.resolve(),

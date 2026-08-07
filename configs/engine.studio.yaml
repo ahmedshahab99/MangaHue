@@ -43,13 +43,13 @@ postprocess:
   relighting_strength: 0.35
   midtone_depth: 0.26
   local_contrast: 0.1
-  target_colorfulness: 1.8
+  target_colorfulness: 1.55
   natural_grading: true
   reference_transfer: false
   muted_target_grade: true
-  muted_strength: 0.95
-  muted_hue_shift_deg: 20
-  muted_dark_pull: 0.85
+  muted_strength: 0.72
+  muted_hue_shift_deg: 4
+  muted_dark_pull: 0.45
   soft_strength: 1.0
   soft_confidence: 1.0
   muted_dark_sat: 0.17

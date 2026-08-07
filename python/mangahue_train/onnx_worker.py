@@ -110,14 +110,12 @@ def _load_input(request: dict, channels: int, spatial_multiple: int) -> tuple[np
                 umap = cv2.cvtColor(umap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 umask = umask.astype(np.float32) / 255.0
                 if umap.shape[:2] == (height, width) and umask.shape == (height, width):
-                    # Explicit Rust-side guidance (user hints, character
-                    # memory, style, semantic regions, region locks) takes
-                    # priority wherever its mask is non-zero; internal region
-                    # hints fill the rest so the model always receives
-                    # guidance.
-                    take_user = umask > 0.02
-                    cmap[take_user] = umap[take_user]
-                    cmask[take_user] = np.maximum(cmask[take_user], umask[take_user])
+                    # Rust has the full-page bubble, character-memory, and
+                    # region-lock context. Its map is authoritative; mixing
+                    # the worker's grayscale-only guesses back into unhinted
+                    # pixels mislabeled paper and clothing as skin.
+                    cmap = umap
+                    cmask = umask
                 else:
                     print(json.dumps({
                         "warn": "hint_map/hint_mask dimensions do not match lineart; using internal hints",

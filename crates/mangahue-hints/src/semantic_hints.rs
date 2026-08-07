@@ -18,7 +18,7 @@ const BG_WARM: [u8; 3] = [228, 222, 215];
 const BG_COOL: [u8; 3] = [195, 192, 200];
 const WHITE: [u8; 3] = [255, 253, 250];
 
-const REGION_STRENGTH: u8 = 192; // 0.75
+const REGION_STRENGTH: u8 = 168;
 
 #[derive(Debug, Default, Clone)]
 pub struct SemanticMasks {
@@ -39,7 +39,7 @@ pub fn detect_semantic_regions(
     let len = (width * height) as usize;
 
     // Per-pixel candidate predicates (scipy thresholds from onnx_worker).
-    let mut skin_cand = vec![false; len];
+    let skin_cand = vec![false; len];
     let mut hair_cand = vec![false; len];
     let mut ink = vec![false; len];
     for (i, p) in gray.pixels().enumerate() {
@@ -48,11 +48,10 @@ pub fn detect_semantic_regions(
         let ink_px = line_mask.get_pixel(i as u32 % width, i as u32 / width)[0] > 100;
         ink[i] = ink_px;
         if !ink_px && !bubble {
-            // Skin range extended to bright skin (98-250) so light faces and
-            // chests still get skin hints; only true paper (>250) is not skin.
-            if (98..=250).contains(&g) {
-                skin_cand[i] = true;
-            }
+            // Grayscale alone cannot separate pale skin, white clothing, and
+            // paper reliably. Skin is supplied by face detection, user
+            // guidance, or model evidence; broad thresholding painted almost
+            // the entire page peach.
             if (20..=89).contains(&g) {
                 hair_cand[i] = true;
             }
@@ -173,16 +172,19 @@ pub fn rasterize_semantic_hints(
         let y = i as u32 / width;
         let g = gray.get_pixel(x, y)[0] as u32;
 
-        // Priority: bubble > skin > hair > clothing > background.
+        // Material hints are seeds, not a replacement color layer. Dense
+        // bubble constraints are safe; inferred materials use a regular
+        // sparse lattice and are expanded by the edge-aware propagator.
+        let semantic_seed = x % 20 == 10 && y % 20 == 10;
         let color: Option<[u8; 3]> = if regions.bubble[i] {
             Some(WHITE)
-        } else if regions.skin[i] {
+        } else if regions.skin[i] && (x % 8 == 4 && y % 8 == 4) {
             Some(if g > 153 { SKIN } else { SKIN_SHA })
-        } else if regions.hair[i] {
+        } else if regions.hair[i] && (x % 12 == 6 && y % 12 == 6) {
             Some(if g < 51 { HAIR_D } else { HAIR_M })
-        } else if regions.clothing[i] {
+        } else if regions.clothing[i] && semantic_seed {
             Some(if g > 115 { CLOTH_L } else { CLOTH_D })
-        } else if regions.background[i] {
+        } else if regions.background[i] && semantic_seed {
             Some(if g > 128 { BG_WARM } else { BG_COOL })
         } else {
             None
@@ -292,12 +294,13 @@ pub fn rasterize_face_mask(faces: &[[u32; 4]], width: u32, height: u32) -> GrayI
         if w < 8.0 || h < 8.0 {
             continue;
         }
-        // Skin ellipse: covers forehead (0.30h) through chin (1.42h) and
-        // full cheek width so the whole face gets painted.
+        // The cascade box already encloses the face. Keep the skin ellipse
+        // inside it; oversized radii created visible peach/gray halos in the
+        // background around every detected head.
         let skin_cx = x + w * 0.5;
-        let skin_cy = y + h * 0.62;
-        let skin_rx = (w * 0.95).max(8.0);
-        let skin_ry = (h * 0.80).max(8.0);
+        let skin_cy = y + h * 0.56;
+        let skin_rx = (w * 0.47).max(8.0);
+        let skin_ry = (h * 0.52).max(8.0);
         // Hair exclusion: NARROW bangs band at the top of the box only
         // (real hair is the top ~20-30%; a tall ellipse would block the
         // forehead and cheeks, leaving the face white).
@@ -306,14 +309,14 @@ pub fn rasterize_face_mask(faces: &[[u32; 4]], width: u32, height: u32) -> GrayI
         let hair_rx = (w * 0.75).max(6.0);
         let hair_ry = (h * 0.18).max(6.0);
         let eye_y = y + h * 0.47;
-        let eye_rx = (w * 0.07).max(3.0);
+        let eye_rx = (w * 0.04).max(2.0);
         let eye_x1 = x + w * 0.33;
         let eye_x2 = x + w * 0.67;
 
-        let min_y = (y - h * 0.35).max(0.0) as u32;
-        let max_y = ((y + h * 1.45).min(height as f32)) as u32;
-        let min_x = (x - w * 0.45).max(0.0) as u32;
-        let max_x = ((x + w * 1.45).min(width as f32)) as u32;
+        let min_y = y.max(0.0) as u32;
+        let max_y = ((y + h).min(height as f32)) as u32;
+        let min_x = x.max(0.0) as u32;
+        let max_x = ((x + w).min(width as f32)) as u32;
 
         for yy in min_y..max_y {
             for xx in min_x..max_x {
@@ -340,8 +343,7 @@ pub fn rasterize_face_mask(faces: &[[u32; 4]], width: u32, height: u32) -> GrayI
                 let sdy = (fy - skin_cy) / skin_ry;
                 let d = sdx * sdx + sdy * sdy;
                 if d <= 1.0 {
-                    // Soft falloff at the ellipse edge (1.0 -> 255, 1.2 -> 0).
-                    let v = ((1.0 - (d.sqrt() - 0.9) / 0.3).clamp(0.0, 1.0) * 255.0) as u8;
+                    let v = ((1.0 - (d.sqrt() - 0.82) / 0.18).clamp(0.0, 1.0) * 255.0) as u8;
                     let existing = mask.get_pixel(xx, yy)[0];
                     mask.put_pixel(xx, yy, Luma([v.max(existing)]));
                 }
@@ -349,4 +351,36 @@ pub fn rasterize_face_mask(faces: &[[u32; 4]], width: u32, height: u32) -> GrayI
         }
     }
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn face_mask_never_paints_outside_detector_box() {
+        let mask = rasterize_face_mask(&[[20, 30, 40, 50]], 100, 100);
+
+        for (x, y, pixel) in mask.enumerate_pixels() {
+            if x < 20 || x >= 60 || y < 30 || y >= 80 {
+                assert_eq!(pixel[0], 0, "painted outside face box at {x},{y}");
+            }
+        }
+        assert!(mask.pixels().any(|pixel| pixel[0] > 200));
+    }
+
+    #[test]
+    fn semantic_background_hints_remain_sparse() {
+        let gray = GrayImage::from_pixel(200, 200, Luma([245]));
+        let lines = GrayImage::new(200, 200);
+        let bubbles = GrayImage::new(200, 200);
+        let regions = detect_semantic_regions(&gray, &lines, &bubbles);
+        let mut map = RgbImage::new(200, 200);
+        let mut mask = GrayImage::new(200, 200);
+
+        let painted = rasterize_semantic_hints(&mut map, &mut mask, &gray, &regions);
+
+        assert!(painted <= 100, "painted {painted} background pixels");
+        assert!(mask.pixels().filter(|pixel| pixel[0] > 0).count() <= 100);
+    }
 }

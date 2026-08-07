@@ -139,7 +139,10 @@ def main() -> None:
     args = _parse_args()
     os.environ.setdefault("OMP_NUM_THREADS", str(max(1, args.threads)))
     cv2.setNumThreads(max(1, args.threads))
-    cascade = cv2.CascadeClassifier(str(args.cascade.resolve()))
+    cascade_path = str(args.cascade.resolve())
+    if os.name == "nt" and cascade_path.startswith("\\\\?\\"):
+        cascade_path = cascade_path[4:]
+    cascade = cv2.CascadeClassifier(cascade_path)
     if cascade.empty():
         raise RuntimeError(f"failed to load anime face cascade: {args.cascade}")
     print(json.dumps({"status": "ready", "backend": "anime-face-palette"}), flush=True)

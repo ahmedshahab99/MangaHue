@@ -78,5 +78,8 @@ export interface JobEvent {
   percent?: number;
   completed?: number;
   total?: number;
+  tiles_completed?: number;
+  tiles_total?: number;
+  tile_id?: string;
   error?: string;
 }

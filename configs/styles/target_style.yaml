@@ -1,38 +1,32 @@
 id: target_style
-name: Target Muted Warm
-saturation: 0.55
-contrast: 1.06
+name: Target Studio Anime
+saturation: 0.68
+contrast: 1.08
 brightness: 0.02
 shadow_strength: 0.5
 highlight_strength: 0.35
 line_strength: 1.0
-# Palette extracted from the measured target reference: muted warm
-# deep-brown/tan family with one blue-violet accent, low saturation.
+# Semantic slot order is intentional: paper, skin, hair, clothing, scene.
+# The face and material directors consume these roles consistently.
 palette:
-  # paper / light fills
-  - "#e1d1c2"
-  - "#e8dccf"
-  # skin / warm mids
-  - "#d1ac98"
-  - "#c89a80"
-  - "#b98a6e"
-  - "#a97a5e"
-  # hair / deep browns
-  - "#654c44"
-  - "#483430"
-  - "#3b3239"
-  # dark clothing / shadows
-  - "#4e3c3b"
-  - "#483f46"
-  - "#574e4e"
-  - "#292529"
-  # desaturated cool accent (the target's small blue-violet share)
-  - "#5f4555"
-  - "#7a6a78"
-  # neutral warm grays
-  - "#948781"
-  - "#a89a92"
+  - "#f5eee9"
+  - "#e7e7ec"
+  - "#f0bba4"
+  - "#d9977e"
+  - "#b87561"
+  - "#8f594c"
+  - "#352c38"
+  - "#211f28"
+  - "#4d3542"
+  - "#343947"
+  - "#565d70"
+  - "#8ca3ad"
+  - "#78515f"
+  - "#d5b38d"
+  - "#8b786f"
+  - "#6f7f77"
+  - "#687a94"
 protected_colors:
   - "#ffffff"
   - "#000000"
-notes: "Muted warm painterly style measured from the target reference: low saturation, deep warm tones, soft tinted fills, tiny cool accent."
+notes: "Studio anime palette with stable semantic slots, natural skin gamut, dark hair, cool fabrics, and warm environmental light."

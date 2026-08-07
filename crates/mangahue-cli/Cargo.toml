@@ -25,7 +25,7 @@ mangahue-image = { path = "../mangahue-image" }
 mangahue-ingest = { path = "../mangahue-ingest" }
 mangahue-inference = { path = "../mangahue-inference" }
 mangahue-memory = { path = "../mangahue-memory" }
-mangahue-orchestrator = { path = "../mangahue-orchestrator" }
+mangahue-orchestrator = { path = "../mangahue-orchestrator", features = ["native-onnx"] }
 mangahue-platform = { path = "../mangahue-platform" }
 mangahue-preprocess = { path = "../mangahue-preprocess" }
 mangahue-production = { path = "../mangahue-production" }

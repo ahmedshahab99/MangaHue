@@ -298,7 +298,7 @@ pub fn generate_hints(
     let mut user_hints_applied = 0usize;
     let mut notes = Vec::new();
 
-    if config.style_hints_enabled {
+    if config.style_hints_enabled && !config.region_style_hints_enabled {
         style_hints_applied = if config.adaptive_placement_enabled {
             apply_adaptive_style_hints(&mut hint_map, &mut hint_mask, style, config.hint_strength)
         } else {

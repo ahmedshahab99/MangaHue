@@ -16,14 +16,18 @@ try {
   }
   $runtimeReady = $false
   try {
-    & $Python -c "import numpy, onnxruntime, PIL" 2>$null
+    & $Python -c "import cv2, numpy, onnxruntime, PIL; assert hasattr(cv2, 'CascadeClassifier')" 2>$null
     $runtimeReady = $LASTEXITCODE -eq 0
   } catch {}
   if (-not $runtimeReady) {
-    uv pip install --python $Python numpy pillow onnxruntime
+    uv pip install --python $Python numpy pillow onnxruntime 'opencv-python-headless>=4.9,<5'
   }
   $env:MANGAHUE_PYTHON = $Python
   $env:PYTHONPATH = Join-Path $Root "python"
+  $FaceModel = Join-Path $Root "models\anime-face\lbpcascade_animeface.xml"
+  if (Test-Path $FaceModel) {
+    $env:MANGAHUE_FACE_MODEL = Split-Path -Parent $FaceModel
+  }
 
   cargo +stable-x86_64-pc-windows-gnu run -p mangahue-cli -- serve --addr $Addr --jobs-dir $JobsDir --studio-dir $StudioDir
 }

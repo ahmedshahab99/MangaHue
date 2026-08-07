@@ -8,12 +8,13 @@ Type=simple
 User=root
 WorkingDirectory=/opt/MangaHue-release
 EnvironmentFile=/opt/MangaHue-release/runtime/telegram.env
-Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/opt/MangaHue-release/python
-Environment=MANGAHUE_PYTHON=/opt/MangaHue/.venv/bin/python
-Environment=MANGAHUE_REFERENCE_PYTHON=/opt/MangaHue-reference-runtime/bin/python
 Environment=MANGAHUE_MODEL_THREADS=2
 Environment=MANGAHUE_MODEL_TIMEOUT_SECONDS=180
+# Inference is fully native (Rust ort backend): no Python needed for the
+# main model. ORT_DYLIB_PATH points at the ONNX Runtime shared library
+# (the existing venv provides it; remove the venv once libonnxruntime is
+# installed system-wide).
+Environment=ORT_DYLIB_PATH=/opt/MangaHue/.venv/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so
 Environment=TMPDIR=/run/mangahue-pro/tmp
 Environment=OMP_NUM_THREADS=2
 Environment=MKL_NUM_THREADS=2
@@ -21,7 +22,7 @@ Environment=MALLOC_ARENA_MAX=2
 RuntimeDirectory=mangahue-pro
 RuntimeDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /run/mangahue-pro/jobs /run/mangahue-pro/tmp
-ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 2016 --max-concurrent-jobs 1 --batch-size 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --ensemble-model /opt/MangaHue/models/reference-cgan --ensemble-model /opt/MangaHue/models/anime-face --reference-image /opt/MangaHue/reference/studio-anime-reference.jpg --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/studio_anime.yaml --daily-limit 0
+ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 2016 --max-concurrent-jobs 1 --batch-size 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/studio_anime.yaml --daily-limit 0
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30

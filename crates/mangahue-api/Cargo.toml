@@ -35,6 +35,10 @@ uuid.workspace = true
 url.workspace = true
 walkdir.workspace = true
 
+[features]
+default = ["native-onnx"]
+native-onnx = ["mangahue-orchestrator/native-onnx"]
+
 [dev-dependencies]
 tempfile.workspace = true
 tower.workspace = true

@@ -774,6 +774,20 @@ async fn security_headers(
     next: axum::middleware::Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    // The Next.js webapp ships its RSC bootstrap as inline scripts, so HTML
+    // pages must allow inline scripts; every other response (JSON API, files)
+    // keeps the strict policy.
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.starts_with("text/html"))
+        .unwrap_or(false);
+    let script_policy = if is_html {
+        "script-src 'self' 'unsafe-inline'"
+    } else {
+        "script-src 'self'"
+    };
     let headers = response.headers_mut();
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -786,14 +800,20 @@ async fn security_headers(
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
-        ),
+        HeaderValue::from_str(&format!(
+            "default-src 'self'; base-uri 'self'; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; img-src 'self' blob: data:; object-src 'none'; {script_policy}; style-src 'self' 'unsafe-inline'"
+        ))
+        .expect("CSP header is static and valid"),
     );
-    headers.insert(
-        header::HeaderName::from_static("permissions-policy"),
-        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
-    );
+    // The webapp document is an application shell: it must always be fresh
+    // (a cached shell plus cached chunks can break React hydration on
+    // reload). Hashed static assets keep their default caching.
+    if is_html {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+    }
     response
 }
 
@@ -2221,7 +2241,8 @@ async fn get_local_file(
     user: Option<Extension<RequestUser>>,
     Query(query): Query<ApiFileQuery>,
 ) -> Result<Response, ApiError> {
-    let path = resolve_local_file(&state.file_root, &query.path)?;
+    let path = resolve_local_file(&state.file_root, &query.path)
+        .map_err(|error| ApiError::with_status(StatusCode::BAD_REQUEST, error))?;
     if state.sandbox_jobs {
         let job_id = query.job_id.as_deref().ok_or_else(|| {
             ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!("job_id is required"))
@@ -3239,24 +3260,52 @@ fn default_server_config_path() -> PathBuf {
 }
 
 fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
+    if mangahue_inference::is_openvino_studio_model_dir(model_path) {
+        let python = std::env::var("MANGAHUE_STUDIO_PYTHON")
+            .or_else(|_| std::env::var("MANGAHUE_PYTHON"))
+            .unwrap_or_else(|_| "python".to_string());
+        let output = Command::new(&python)
+            .args([
+                "-c",
+                "import openvino, openvino_genai, PIL, mangahue_train.studio_openvino_worker",
+            ])
+            .output()
+            .with_context(|| format!("failed to start Studio Python runtime '{python}'"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "Studio Python runtime is incomplete: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
     if !mangahue_inference::is_ddcolor_onnx_model(model_path) {
         return Ok(());
     }
-    let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
-    let output = Command::new(&python)
-        .args([
-            "-c",
-            "import numpy, onnxruntime, PIL, mangahue_train.ddcolor_onnx_worker",
-        ])
-        .output()
-        .with_context(|| format!("failed to start inference Python runtime '{python}'"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "inference Python runtime is incomplete: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    #[cfg(feature = "native-onnx")]
+    {
+        // DDColor ONNX runs natively through the Rust ort backend; the
+        // Python sidecar is not part of this build.
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(feature = "native-onnx"))]
+    {
+        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
+        let output = Command::new(&python)
+            .args([
+                "-c",
+                "import numpy, onnxruntime, PIL, mangahue_train.ddcolor_onnx_worker",
+            ])
+            .output()
+            .with_context(|| format!("failed to start inference Python runtime '{python}'"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "inference Python runtime is incomplete: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
@@ -3576,10 +3625,15 @@ fn resolve_local_file(root: &Path, path: &Path) -> Result<PathBuf> {
 
 fn resolve_path_under(root: &Path, path: &Path) -> Result<PathBuf> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // Relative paths arrive from the upload endpoint as server-CWD-relative
+    // strings; resolve them against the working directory, then verify the
+    // result lives under the root.
     let candidate = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        root.join(path)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
     };
     let resolved = candidate
         .canonicalize()
