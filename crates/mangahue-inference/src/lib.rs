@@ -2150,31 +2150,46 @@ impl ColorizationBackend for RustOnnxBackend {
         let h = input.lineart.height() as usize;
         let w = input.lineart.width() as usize;
         let channels = self.metadata.input_channels as usize;
+        // The model contract requires spatial dims that are multiples of 32
+        // (skip-connection concat). Pad like the Python worker did: lineart
+        // padded with white (paper), hints/mask with zero, then crop.
+        let pad_h = (32 - h % 32) % 32;
+        let pad_w = (32 - w % 32) % 32;
+        let th = h + pad_h;
+        let tw = w + pad_w;
+        let plane = th * tw;
 
-        let mut tensor_data = Vec::with_capacity(channels * h * w);
-        for y in 0..h {
-            for x in 0..w {
-                tensor_data.push(input.lineart.get_pixel(x as u32, y as u32)[0] as f32 / 255.0);
+        let mut tensor_data = vec![0.0f32; channels * plane];
+        for y in 0..th {
+            for x in 0..tw {
+                let value = if y < h && x < w {
+                    input.lineart.get_pixel(x as u32, y as u32)[0] as f32 / 255.0
+                } else {
+                    1.0 // white paper border
+                };
+                tensor_data[y * tw + x] = value;
             }
         }
         if channels == 5 {
             for c in 0..3 {
+                let base = (1 + c) * plane;
                 for y in 0..h {
                     for x in 0..w {
-                        tensor_data
-                            .push(input.hint_map.get_pixel(x as u32, y as u32)[c] as f32 / 255.0);
+                        tensor_data[base + y * tw + x] =
+                            input.hint_map.get_pixel(x as u32, y as u32)[c] as f32 / 255.0;
                     }
                 }
             }
+            let base = 4 * plane;
             for y in 0..h {
                 for x in 0..w {
-                    tensor_data
-                        .push(input.hint_mask.get_pixel(x as u32, y as u32)[0] as f32 / 255.0);
+                    tensor_data[base + y * tw + x] =
+                        input.hint_mask.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
                 }
             }
         }
 
-        let array = ndarray::Array4::from_shape_vec((1, channels, h, w), tensor_data)
+        let array = ndarray::Array4::from_shape_vec((1, channels, th, tw), tensor_data)
             .map_err(|e| EngineError::Inference(format!("tensor shape error: {e}")))?;
         let tensor = Tensor::from_array(array)
             .map_err(|e| EngineError::Inference(format!("failed to create tensor: {e}")))?;
@@ -2192,10 +2207,10 @@ impl ColorizationBackend for RustOnnxBackend {
             .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
 
         let mut image = RgbImage::new(w as u32, h as u32);
-        let plane_size = h * w;
+        let plane_size = th * tw;
         for y in 0..h {
             for x in 0..w {
-                let idx = y * w + x;
+                let idx = y * tw + x;
                 let r = (output_data[idx].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let g = (output_data[plane_size + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
                 let b = (output_data[2 * plane_size + idx].clamp(0.0, 1.0) * 255.0).round() as u8;
