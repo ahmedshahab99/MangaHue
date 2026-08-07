@@ -2096,6 +2096,49 @@ impl RustOnnxBackend {
             output_name,
         })
     }
+
+    /// Shared session keyed by canonical (model, metadata) paths so a
+    /// chapter never reloads + re-optimizes the model for every page.
+    pub fn shared(
+        model_path: impl AsRef<Path>,
+        metadata_path: impl AsRef<Path>,
+    ) -> Result<Arc<Self>> {
+        let model_path = model_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve ONNX model {}",
+                model_path.as_ref().display()
+            )
+        })?;
+        let metadata_path = metadata_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve model metadata {}",
+                metadata_path.as_ref().display()
+            )
+        })?;
+        let key = format!(
+            "{}::{}\n{}",
+            model_path.display(),
+            metadata_path.display(),
+            std::env::var("MANGAHUE_MODEL_THREADS").unwrap_or_default()
+        );
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<RustOnnxBackend>>>> = OnceLock::new();
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|e| anyhow!("session registry lock poisoned: {e}"))?;
+        if let Some(backend) = workers.get(&key) {
+            return Ok(Arc::clone(backend));
+        }
+        // Bound the registry: keep at most 8 sessions, drop the oldest.
+        if workers.len() >= 8 {
+            if let Some(oldest) = workers.keys().next().cloned() {
+                workers.remove(&oldest);
+            }
+        }
+        let backend = Arc::new(RustOnnxBackend::new(&model_path, &metadata_path)?);
+        workers.insert(key, Arc::clone(&backend));
+        Ok(backend)
+    }
 }
 
 #[cfg(feature = "native-onnx")]
@@ -2304,6 +2347,35 @@ impl NativeDdColorOnnxBackend {
             input_name,
             output_name,
         })
+    }
+
+    /// Shared session keyed by the canonical model path (calibration runs
+    /// once, not once per page).
+    pub fn shared(model_path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let model_path = model_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve DDColor ONNX model {}",
+                model_path.as_ref().display()
+            )
+        })?;
+        let key = model_path.display().to_string();
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<NativeDdColorOnnxBackend>>>> =
+            OnceLock::new();
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|e| anyhow!("session registry lock poisoned: {e}"))?;
+        if let Some(backend) = workers.get(&key) {
+            return Ok(Arc::clone(backend));
+        }
+        if workers.len() >= 8 {
+            if let Some(oldest) = workers.keys().next().cloned() {
+                workers.remove(&oldest);
+            }
+        }
+        let backend = Arc::new(NativeDdColorOnnxBackend::new(&model_path)?);
+        workers.insert(key, Arc::clone(&backend));
+        Ok(backend)
     }
 }
 

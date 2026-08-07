@@ -66,8 +66,15 @@ pub(crate) fn natural_grade(
             v = v.clamp(0.0, 1.0);
 
             // Skin warm-up extends to bright skin (0.50-0.97) so light faces
-            // get the peach shift; deep skin keeps warm shadows.
-            let is_skin = (0.40..=0.97).contains(&gray) && skin_hue_range(h);
+            // get the peach shift; deep skin keeps warm shadows. The gate
+            // requires red dominance plus a blue floor so orange/gold hair
+            // and strongly blue-deficient materials are NOT peached.
+            let (pr, pg, pb) = (pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
+            let is_skin = (0.40..=0.97).contains(&gray)
+                && skin_hue_range(h)
+                && pr > pg + 6.0
+                && pb > pr * 0.35
+                && pb < pg;
             if is_skin {
                 h = h * 0.85 + PEACH_HUE * 0.15;
                 s = s.clamp(0.32, 0.62);

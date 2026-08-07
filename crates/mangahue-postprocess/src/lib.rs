@@ -87,7 +87,11 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         sharpen_amount: input.config.final_sharpening,
     };
 
-    if input.config.bleeding_correction {
+    if input.config.bleeding_correction && !input.config.palette_correction {
+        // When the region graph renders, it re-paints the ink-adjacent band
+        // with strong chroma, undoing any bleed removal that ran before it.
+        // Run the bleed pass AFTER region rendering instead (see below); this
+        // branch only covers the no-region-renderer configuration.
         reduce_color_near_ink(
             &mut output,
             input.line_mask,
@@ -124,6 +128,17 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         report.semantic_skin_regions = region_report.semantic_skin_regions;
         report.face_cavity_pixels = region_report.face_cavity_pixels;
         report.region_pixels_rendered = region_report.pixels_rendered;
+    }
+
+    if input.config.bleeding_correction {
+        // Chroma bleed removal runs AFTER the region renderer so the pass
+        // removes what the renderer just painted instead of being undone by
+        // it: the 3px band hugging ink lines stays paper-clean.
+        reduce_color_near_ink(
+            &mut output,
+            input.line_mask,
+            &mut report.bleed_pixels_corrected,
+        );
     }
 
     if input.config.reference_finishing {
@@ -252,10 +267,9 @@ pub fn cross_tile_coherence(
                             continue;
                         }
                         let t = dx as f32 / blend_width as f32;
-                        let left_x = x.saturating_sub(overlap);
-                        if left_x < tx {
-                            continue;
-                        }
+                        // The left neighbour always covers [tx-overlap, tx),
+                        // which is exactly this blend band.
+                        let left_x = x - overlap;
                         let left = *image.get_pixel(left_x, y);
                         let right = *image.get_pixel(x, y);
                         let line = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
@@ -280,10 +294,8 @@ pub fn cross_tile_coherence(
                             continue;
                         }
                         let t = dy as f32 / blend_height as f32;
-                        let top_y = y.saturating_sub(overlap);
-                        if top_y < ty {
-                            continue;
-                        }
+                        // The top neighbour always covers [ty-overlap, ty).
+                        let top_y = y - overlap;
                         let top = *image.get_pixel(x, top_y);
                         let bottom = *image.get_pixel(x, y);
                         let line = line_mask.get_pixel(x, y)[0] as f32 / 255.0;

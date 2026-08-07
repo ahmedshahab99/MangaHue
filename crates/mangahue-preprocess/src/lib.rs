@@ -621,7 +621,13 @@ fn integral_window_stats(
 pub fn create_line_mask(gray: &GrayImage, threshold: &GrayImage) -> GrayImage {
     let mut mask = GrayImage::new(gray.width(), gray.height());
     for (x, y, pixel) in gray.enumerate_pixels() {
-        let active = if pixel[0] <= threshold.get_pixel(x, y)[0] {
+        // A global ink floor catches uniform dark fills (solid black hair,
+        // backgrounds, night panels) that the Sauvola threshold structurally
+        // misses: inside a uniform fill the local stddev is ~0, so
+        // T = mean*(1 + k*(std/R - 1)) lands BELOW the pixel value and the
+        // interior is not marked as ink. Without the floor those fills get
+        // tinted by the region renderer instead of staying ink black.
+        let active = if pixel[0] <= threshold.get_pixel(x, y)[0] || pixel[0] <= 64 {
             255
         } else {
             0

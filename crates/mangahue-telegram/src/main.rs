@@ -688,21 +688,35 @@ fn process_update(
             }));
             // Always release the chat slot, even on error or panic.
             state.finish(chat_id);
-            if let Err(error) = result {
-                let message = if let Some(payload) = error.downcast_ref::<&str>() {
-                    (*payload).to_string()
-                } else if let Some(payload) = error.downcast_ref::<String>() {
-                    payload.clone()
-                } else {
-                    "internal error".to_string()
-                };
-                let _ = send_message(
-                    &client,
-                    &token,
-                    chat_id,
-                    &format!("Could not colorize this image: {message}"),
-                    None,
-                );
+            match result {
+                // A returned Err (not a panic) used to be silently dropped,
+                // leaving the user with a stale "Scanning…" message forever.
+                Ok(Err(error)) => {
+                    let _ = send_message(
+                        &client,
+                        &token,
+                        chat_id,
+                        &format!("Could not colorize this image: {error}"),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    let message = if let Some(payload) = error.downcast_ref::<&str>() {
+                        (*payload).to_string()
+                    } else if let Some(payload) = error.downcast_ref::<String>() {
+                        payload.clone()
+                    } else {
+                        "internal error".to_string()
+                    };
+                    let _ = send_message(
+                        &client,
+                        &token,
+                        chat_id,
+                        &format!("Could not colorize this image: {message}"),
+                        None,
+                    );
+                }
+                Ok(Ok(())) => {}
             }
         });
         return Ok(());
@@ -804,21 +818,35 @@ fn process_update(
             )
         }));
         state.finish(chat_id);
-        if let Err(error) = result {
-            let message = if let Some(payload) = error.downcast_ref::<&str>() {
-                (*payload).to_string()
-            } else if let Some(payload) = error.downcast_ref::<String>() {
-                payload.clone()
-            } else {
-                "internal error".to_string()
-            };
-            let _ = send_message(
-                &client,
-                &token,
-                chat_id,
-                &format!("MangaHue could not finish this link: {message}"),
-                None,
-            );
+        match result {
+            // A returned Err (not a panic) used to be silently dropped,
+            // leaving the user with a stale "Scanning…" message forever.
+            Ok(Err(error)) => {
+                let _ = send_message(
+                    &client,
+                    &token,
+                    chat_id,
+                    &format!("MangaHue could not finish this link: {error}"),
+                    None,
+                );
+            }
+            Err(error) => {
+                let message = if let Some(payload) = error.downcast_ref::<&str>() {
+                    (*payload).to_string()
+                } else if let Some(payload) = error.downcast_ref::<String>() {
+                    payload.clone()
+                } else {
+                    "internal error".to_string()
+                };
+                let _ = send_message(
+                    &client,
+                    &token,
+                    chat_id,
+                    &format!("MangaHue could not finish this link: {message}"),
+                    None,
+                );
+            }
+            Ok(Ok(())) => {}
         }
     });
     Ok(())
@@ -1888,9 +1916,14 @@ fn handle_link(
     let all_image_urls: Vec<String> = if content_type.starts_with("image/") {
         vec![url.to_string()]
     } else {
-        let html = page_resp
-            .text()
+        // Cap the HTML body: an attacker-controlled public URL could stream
+        // hundreds of MB into RAM otherwise.
+        let mut html_bytes = Vec::new();
+        page_resp
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut html_bytes)
             .with_context(|| format!("failed to read HTML from {url}"))?;
+        let html = String::from_utf8_lossy(&html_bytes).into_owned();
         extract_manga_urls(
             fetch_client,
             &source_url,
@@ -2198,7 +2231,7 @@ fn handle_link(
     };
 
     let mut final_text = format!(
-        "Done in {:.0}s. Sent *{sent}* colored page\\(s\\)\\.",
+        "Done in {:.0}s\\. Sent *{sent}* colored page\\(s\\)\\.",
         elapsed
     );
     if failed > 0 {
@@ -2222,7 +2255,7 @@ fn handle_link(
         token,
         chat_id,
         progress_msg_id,
-        &format!("Complete: *{sent}* sent, *{failed}* failed.",),
+        &format!("Complete: *{sent}* sent, *{failed}* failed\\.",),
         Some(r#"{"inline_keyboard":[]}"#),
     );
 
@@ -2238,16 +2271,15 @@ fn format_progress(
     failed: usize,
 ) -> String {
     let pct = if total == 0 {
-        0.0
+        0
     } else {
-        (done as f32 / total as f32) * 100.0
+        ((done as f32 / total as f32) * 100.0).round() as usize
     };
     let bar = progress_bar(done, total, 16);
+    // MarkdownV2-safe: the pipe and period must be escaped, the percent is
+    // an integer so no decimal point appears.
     let mut text = format!(
-        "`{bar}` {:.0}%\nPages: {}/{} | Batch: {}/{}",
-        pct,
-        done,
-        total,
+        "`{bar}` {pct}%\nPages: {done}/{total} \\| Batch: {}/{}",
         (batch_idx + 1).min(total_batches),
         total_batches
     );
@@ -2382,42 +2414,60 @@ fn download_image_url_telegram(
     // (attacker-controlled HTML can point image URLs at internal services).
     let parsed = url::Url::parse(url).with_context(|| format!("invalid image URL: {url}"))?;
     validate_public_url(&parsed).with_context(|| format!("unsafe image URL skipped: {url}"))?;
-    let resp = client
-        .get(url)
-        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        .header(REFERER, referer)
-        .header(
-            ACCEPT,
-            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
-        )
-        .timeout(Duration::from_secs(60))
-        .send()
-        .with_context(|| format!("failed to fetch {url}"))?
-        .error_for_status()
-        .with_context(|| format!("server rejected {url}"))?;
-    let content_type = resp
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let mut reader = resp.take(max_bytes + 1);
-    let mut data = Vec::new();
-    reader
-        .read_to_end(&mut data)
-        .with_context(|| format!("failed to read bytes from {url}"))?;
-    if data.len() as u64 > max_bytes {
-        anyhow::bail!("image exceeds {max_bytes} bytes");
+
+    // CDNs throttle burst scrapers (nhentai in particular): retry twice
+    // with backoff before giving up on a page.
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..3usize {
+        let outcome = (|| -> Result<()> {
+            let resp = client
+                .get(url)
+                .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                .header(REFERER, referer)
+                .header(
+                    ACCEPT,
+                    "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+                )
+                .timeout(Duration::from_secs(60))
+                .send()
+                .with_context(|| format!("failed to fetch {url}"))?
+                .error_for_status()
+                .with_context(|| format!("server rejected {url}"))?;
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mut reader = resp.take(max_bytes + 1);
+            let mut data = Vec::new();
+            reader
+                .read_to_end(&mut data)
+                .with_context(|| format!("failed to read bytes from {url}"))?;
+            if data.len() as u64 > max_bytes {
+                anyhow::bail!("image exceeds {max_bytes} bytes");
+            }
+            if !content_type.starts_with("image/") && !has_image_magic(&data) {
+                anyhow::bail!("URL returned non-image content ({content_type})");
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(output, &data)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_secs(1 + attempt as u64 * 2));
+                }
+            }
+        }
     }
-    if !content_type.starts_with("image/") && !has_image_magic(&data) {
-        anyhow::bail!("URL returned non-image content ({content_type})");
-    }
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(output, &data)
-        .with_context(|| format!("failed to write {}", output.display()))?;
-    Ok(())
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed after retries: {url}")))
 }
 
 fn has_image_magic(data: &[u8]) -> bool {

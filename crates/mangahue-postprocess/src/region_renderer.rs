@@ -847,7 +847,10 @@ fn infer_region_color(
     let bright_region = mean_luma > 230.0;
     let seed_chroma_bar = if bright_region { 48.0 } else { 24.0 };
     let chroma_bar = if bright_region { 40.0 } else { 20.0 };
-    if region.touches_border && mean_luma > 150.0 && existing_blue > 1.0 {
+    if region.touches_border && mean_luma > 150.0 && existing_magnitude < 12.0 {
+        // Only near-neutral border regions (scanner paper casts) are remapped
+        // to a warm palette hue. Vivid content — blue skies, water, red
+        // panels — has large chroma magnitude and must keep its hue.
         if let Some((_, red, blue)) = palette
             .iter()
             .filter(|(_, red, blue)| *red >= 0.0 && *blue <= 0.0)

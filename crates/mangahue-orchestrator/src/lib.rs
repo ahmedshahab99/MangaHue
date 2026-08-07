@@ -395,17 +395,25 @@ impl MangaHueEngine {
                         Ok(faces) if !faces.is_empty() => {
                             face_boxes = faces;
                             // Skin/hair/eye colors from the style palette by
-                            // semantic slots; fall back to natural defaults.
-                            let skin = style
-                                .palette
-                                .get(2)
-                                .map(|c| [c.r, c.g, c.b])
-                                .unwrap_or([242, 208, 182]);
-                            let hair = style
-                                .palette
-                                .get(6)
-                                .map(|c| [c.r, c.g, c.b])
-                                .unwrap_or([38, 28, 34]);
+                            // semantic slots; the slot contract (0-1 paper,
+                            // 2-5 skin, 6-8 hair) only holds for full
+                            // >= 9-color palettes, so short palettes fall
+                            // back to natural defaults instead of reading an
+                            // arbitrary hue (e.g. slot 2 is BLUE in the
+                            // 3-color default style).
+                            let palette_slots_ok = style.palette.len() >= 9;
+                            let skin = if palette_slots_ok {
+                                style.palette.get(2).map(|c| [c.r, c.g, c.b])
+                            } else {
+                                None
+                            }
+                            .unwrap_or([242, 208, 182]);
+                            let hair = if palette_slots_ok {
+                                style.palette.get(6).map(|c| [c.r, c.g, c.b])
+                            } else {
+                                None
+                            }
+                            .unwrap_or([38, 28, 34]);
                             let eyes = [46, 40, 54];
                             let face_painted = rasterize_face_hints(
                                 &mut hints.hint_map,
@@ -1213,10 +1221,11 @@ fn select_backend_for_model(
     if mangahue_inference::is_ddcolor_onnx_model(model_path) {
         #[cfg(feature = "native-onnx")]
         {
-            // Native Rust inference: no Python sidecar, no IPC.
-            return Ok(Box::new(mangahue_inference::NativeDdColorOnnxBackend::new(
-                model_path,
-            )?));
+            // Native Rust inference: no Python sidecar, no IPC. Sessions are
+            // shared across pages so chapters never reload the model.
+            return Ok(Box::new(
+                mangahue_inference::NativeDdColorOnnxBackend::shared(model_path)?,
+            ));
         }
         #[cfg(not(feature = "native-onnx"))]
         {
@@ -1256,15 +1265,24 @@ fn select_backend_for_model(
     }
 
     #[cfg(feature = "native-onnx")]
-    if let Ok(backend) =
-        mangahue_inference::RustOnnxBackend::new(model_path, &config.inference.model_metadata_path)
     {
+        // Native inference is the ONLY path in this build: if the session
+        // cannot be built (missing metadata, broken ORT_DYLIB_PATH, corrupt
+        // model), fail loudly instead of silently falling back to a Python
+        // sidecar that may not even exist on the host.
+        let backend = mangahue_inference::RustOnnxBackend::shared(
+            model_path,
+            &config.inference.model_metadata_path,
+        )?;
         return Ok(Box::new(backend));
     }
-    Ok(Box::new(mangahue_inference::OnnxColorizationBackend::new(
-        model_path,
-        &config.inference.model_metadata_path,
-    )?))
+    #[cfg(not(feature = "native-onnx"))]
+    {
+        Ok(Box::new(mangahue_inference::OnnxColorizationBackend::new(
+            model_path,
+            &config.inference.model_metadata_path,
+        )?))
+    }
 }
 
 fn update_project_history(project_path: &Path, page_id: &str) -> Result<()> {

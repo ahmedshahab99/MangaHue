@@ -22,7 +22,7 @@ Environment=MALLOC_ARENA_MAX=2
 RuntimeDirectory=mangahue-pro
 RuntimeDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /run/mangahue-pro/jobs /run/mangahue-pro/tmp
-ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 2016 --max-concurrent-jobs 1 --batch-size 1 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/studio_anime.yaml --daily-limit 0
+ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 1 --batch-size 1 --daily-limit 300 --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml --style /opt/MangaHue-release/configs/styles/studio_anime.yaml
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30
