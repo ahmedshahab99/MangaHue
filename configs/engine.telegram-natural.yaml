@@ -1,0 +1,70 @@
+engine:
+  mode: fast
+  parallel_jobs: 1
+  pyramid_enabled: false
+  hint_propagation_enabled: false
+
+preprocess:
+  denoise_enabled: false
+  denoise_strength: 0
+  max_input_dimension: 640
+  line_sharpening: 0.35
+
+layout:
+  tiling_enabled: false
+  tile_size: 640
+  tile_overlap: 0
+
+inference:
+  model_path: models/manga-onnx/manga-colorize-fp16.onnx
+  model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
+  device: cpu
+  batch_size: 1
+  input_size: 640
+  fp16_enabled: false
+  resize_policy: fit
+
+hints:
+  user_hints_enabled: true
+  character_memory_enabled: true
+  style_hints_enabled: true
+  hint_blur_radius: 4.0
+  hint_strength: 1.0
+  region_style_hints_enabled: true
+  region_style_hint_budget: 18
+
+postprocess:
+  restore_lines: true
+  line_strength: 1.05
+  bubble_cleanup: false
+  bleeding_correction: false
+  palette_correction: true
+  final_sharpening: 0.02
+  reference_finishing: true
+  # Natural grade: pull the model's vivid output toward real-world chroma.
+  target_colorfulness: 1.1
+  midtone_depth: 0.08
+  local_contrast: 0.1
+  semantic_relighting: false
+  relighting_strength: 0.15
+  natural_grading: true
+  muted_target_grade: true
+  muted_strength: 0.95
+  muted_hue_shift_deg: 16.0
+  muted_dark_pull: 0.92
+  muted_dark_sat: 0.19
+  muted_mid_sat: 0.27
+  muted_bright_sat: 0.22
+  muted_paper_sat: 0.034
+
+output:
+  format: png
+  quality: 95
+  write_report: true
+  write_intermediates: false
+
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.18

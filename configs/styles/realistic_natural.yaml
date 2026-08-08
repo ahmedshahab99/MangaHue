@@ -1,0 +1,59 @@
+id: realistic_natural
+name: Realistic Natural
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Real-world material palette: low-chroma warm skin, muted clothing hues
+# (faded denim, olive, terracotta, sage), and desaturated airy backgrounds
+# so nothing reads as neon or plastic.
+palette:
+  # skin (warm, low chroma, natural variety)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair (natural dark tones)
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing — muted denim blues
+  - "#5a6e8a"
+  - "#44587a"
+  - "#72869e"
+  - "#3a4a63"
+  # clothing — faded terracotta / brick
+  - "#a86a58"
+  - "#b57a68"
+  - "#8f5a4c"
+  # clothing — sage / olive greens
+  - "#5f7660"
+  - "#778c73"
+  - "#4c6350"
+  # clothing — muted plum
+  - "#6e5f77"
+  - "#5c4f64"
+  # clothing — ochre / khaki
+  - "#a08a5e"
+  - "#8f7b54"
+  # fabric neutrals (warm gray)
+  - "#7e746c"
+  - "#958a80"
+  # backgrounds — hazy cool
+  - "#a5b3c0"
+  - "#8b99a6"
+  - "#b9c2cc"
+  # backgrounds — warm beige
+  - "#d2c4a8"
+  - "#c0b194"
+  - "#e0d6c0"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Realistic natural look: no saturation boost, gentle contrast, low-chroma material palette so skin reads as skin and clothes as fabric."
