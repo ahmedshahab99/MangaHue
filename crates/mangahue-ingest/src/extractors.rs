@@ -71,32 +71,83 @@ fn extract_nhentai(
     max_pages: usize,
 ) -> Result<Vec<String>> {
     let document = Html::parse_document(html);
-    let mut urls = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
 
-    // Method 1: Extract from <noscript> images (thumbnails → full image)
+    // All candidates are normalized (thumbnail -> full size, double
+    // extensions collapsed) and deduplicated as they arrive.
+    let mut push = |candidate: &str| {
+        let absolute = match Url::parse(candidate) {
+            Ok(_) => candidate.to_string(),
+            Err(_) => base
+                .join(candidate)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| candidate.to_string()),
+        };
+        let normalized = normalize_nhentai_url(&absolute);
+        if seen.insert(normalized.clone()) {
+            urls.push(normalized);
+        }
+    };
+
+    // Method 1: <noscript> images (already absolute on the site)
     let noscript_sel = Selector::parse("noscript img").unwrap();
     for img in document.select(&noscript_sel) {
         if let Some(src) = img.value().attr("src") {
-            let full = nhentai_thumb_to_full(src);
-            if seen.insert(full.clone()) {
-                if let Ok(abs) = base.join(&full) {
-                    urls.push(abs.to_string());
-                }
+            push(src);
+        }
+    }
+
+    // Method 2: lazy-loaded images (data-src / src).
+    // NOTE: not gated on method 1 being empty: a partial noscript set must
+    // not suppress the other methods (that caused silent page loss).
+    let img_sel = Selector::parse(".thumb-container img").unwrap();
+    for img in document.select(&img_sel) {
+        for attr in &["data-src", "src"] {
+            if let Some(src) = img.value().attr(attr) {
+                push(src);
             }
         }
     }
 
-    // Method 2: Extract from lazy-loaded images (data-src)
-    if urls.is_empty() {
-        let img_sel = Selector::parse(".thumb-container img").unwrap();
-        for img in document.select(&img_sel) {
-            for attr in &["data-src", "src"] {
-                if let Some(src) = img.value().attr(attr) {
-                    let full = nhentai_thumb_to_full(src);
-                    if seen.insert(full.clone()) {
-                        if let Ok(abs) = base.join(&full) {
-                            urls.push(abs.to_string());
+    // Method 3: gallery JSON embedded in the page body (complete page list).
+    if let Some(gid) = extract_nhentai_gallery_id(base) {
+        if let Some(parsed) = parse_nhentai_embedded_json(html, &gid) {
+            for img in parsed {
+                push(&img);
+            }
+        }
+    }
+
+    // Method 4: gallery API as a completeness fallback. The official API is
+    // now gated ("Use new API"), but the legacy endpoint still answers for
+    // some galleries; merging it can only add missing pages.
+    if let Some(gid) = extract_nhentai_gallery_id(base) {
+        let api_url = format!("https://nhentai.net/api/gallery/{}", gid);
+        if let Ok(resp) = _client
+            .get(&api_url)
+            .header(USER_AGENT, UA)
+            .timeout(Duration::from_secs(15))
+            .send()
+        {
+            let mut reader = resp.take(16 * 1024 * 1024);
+            let mut body = Vec::new();
+            if reader.read_to_end(&mut body).is_ok() {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    if let (Some(mid), Some(images)) = (
+                        json["media_id"].as_str().map(|s| s.to_string()),
+                        json["images"]["pages"].as_array(),
+                    ) {
+                        for page in images.iter().take(max_pages) {
+                            let ext = match page["t"].as_str().unwrap_or("j") {
+                                "p" => "png",
+                                "w" => "webp",
+                                _ => "jpg",
+                            };
+                            let num = page["num"].as_u64().unwrap_or(1);
+                            let img =
+                                format!("https://i.nhentai.net/galleries/{}/{}.{}", mid, num, ext);
+                            push(&img);
                         }
                     }
                 }
@@ -104,99 +155,129 @@ fn extract_nhentai(
         }
     }
 
-    // Method 3: Build URLs from gallery data in JSON/script.
-    // nhentai embeds the gallery JSON as an escaped string inside a
-    // `"body":"{...}"` field; parse the `pages` array paths directly.
-    if urls.is_empty() {
-        if let Some(gid) = extract_nhentai_gallery_id(base) {
-            if let Some(parsed) = parse_nhentai_embedded_json(html, &gid) {
-                for img in parsed.into_iter().take(max_pages) {
-                    if seen.insert(img.clone()) {
-                        urls.push(img);
-                    }
-                }
-            }
-        }
-    }
-
-    // Method 4: Use the API as fallback
-    if urls.is_empty() {
-        if let Some(gid) = extract_nhentai_gallery_id(base) {
-            let api_url = format!("https://nhentai.net/api/gallery/{}", gid);
-            if let Ok(resp) = _client
-                .get(&api_url)
-                .header(USER_AGENT, UA)
-                .timeout(Duration::from_secs(15))
-                .send()
-            {
-                let mut reader = resp.take(16 * 1024 * 1024);
-                let mut body = Vec::new();
-                if reader.read_to_end(&mut body).is_ok() {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                        if let (Some(mid), Some(images)) = (
-                            json["media_id"].as_str().map(|s| s.to_string()),
-                            json["images"]["pages"].as_array(),
-                        ) {
-                            for page in images.iter().take(max_pages) {
-                                let ext = match page["t"].as_str().unwrap_or("j") {
-                                    "p" => "png",
-                                    "w" => "webp",
-                                    _ => "jpg",
-                                };
-                                let num = page["num"].as_u64().unwrap_or(1);
-                                let img = format!(
-                                    "https://i.nhentai.net/galleries/{}/{}.{}",
-                                    mid, num, ext
-                                );
-                                if seen.insert(img.clone()) {
-                                    urls.push(img);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // Defensive: drop any remaining thumbnail markers, then order pages
+    // numerically (methods return them in different orders / sets).
+    urls.retain(|u| !is_nhentai_thumbnail(u));
+    urls.sort_by_key(|u| page_number_of(u).unwrap_or(u64::MAX));
+    urls.truncate(max_pages);
     Ok(urls)
 }
 
-fn nhentai_thumb_to_full(src: &str) -> String {
-    // Convert any //t, //t1, //t2, ... //t999 subdomain to //i, //i1, //i2, ...
-    let mut s = src.trim().to_string();
-    if let Ok(mut parsed) = Url::parse(&s) {
-        if let Some(host) = parsed.host_str().map(str::to_string) {
-            let lower = host.to_ascii_lowercase();
+/// True if the URL still names a thumbnail (`{n}t.{ext}`) after normalization.
+fn is_nhentai_thumbnail(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    let Some(file) = parsed.path().rsplit('/').next() else {
+        return false;
+    };
+    let Some(stem) = file.split('.').next() else {
+        return false;
+    };
+    stem.strip_suffix('t')
+        .is_some_and(|num| !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Extract the 1-based page number from a normalized nhentai image URL.
+fn page_number_of(url: &str) -> Option<u64> {
+    let path = Url::parse(url).ok()?.path().to_string();
+    let file = path.rsplit('/').next()?;
+    let stem = file.split('.').next()?;
+    if stem.chars().all(|c| c.is_ascii_digit()) {
+        stem.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Normalize a nhentai image URL to the full-size page variant.
+///
+/// The site's thumbnail markup is messy: hosts are `t[1-9]?.nhentai.net`
+/// instead of `i...`, and the current HTML emits filenames like
+/// `3t.webp.webp` (thumbnail marker + double extension). This collapses
+/// both: `3t.webp.webp` -> `3.webp`, `1t.jpg` -> `1.jpg`, and plain
+/// `2.webp` is left untouched.
+fn normalize_nhentai_url(src: &str) -> String {
+    let trimmed = src.trim();
+    let mut parsed = match Url::parse(trimmed) {
+        Ok(p) => p,
+        Err(_) => {
+            // Protocol-relative (`//t1.nhentai.net/...`) or bare path.
+            let absolute = if trimmed.starts_with("//") {
+                format!("https:{trimmed}")
+            } else {
+                trimmed.to_string()
+            };
+            let Ok(p) = Url::parse(&absolute) else {
+                return trimmed.to_string();
+            };
+            p
+        }
+    };
+
+    // t[1-9]? .nhentai.net -> i[1-9]? .nhentai.net (thumb -> full host).
+    if let Some(host) = parsed.host_str().map(str::to_string) {
+        let lower = host.to_ascii_lowercase();
+        for domain in [".nhentai.net", ".nhentai.to"] {
             if let Some(suffix) = lower
                 .strip_prefix('t')
-                .and_then(|value| value.strip_suffix(".nhentai.net"))
+                .and_then(|value| value.strip_suffix(domain))
             {
-                let _ = parsed.set_host(Some(&format!("i{suffix}.nhentai.net")));
-                s = parsed.to_string();
-            } else if let Some(suffix) = lower
-                .strip_prefix('t')
-                .and_then(|value| value.strip_suffix(".nhentai.to"))
-            {
-                let _ = parsed.set_host(Some(&format!("i{suffix}.nhentai.to")));
-                s = parsed.to_string();
+                let _ = parsed.set_host(Some(&format!("i{suffix}{domain}")));
+                break;
             }
         }
-    } else if s.starts_with("//t") {
-        s = s.replacen("//t", "//i", 1);
     }
 
-    // Remove 't' suffix before extension: 1t.jpg → 1.jpg, 23t.png → 23.png
-    if let Some(ext_dot) = s.rfind('.') {
-        let base = &s[..ext_dot];
-        let ext = &s[ext_dot..];
-        if let Some(without_t) = base.strip_suffix('t') {
-            if !without_t.is_empty() && without_t.ends_with(|c: char| c.is_ascii_digit()) {
-                return format!("{}{}", without_t, ext);
-            }
+    // Collapse thumbnail marker + repeated extensions in the filename.
+    let cleaned = cleanup_nhentai_filename(parsed.path());
+    let _ = parsed.set_path(&cleaned);
+    parsed.to_string()
+}
+
+/// `3t.webp.webp` -> `3.webp`; `1t.jpg` -> `1.jpg`; `4.webp` stays `4.webp`.
+fn cleanup_nhentai_filename(path: &str) -> String {
+    let (dir, file) = match path.rsplit_once('/') {
+        Some((d, f)) => (d, f),
+        None => ("", path),
+    };
+
+    // Strip repeated known extensions, keeping the last one.
+    let mut ext: Option<&str> = None;
+    let mut stem = file;
+    loop {
+        let Some((s, e)) = stem.rsplit_once('.') else {
+            break;
+        };
+        if matches!(
+            e.to_ascii_lowercase().as_str(),
+            "webp" | "jpg" | "jpeg" | "png" | "gif"
+        ) {
+            ext = Some(e);
+            stem = s;
+        } else {
+            break;
         }
     }
-    s
+
+    // Thumbnail marker: {n}t -> {n}.
+    if let Some(num) = stem.strip_suffix('t') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            stem = num;
+        }
+    }
+
+    match ext {
+        Some(e) => {
+            let name = format!("{stem}.{e}");
+            if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            }
+        }
+        None => path.to_string(),
+    }
 }
 
 fn extract_nhentai_gallery_id(url: &Url) -> Option<String> {
@@ -247,6 +328,16 @@ fn parse_nhentai_embedded_json(html: &str, gid: &str) -> Option<Vec<String>> {
             end = i + c.len_utf8();
         }
         let file = &rest[..end];
+        // Skip thumbnail paths ({n}t.{ext}) — they 404 on the full-size
+        // host and are mixed into the embedded JSON alongside the real
+        // pages. Full paths like `3.webp` are kept.
+        let file_stem = file.split('.').next().unwrap_or(file);
+        if let Some(num) = file_stem.strip_suffix('t') {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                search_from = start + end;
+                continue;
+            }
+        }
         if let Some(ext) = file.rsplit('.').next() {
             if matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "gif") {
                 let img = format!("https://i.nhentai.net/galleries/{}/{}", media_id, file);
@@ -818,7 +909,7 @@ mod tests {
     #[test]
     fn nhentai_thumb_to_full_converts_correctly() {
         let thumb = "https://t.nhentai.net/galleries/1234567/1t.jpg";
-        let full = nhentai_thumb_to_full(thumb);
+        let full = normalize_nhentai_url(thumb);
         assert_eq!(full, "https://i.nhentai.net/galleries/1234567/1.jpg");
     }
 
@@ -905,8 +996,72 @@ mod tests {
     #[test]
     fn nhentai_thumbnail_conversion_handles_numbered_hosts() {
         assert_eq!(
-            nhentai_thumb_to_full("https://t2.nhentai.net/galleries/12/23t.webp"),
+            normalize_nhentai_url("https://t2.nhentai.net/galleries/12/23t.webp"),
             "https://i2.nhentai.net/galleries/12/23.webp"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nhentai_normalize_tests {
+    use super::*;
+
+    #[test]
+    fn thumbnail_double_ext_collapses() {
+        // The exact malformed URLs seen in production logs.
+        assert_eq!(
+            normalize_nhentai_url("https://i2.nhentai.net/galleries/3257072/3t.webp.webp"),
+            "https://i2.nhentai.net/galleries/3257072/3.webp"
+        );
+    }
+
+    #[test]
+    fn thumbnail_single_ext_collapses() {
+        assert_eq!(
+            normalize_nhentai_url("https://t.nhentai.net/galleries/3257072/1t.jpg"),
+            "https://i.nhentai.net/galleries/3257072/1.jpg"
+        );
+        assert_eq!(
+            normalize_nhentai_url("https://i3.nhentai.net/galleries/3257072/23t.webp"),
+            "https://i3.nhentai.net/galleries/3257072/23.webp"
+        );
+    }
+
+    #[test]
+    fn full_pages_unchanged() {
+        assert_eq!(
+            normalize_nhentai_url("https://i1.nhentai.net/galleries/3257072/2.webp"),
+            "https://i1.nhentai.net/galleries/3257072/2.webp"
+        );
+        assert_eq!(
+            normalize_nhentai_url("https://i.nhentai.net/galleries/3257072/14.png"),
+            "https://i.nhentai.net/galleries/3257072/14.png"
+        );
+    }
+
+    #[test]
+    fn thumbnail_detector() {
+        assert!(is_nhentai_thumbnail(
+            "https://i2.nhentai.net/galleries/3257072/3t.webp"
+        ));
+        assert!(!is_nhentai_thumbnail(
+            "https://i2.nhentai.net/galleries/3257072/3.webp"
+        ));
+    }
+
+    #[test]
+    fn page_number_extraction() {
+        assert_eq!(
+            page_number_of("https://i1.nhentai.net/galleries/3257072/2.webp"),
+            Some(2)
+        );
+        assert_eq!(
+            page_number_of("https://i1.nhentai.net/galleries/3257072/14.png"),
+            Some(14)
+        );
+        assert_eq!(
+            page_number_of("https://i1.nhentai.net/galleries/3257072/x.webp"),
+            None
         );
     }
 }

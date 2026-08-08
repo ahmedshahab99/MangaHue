@@ -1978,16 +1978,21 @@ fn handle_link(
     let batch_size = settings.batch_size;
     let total_batches = effective_total.div_ceil(batch_size);
 
-    let status_msg_id = send_message(
-        client,
-        token,
-        chat_id,
-        &format!(
+    let status_text = if remaining < total {
+        // Never hide quota truncation: the user must know pages are skipped.
+        format!(
+            "Found all *{}* page\\(s\\)\\. Daily quota allows *{}* today\\. *{}* page\\(s\\) will be skipped\\.",
+            total,
+            effective_total,
+            total - effective_total
+        )
+    } else {
+        format!(
             "Found all *{}* page\\(s\\)\\. Coloring them one by one in chapter order\\.",
             effective_total
-        ),
-        Some("MarkdownV2"),
-    )?;
+        )
+    };
+    let status_msg_id = send_message(client, token, chat_id, &status_text, Some("MarkdownV2"))?;
     let _ = edit_message(
         client,
         token,
@@ -2005,11 +2010,189 @@ fn handle_link(
     )?;
 
     let engine = MangaHueEngine::new();
-    let mut sent = 0usize;
-    let mut failed = 0usize;
-    let mut failed_pages: Vec<PathBuf> = Vec::new();
+    // Shared mutable counters: the per-page closure and the retry pass both
+    // update them (Rc<RefCell> so the closure's capture never fights the
+    // outer reads for summary lines).
+    #[derive(Default)]
+    struct PageCounters {
+        sent: usize,
+        failed: usize,
+        failed_pages: Vec<PathBuf>,
+        page_times: Vec<f32>,
+    }
+    let counters = std::rc::Rc::new(std::cell::RefCell::new(PageCounters::default()));
+    // Downloads that failed transiently (CDN hiccups) are retried once
+    // after the main pass instead of being silently dropped.
+    let mut retry_queue: Vec<(usize, String, PathBuf)> = Vec::new();
     let total_start = Instant::now();
-    let mut page_times: Vec<f32> = Vec::new();
+
+    // Shared per-page pipeline (the caller owns the download): colorize,
+    // deliver, report. Returns Ok(true) when the job was cancelled.
+    let process_page = |position: usize,
+                        local_path: &PathBuf,
+                        batch_idx: usize|
+     -> anyhow::Result<bool> {
+        if cancel_token.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+
+        let page_start = Instant::now();
+        let stem = local_path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .unwrap_or("page");
+        let output_path = output_dir.join(format!("{stem}.png"));
+
+        let (progress_sender, mut progress_receiver) =
+            tokio::sync::mpsc::unbounded_channel::<ProgressUpdate>();
+        let progress_client = client.clone();
+        let progress_token = token.to_string();
+        let progress_msg_id2 = progress_msg_id;
+        let progress_total = effective_total;
+        let progress_position = position;
+        let progress_chat = chat_id;
+        let progress_markup = cancel_markup.clone();
+        let progress_thread = std::thread::spawn(move || {
+            let mut last_stage = String::new();
+            let mut last_percent = -10i32;
+            while let Some(update) = progress_receiver.blocking_recv() {
+                let percent = update.percent.round() as i32;
+                if update.stage != last_stage || percent >= last_percent + 10 || percent >= 100 {
+                    let text = format!(
+                        "Coloring page {}/{}: {} ({}%)",
+                        progress_position + 1,
+                        progress_total,
+                        humanize_stage(&update.stage),
+                        percent.clamp(0, 100)
+                    );
+                    let _ = edit_message_with_markup(
+                        &progress_client,
+                        &progress_token,
+                        progress_chat,
+                        progress_msg_id2,
+                        &text,
+                        Some(&progress_markup),
+                    );
+                    last_stage = update.stage;
+                    last_percent = percent;
+                }
+            }
+        });
+
+        let result = engine.colorize(ColorizeRequest {
+            input_path: local_path.clone(),
+            output_path: output_path.clone(),
+            model_path: args.model.clone(),
+            reference_image_path: reference_image.clone(),
+            enable_ensemble: !args.ensemble_models.is_empty(),
+            ensemble_model_paths: args.ensemble_models.clone(),
+            config_path: args.config.clone(),
+            preset_path: args.preset.clone(),
+            style_path: style_path.clone(),
+            project_path: args.project.clone(),
+            region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
+            user_hints_path: resolve_user_hints(args, chat_id, stem),
+            use_mock_backend: args.mock,
+            pyramid_enabled: args.pyramid,
+            hint_propagation_enabled: args.hint_propagate,
+            palette_path: settings.palette_path.clone(),
+            auto_palette: settings.auto_palette,
+            cancel_token: Some(Arc::clone(&cancel_token)),
+            progress_sender: Some(progress_sender),
+            ..ColorizeRequest::default()
+        });
+
+        let _ = progress_thread.join();
+        let elapsed = page_start.elapsed().as_secs_f32();
+        let mut c = counters.borrow_mut();
+        c.page_times.push(elapsed);
+
+        match result {
+            Ok(colorize_result) => {
+                if cancel_token.load(Ordering::Acquire) {
+                    let _ = edit_message_with_markup(
+                        client,
+                        token,
+                        chat_id,
+                        progress_msg_id,
+                        &format!("Cancelled after {} page(s).", c.sent),
+                        Some(r#"{"inline_keyboard":[]}"#),
+                    );
+                    cleanup_dir(&job_dir);
+                    return Ok(true);
+                }
+                let caption = format!(
+                    "MangaHue p.{} | {}",
+                    position + 1,
+                    colorize_result
+                        .report
+                        .director_verdict
+                        .unwrap_or_else(|| "colored".to_string())
+                );
+                let delivery_path =
+                    prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+                ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
+                // Cosmetic typing indicator: never abort the chapter on this.
+                let _ = send_chat_action(client, token, chat_id, "upload_document");
+                if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption) {
+                    tracing::error!(error = %e, "send failed");
+                    c.failed += 1;
+                } else {
+                    c.sent += 1;
+                }
+                if delivery_path != output_path {
+                    let _ = std::fs::remove_file(&delivery_path);
+                }
+                let _ = std::fs::remove_file(&output_path);
+                let _ = std::fs::remove_file(local_path);
+                state.record_pages(chat_id, 1);
+            }
+            Err(error) => {
+                if cancel_token.load(Ordering::Acquire) {
+                    let _ = edit_message_with_markup(
+                        client,
+                        token,
+                        chat_id,
+                        progress_msg_id,
+                        "Cancelled.",
+                        Some(r#"{"inline_keyboard":[]}"#),
+                    );
+                    cleanup_dir(&job_dir);
+                    return Ok(true);
+                }
+                c.failed += 1;
+                c.failed_pages.push(local_path.clone());
+                if args.fail_fast {
+                    cleanup_dir(&job_dir);
+                    return Err(error);
+                }
+                tracing::warn!(
+                    page = position + 1,
+                    error = %error,
+                    "page colorization failed, continuing"
+                );
+            }
+        }
+
+        let done = c.sent + c.failed;
+        let eta = estimate_eta(&c.page_times, done, effective_total);
+        let _ = edit_message_with_markup(
+            client,
+            token,
+            chat_id,
+            progress_msg_id,
+            &format_progress(
+                done,
+                effective_total,
+                batch_idx,
+                total_batches,
+                eta,
+                c.failed,
+            ),
+            Some(&cancel_markup),
+        );
+        Ok(false)
+    };
 
     for batch_idx in 0..total_batches {
         if cancel_token.load(Ordering::Acquire) {
@@ -2018,7 +2201,7 @@ fn handle_link(
                 token,
                 chat_id,
                 progress_msg_id,
-                &format!("Cancelled after {sent} page(s) colored.",),
+                "Cancelled.",
                 Some(r#"{"inline_keyboard":[]}"#),
             );
             cleanup_dir(&job_dir);
@@ -2033,7 +2216,7 @@ fn handle_link(
             .map(|(i, u)| (start + i, u.clone()))
             .collect();
 
-        // â”€â”€ Download this batch â”€â”€
+        // Download this batch; transient failures are queued for the retry pass.
         let mut batch_pages: Vec<(usize, PathBuf)> = Vec::new();
         for (pos, img_url) in &batch_urls {
             if cancel_token.load(Ordering::Acquire) {
@@ -2053,170 +2236,57 @@ fn handle_link(
                     batch_pages.push((*pos, local_path));
                 }
                 Err(e) => {
-                    tracing::warn!(url = %img_url, error = %e, "download failed, skipping");
-                    failed += 1;
+                    tracing::warn!(url = %img_url, error = %e, "download failed, queued for retry");
+                    retry_queue.push((*pos, img_url.clone(), local_path));
                 }
             }
         }
 
         for (position, page) in &batch_pages {
-            if cancel_token.load(Ordering::Acquire) {
-                break;
+            if process_page(*position, page, batch_idx)? {
+                cleanup_dir(&job_dir);
+                return Ok(());
             }
-
-            let page_start = Instant::now();
-            let local_path = page;
-            let stem = local_path
-                .file_stem()
-                .and_then(|v| v.to_str())
-                .unwrap_or("page");
-            let output_path = output_dir.join(format!("{stem}.png"));
-
-            let (progress_sender, mut progress_receiver) =
-                tokio::sync::mpsc::unbounded_channel::<ProgressUpdate>();
-            let progress_client = client.clone();
-            let progress_token = token.to_string();
-            let progress_msg_id2 = progress_msg_id;
-            let progress_total = effective_total;
-            let progress_position = *position;
-            let progress_chat = chat_id;
-            let progress_markup = cancel_markup.clone();
-            let progress_thread = std::thread::spawn(move || {
-                let mut last_stage = String::new();
-                let mut last_percent = -10i32;
-                while let Some(update) = progress_receiver.blocking_recv() {
-                    let percent = update.percent.round() as i32;
-                    if update.stage != last_stage || percent >= last_percent + 10 || percent >= 100
-                    {
-                        let text = format!(
-                            "Coloring page {}/{}: {} ({}%)",
-                            progress_position + 1,
-                            progress_total,
-                            humanize_stage(&update.stage),
-                            percent.clamp(0, 100)
-                        );
-                        let _ = edit_message_with_markup(
-                            &progress_client,
-                            &progress_token,
-                            progress_chat,
-                            progress_msg_id2,
-                            &text,
-                            Some(&progress_markup),
-                        );
-                        last_stage = update.stage;
-                        last_percent = percent;
-                    }
-                }
-            });
-
-            let result = engine.colorize(ColorizeRequest {
-                input_path: local_path.clone(),
-                output_path: output_path.clone(),
-                model_path: args.model.clone(),
-                reference_image_path: reference_image.clone(),
-                enable_ensemble: !args.ensemble_models.is_empty(),
-                ensemble_model_paths: args.ensemble_models.clone(),
-                config_path: args.config.clone(),
-                preset_path: args.preset.clone(),
-                style_path: style_path.clone(),
-                project_path: args.project.clone(),
-                region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
-                user_hints_path: resolve_user_hints(args, chat_id, stem),
-                use_mock_backend: args.mock,
-                pyramid_enabled: args.pyramid,
-                hint_propagation_enabled: args.hint_propagate,
-                palette_path: settings.palette_path.clone(),
-                auto_palette: settings.auto_palette,
-                cancel_token: Some(Arc::clone(&cancel_token)),
-                progress_sender: Some(progress_sender),
-                ..ColorizeRequest::default()
-            });
-
-            let _ = progress_thread.join();
-            let elapsed = page_start.elapsed().as_secs_f32();
-            page_times.push(elapsed);
-
-            match result {
-                Ok(colorize_result) => {
-                    if cancel_token.load(Ordering::Acquire) {
-                        let _ = edit_message_with_markup(
-                            client,
-                            token,
-                            chat_id,
-                            progress_msg_id,
-                            &format!("Cancelled after {sent} page(s)."),
-                            Some(r#"{"inline_keyboard":[]}"#),
-                        );
-                        cleanup_dir(&job_dir);
-                        return Ok(());
-                    }
-                    let caption = format!(
-                        "MangaHue p.{} | {}",
-                        position + 1,
-                        colorize_result
-                            .report
-                            .director_verdict
-                            .unwrap_or_else(|| "colored".to_string())
-                    );
-                    let delivery_path =
-                        prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
-                    ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
-                    send_chat_action(client, token, chat_id, "upload_document")?;
-                    if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption)
-                    {
-                        tracing::error!(error = %e, "send failed");
-                        failed += 1;
-                    } else {
-                        sent += 1;
-                    }
-                    if delivery_path != output_path {
-                        let _ = std::fs::remove_file(&delivery_path);
-                    }
-                    let _ = std::fs::remove_file(&output_path);
-                    let _ = std::fs::remove_file(local_path);
-                    state.record_pages(chat_id, 1);
-                }
-                Err(error) => {
-                    if cancel_token.load(Ordering::Acquire) {
-                        let _ = edit_message_with_markup(
-                            client,
-                            token,
-                            chat_id,
-                            progress_msg_id,
-                            "Cancelled.",
-                            Some(r#"{"inline_keyboard":[]}"#),
-                        );
-                        cleanup_dir(&job_dir);
-                        return Ok(());
-                    }
-                    failed += 1;
-                    failed_pages.push(local_path.clone());
-                    if args.fail_fast {
-                        cleanup_dir(&job_dir);
-                        return Err(error);
-                    }
-                    tracing::warn!(
-                        page = position + 1,
-                        error = %error,
-                        "page colorization failed, continuing"
-                    );
-                }
-            }
-
-            let done =
-                start + sent.min((*position + 1) - start) + failed.min((*position + 1) - start);
-            let eta = estimate_eta(&page_times, done, effective_total);
-            let _ = edit_message_with_markup(
-                client,
-                token,
-                chat_id,
-                progress_msg_id,
-                &format_progress(done, effective_total, batch_idx, total_batches, eta, failed),
-                Some(&cancel_markup),
-            );
         }
 
         for (_, path) in &batch_pages {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // Retry pass: give transiently failed downloads a second chance before
+    // reporting them as failed.
+    if !retry_queue.is_empty() && !cancel_token.load(Ordering::Acquire) {
+        let mut recovered: Vec<(usize, PathBuf)> = Vec::new();
+        for (pos, img_url, local_path) in &retry_queue {
+            if cancel_token.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(3));
+            match download_image_url_telegram(
+                fetch_client,
+                img_url,
+                source_url.as_str(),
+                local_path,
+                args.max_bytes_per_page,
+            ) {
+                Ok(()) => {
+                    ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
+                    recovered.push((*pos, local_path.clone()));
+                }
+                Err(e) => {
+                    tracing::warn!(url = %img_url, error = %e, "retry download failed, skipping");
+                    counters.borrow_mut().failed += 1;
+                }
+            }
+        }
+        for (position, page) in &recovered {
+            if process_page(*position, page, total_batches)? {
+                cleanup_dir(&job_dir);
+                return Ok(());
+            }
+        }
+        for (_, path) in &recovered {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -2231,12 +2301,14 @@ fn handle_link(
     };
 
     let mut final_text = format!(
-        "Done in {:.0}s\\. Sent *{sent}* colored page\\(s\\)\\.",
-        elapsed
+        "Done in {:.0}s\\. Sent *{}* colored page\\(s\\)\\.",
+        elapsed,
+        counters.borrow().sent
     );
-    if failed > 0 {
+    if counters.borrow().failed > 0 {
         final_text.push_str(&format!(
-            " *{failed}* page\\(s\\) failed\\. Send the URL again to retry failed pages\\."
+            " *{}* page\\(s\\) failed\\. Send the URL again to retry failed pages\\.",
+            counters.borrow().failed
         ));
     }
 
@@ -2255,7 +2327,11 @@ fn handle_link(
         token,
         chat_id,
         progress_msg_id,
-        &format!("Complete: *{sent}* sent, *{failed}* failed\\.",),
+        &format!(
+            "Complete: *{}* sent, *{}* failed\\.",
+            counters.borrow().sent,
+            counters.borrow().failed
+        ),
         Some(r#"{"inline_keyboard":[]}"#),
     );
 
