@@ -1,0 +1,42 @@
+id: creative_soft_pastel
+name: Creative Soft Pastel
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Creative mood palette: identical natural grading and identical skin hues
+# (faces must always read as natural skin); clothing + background hues carry
+# the mood. The bot rotates these per job for channel variety.
+palette:
+  # skin (identical across all creative styles)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing
+  - "#d4a0b8"
+  - "#c088b0"
+  - "#e0b8c8"
+  - "#a0c0d8"
+  - "#88b0cc"
+  - "#c0b8d8"
+  - "#a8a0cc"
+  # backgrounds
+  - "#f0d8e0"
+  - "#e8d0e0"
+  - "#d8e8f0"
+  - "#c8dce8"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Creative Soft Pastel: creative mood palette with natural skin and grading."

@@ -1,0 +1,43 @@
+id: creative_ocean_teal
+name: Creative Ocean Teal
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Creative mood palette: identical natural grading and identical skin hues
+# (faces must always read as natural skin); clothing + background hues carry
+# the mood. The bot rotates these per job for channel variety.
+palette:
+  # skin (identical across all creative styles)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing
+  - "#2f8a8a"
+  - "#3a9a9a"
+  - "#287878"
+  - "#3a7a9a"
+  - "#2f5d8a"
+  - "#5a9a8a"
+  - "#7ab8a8"
+  # backgrounds
+  - "#a0d0c8"
+  - "#88c0b8"
+  - "#b8e0d8"
+  - "#d0e8e4"
+  - "#c0dcd8"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Creative Ocean Teal: creative mood palette with natural skin and grading."

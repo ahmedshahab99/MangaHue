@@ -33,6 +33,17 @@ const BUILTIN_STYLES: &[(&str, &str)] = &[
     ("dark_seinen", "Dark Seinen"),
     ("watercolor_soft", "Watercolor Soft"),
     ("retro_90s_anime", "Retro 90s Anime"),
+    // Creative mood rotation: the bot cycles these per job (unless the user
+    // picked a style explicitly) so a channel never shows two identical-
+    // looking pages. Skin hues are identical across all of them.
+    ("creative_warm_sunset", "Creative Warm Sunset"),
+    ("creative_cool_twilight", "Creative Cool Twilight"),
+    ("creative_fresh_sage", "Creative Fresh Sage"),
+    ("creative_soft_pastel", "Creative Soft Pastel"),
+    ("creative_autumn_amber", "Creative Autumn Amber"),
+    ("creative_ocean_teal", "Creative Ocean Teal"),
+    ("creative_violet_dusk", "Creative Violet Dusk"),
+    ("creative_warm_cocoa", "Creative Warm Cocoa"),
 ];
 
 #[derive(Debug, Clone, Parser)]
@@ -210,6 +221,8 @@ struct BotState {
     active_jobs: AtomicUsize,
     active_chats: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     per_chat_settings: Mutex<HashMap<i64, PerChatSettings>>,
+    /// Per-chat job counter driving the creative style rotation.
+    job_counter: Mutex<HashMap<i64, u64>>,
     usage_lock: Mutex<()>,
     usage_path: PathBuf,
     daily_limit: usize,
@@ -405,12 +418,19 @@ impl BotState {
 
     fn resolve_style_path(&self, chat_id: i64, default_style: &Option<PathBuf>) -> Option<PathBuf> {
         let settings = lock_or_recover(&self.per_chat_settings);
-        let style_path = settings
-            .get(&chat_id)
-            .and_then(|s| s.style_path.clone())
-            .or_else(|| default_style.clone());
-
-        style_path.or_else(|| {
+        let explicit = settings.get(&chat_id).and_then(|s| s.style_path.clone());
+        drop(settings);
+        if explicit.is_some() {
+            return explicit;
+        }
+        // Creative rotation: no explicit /style choice, so vary the mood
+        // palette per job. A channel then never shows the same look twice
+        // in a row while skin stays natural (all creative styles share the
+        // same skin hues and natural grading).
+        if let Some(creative) = self.next_creative_style(chat_id) {
+            return Some(creative);
+        }
+        default_style.clone().or_else(|| {
             self.styles_dir.as_ref().and_then(|dir| {
                 let candidate = dir.join("anime_cel.json");
                 if candidate.exists() {
@@ -420,6 +440,33 @@ impl BotState {
                 }
             })
         })
+    }
+
+    /// Deterministically cycle through the creative styles for a chat.
+    /// Each job advances the counter, so consecutive jobs get consecutive
+    /// moods; the cycle restarts after the last style.
+    fn next_creative_style(&self, chat_id: i64) -> Option<PathBuf> {
+        let creative_ids: Vec<&str> = BUILTIN_STYLES
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| id.starts_with("creative_"))
+            .collect();
+        if creative_ids.is_empty() {
+            return None;
+        }
+        let dir = self.styles_dir.as_ref()?;
+        let mut counters = lock_or_recover(&self.job_counter);
+        let counter = counters.entry(chat_id).or_insert(0);
+        let index = (*counter % creative_ids.len() as u64) as usize;
+        *counter = counter.wrapping_add(1);
+        let id = creative_ids[index];
+        for extension in ["yaml", "yml", "json"] {
+            let candidate = dir.join(format!("{id}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 }
 
@@ -493,6 +540,7 @@ fn main() -> Result<()> {
         active_jobs: AtomicUsize::new(0),
         active_chats: Mutex::new(HashMap::new()),
         per_chat_settings: Mutex::new(HashMap::new()),
+        job_counter: Mutex::new(HashMap::new()),
         usage_lock: Mutex::new(()),
         usage_path,
         daily_limit: args.daily_limit,
@@ -2962,11 +3010,57 @@ mod tests {
     }
 
     #[test]
+    fn creative_rotation_cycles_deterministically_per_chat() {
+        // Build a BotState with a styles dir containing the creative styles.
+        let dir = tempfile::tempdir().unwrap();
+        let creative_ids: Vec<&str> = BUILTIN_STYLES
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| id.starts_with("creative_"))
+            .collect();
+        assert_eq!(creative_ids.len(), 8, "expected 8 creative styles");
+        for id in &creative_ids {
+            std::fs::write(dir.path().join(format!("{id}.yaml")), "id: {id}\n").unwrap();
+        }
+        let state = BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
+            usage_lock: Mutex::new(()),
+            usage_path: dir.path().join("usage.json"),
+            daily_limit: 0,
+            styles_dir: Some(dir.path().to_path_buf()),
+            palettes_dir: dir.path().join("palettes"),
+        };
+
+        // Consecutive jobs cycle through all 8 moods, then repeat.
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..16 {
+            let path = state.next_creative_style(42).unwrap();
+            let file = path.file_stem().unwrap().to_str().unwrap().to_string();
+            seen.push(file);
+        }
+        for i in 0..8 {
+            assert_eq!(seen[i], creative_ids[i]);
+            assert_eq!(seen[i + 8], seen[i], "cycle repeats after 8 jobs");
+        }
+
+        // A different chat starts its own cycle at the first mood.
+        let first_other = state.next_creative_style(7).unwrap();
+        assert_eq!(
+            first_other.file_stem().unwrap().to_str().unwrap(),
+            creative_ids[0]
+        );
+    }
+
+    #[test]
     fn bot_state_bounds_jobs_and_supports_cancellation() {
         let state = BotState {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
@@ -2991,6 +3085,7 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
@@ -3024,6 +3119,7 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 100,

@@ -1,0 +1,44 @@
+id: creative_warm_sunset
+name: Creative Warm Sunset
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Creative mood palette: identical natural grading and identical skin hues
+# (faces must always read as natural skin); clothing + background hues carry
+# the mood. The bot rotates these per job for channel variety.
+palette:
+  # skin (identical across all creative styles)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing
+  - "#b3542e"
+  - "#c96a3d"
+  - "#8f4426"
+  - "#a63f3f"
+  - "#c25f5f"
+  - "#7a2e2e"
+  - "#6b5a4e"
+  - "#8a7a6e"
+  # backgrounds
+  - "#d8a05a"
+  - "#e8b86a"
+  - "#c4883f"
+  - "#e8d8b0"
+  - "#d4c098"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Creative Warm Sunset: creative mood palette with natural skin and grading."

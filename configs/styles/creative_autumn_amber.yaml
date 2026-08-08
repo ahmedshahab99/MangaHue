@@ -1,0 +1,43 @@
+id: creative_autumn_amber
+name: Creative Autumn Amber
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Creative mood palette: identical natural grading and identical skin hues
+# (faces must always read as natural skin); clothing + background hues carry
+# the mood. The bot rotates these per job for channel variety.
+palette:
+  # skin (identical across all creative styles)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing
+  - "#a0682e"
+  - "#b8843f"
+  - "#8f5a2e"
+  - "#a04a3a"
+  - "#c05a44"
+  - "#8a6a4a"
+  - "#a08a5e"
+  # backgrounds
+  - "#d8b068"
+  - "#c8a058"
+  - "#e8c888"
+  - "#e8dcc0"
+  - "#d8cca8"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Creative Autumn Amber: creative mood palette with natural skin and grading."

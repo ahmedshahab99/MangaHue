@@ -1,0 +1,43 @@
+id: creative_fresh_sage
+name: Creative Fresh Sage
+saturation: 1.0
+contrast: 1.03
+brightness: 0.0
+shadow_strength: 0.5
+highlight_strength: 0.25
+line_strength: 1.02
+# Creative mood palette: identical natural grading and identical skin hues
+# (faces must always read as natural skin); clothing + background hues carry
+# the mood. The bot rotates these per job for channel variety.
+palette:
+  # skin (identical across all creative styles)
+  - "#dcb39a"
+  - "#cf9f85"
+  - "#c08e75"
+  - "#b07e66"
+  - "#e6c4ae"
+  # hair
+  - "#332d30"
+  - "#463c3c"
+  - "#55443c"
+  - "#634f42"
+  - "#2c2a30"
+  - "#7d6250"
+  # clothing
+  - "#5f7660"
+  - "#778c73"
+  - "#4c6350"
+  - "#6a8a5a"
+  - "#8aa87a"
+  - "#7a8a6a"
+  - "#5a6a4a"
+  # backgrounds
+  - "#a8c0a0"
+  - "#b8ccb0"
+  - "#8aa880"
+  - "#d8e0d0"
+  - "#c8d4c0"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Creative Fresh Sage: creative mood palette with natural skin and grading."
