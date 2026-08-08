@@ -374,22 +374,84 @@ pub fn download_image_url_with_referer(
     index: usize,
     max_bytes: u64,
 ) -> Result<IngestedPage> {
-    let mut request = client
-        .get(url.clone())
-        .header(USER_AGENT, user_agent)
-        .header(
-            ACCEPT,
-            "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
-        );
-    if let Some(referer) = referer {
-        request = request.header(REFERER, referer.as_str());
+    // nhentai throttles individual CDN hosts (i1 is a common offender) while
+    // the same image lives on all four servers; retry with backoff across
+    // the sibling hosts before giving up.
+    let mut candidates: Vec<Url> = vec![url.clone()];
+    candidates.extend(alternate_nhentai_hosts(&url));
+    let mut last_error: Option<anyhow::Error> = None;
+    for candidate in candidates {
+        for attempt in 0..3usize {
+            let outcome = (|| -> Result<IngestedPage> {
+                let mut request = client
+                    .get(candidate.clone())
+                    .header(USER_AGENT, user_agent)
+                    .header(
+                        ACCEPT,
+                        "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+                    );
+                if let Some(referer) = referer {
+                    request = request.header(REFERER, referer.as_str());
+                }
+                let response = request
+                    .send()
+                    .with_context(|| format!("failed to fetch {candidate}"))?
+                    .error_for_status()
+                    .with_context(|| format!("server rejected {candidate}"))?;
+                download_image_response(response, output_dir, index, &candidate, max_bytes)
+            })();
+            match outcome {
+                Ok(page) => return Ok(page),
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_secs(1 + attempt as u64 * 2));
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
-    let response = request
-        .send()
-        .with_context(|| format!("failed to fetch {url}"))?
-        .error_for_status()
-        .with_context(|| format!("server rejected {url}"))?;
-    download_image_response(response, output_dir, index, &url, max_bytes)
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed after retries: {url}")))
+}
+
+/// nhentai serves every image on all CDN hosts (`i1..i4.nhentai.net` plus
+/// the canonical `i.nhentai.net`). When one host throttles us, the same
+/// path on a sibling host still works; return those siblings (empty for
+/// any non-nhentai URL).
+fn alternate_nhentai_hosts(url: &Url) -> Vec<Url> {
+    let Some(host) = url.host_str().map(str::to_string) else {
+        return Vec::new();
+    };
+    let lower = host.to_ascii_lowercase();
+    let Some(domain) = [".nhentai.net", ".nhentai.to"]
+        .iter()
+        .find(|d| lower.ends_with(**d))
+    else {
+        return Vec::new();
+    };
+    let prefix = &lower[..lower.len() - domain.len()]; // e.g. "i1" or "i"
+    let Some(num_str) = prefix.strip_prefix('i') else {
+        return Vec::new();
+    };
+    if num_str.is_empty() || !num_str.chars().all(|c| c.is_ascii_digit()) {
+        return Vec::new();
+    }
+    let num: u32 = num_str.parse().unwrap_or(0);
+    let mut siblings = Vec::new();
+    for n in 1..=4u32 {
+        if n != num {
+            let mut sibling = url.clone();
+            if sibling.set_host(Some(&format!("i{n}{domain}"))).is_ok() {
+                siblings.push(sibling);
+            }
+        }
+    }
+    let mut canonical = url.clone();
+    if canonical.set_host(Some(&format!("i{domain}"))).is_ok() {
+        siblings.push(canonical);
+    }
+    siblings
 }
 
 fn download_image_response(

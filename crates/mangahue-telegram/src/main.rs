@@ -2491,59 +2491,111 @@ fn download_image_url_telegram(
     let parsed = url::Url::parse(url).with_context(|| format!("invalid image URL: {url}"))?;
     validate_public_url(&parsed).with_context(|| format!("unsafe image URL skipped: {url}"))?;
 
-    // CDNs throttle burst scrapers (nhentai in particular): retry twice
-    // with backoff before giving up on a page.
+    // CDNs throttle burst scrapers (nhentai in particular): retry each
+    // candidate host a few times with backoff. nhentai serves every image
+    // on all four CDN hosts (i1..i4 + i) and throttles individual hosts
+    // (i1 is a common offender), so the identical path is retried on the
+    // sibling hosts before giving up.
+    let mut candidates: Vec<String> = vec![url.to_string()];
+    candidates.extend(alternate_nhentai_hosts(url));
     let mut last_error: Option<anyhow::Error> = None;
-    for attempt in 0..3usize {
-        let outcome = (|| -> Result<()> {
-            let resp = client
-                .get(url)
-                .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-                .header(REFERER, referer)
-                .header(
-                    ACCEPT,
-                    "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
-                )
-                .timeout(Duration::from_secs(60))
-                .send()
-                .with_context(|| format!("failed to fetch {url}"))?
-                .error_for_status()
-                .with_context(|| format!("server rejected {url}"))?;
-            let content_type = resp
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let mut reader = resp.take(max_bytes + 1);
-            let mut data = Vec::new();
-            reader
-                .read_to_end(&mut data)
-                .with_context(|| format!("failed to read bytes from {url}"))?;
-            if data.len() as u64 > max_bytes {
-                anyhow::bail!("image exceeds {max_bytes} bytes");
-            }
-            if !content_type.starts_with("image/") && !has_image_magic(&data) {
-                anyhow::bail!("URL returned non-image content ({content_type})");
-            }
-            if let Some(parent) = output.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(output, &data)
-                .with_context(|| format!("failed to write {}", output.display()))?;
-            Ok(())
-        })();
-        match outcome {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_secs(1 + attempt as u64 * 2));
+    for candidate in &candidates {
+        let mut succeeded = false;
+        for attempt in 0..3usize {
+            let outcome = (|| -> Result<()> {
+                let resp = client
+                    .get(candidate)
+                    .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+                    .header(REFERER, referer)
+                    .header(
+                        ACCEPT,
+                        "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+                    )
+                    .timeout(Duration::from_secs(60))
+                    .send()
+                    .with_context(|| format!("failed to fetch {candidate}"))?
+                    .error_for_status()
+                    .with_context(|| format!("server rejected {candidate}"))?;
+                let content_type = resp
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let mut reader = resp.take(max_bytes + 1);
+                let mut data = Vec::new();
+                reader
+                    .read_to_end(&mut data)
+                    .with_context(|| format!("failed to read bytes from {candidate}"))?;
+                if data.len() as u64 > max_bytes {
+                    anyhow::bail!("image exceeds {max_bytes} bytes");
+                }
+                if !content_type.starts_with("image/") && !has_image_magic(&data) {
+                    anyhow::bail!("URL returned non-image content ({content_type})");
+                }
+                if let Some(parent) = output.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(output, &data)
+                    .with_context(|| format!("failed to write {}", output.display()))?;
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => {
+                    succeeded = true;
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 2 {
+                        std::thread::sleep(Duration::from_secs(1 + attempt as u64 * 2));
+                    }
                 }
             }
         }
+        if succeeded {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(2));
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("download failed after retries: {url}")))
+}
+
+/// nhentai serves every image on all CDN hosts (`i1..i4.nhentai.net` plus
+/// the canonical `i.nhentai.net`). When one host throttles us, the same
+/// path on a sibling host still works; return those siblings.
+fn alternate_nhentai_hosts(url: &str) -> Vec<String> {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return Vec::new();
+    };
+    let Some(host) = parsed.host_str().map(str::to_string) else {
+        return Vec::new();
+    };
+    let lower = host.to_ascii_lowercase();
+    let Some(domain) = [".nhentai.net", ".nhentai.to"]
+        .iter()
+        .find(|d| lower.ends_with(**d))
+    else {
+        return Vec::new();
+    };
+    let prefix = &lower[..lower.len() - domain.len()]; // e.g. "i1" or "i"
+    let Some(num_str) = prefix.strip_prefix('i') else {
+        return Vec::new();
+    };
+    if num_str.is_empty() || !num_str.chars().all(|c| c.is_ascii_digit()) {
+        return Vec::new();
+    }
+    let num: u32 = num_str.parse().unwrap_or(0);
+    let mut siblings = Vec::new();
+    for n in 1..=4u32 {
+        if n != num {
+            let _ = parsed.set_host(Some(&format!("i{n}{domain}")));
+            siblings.push(parsed.to_string());
+        }
+    }
+    let _ = parsed.set_host(Some(&format!("i{domain}")));
+    siblings.push(parsed.to_string());
+    siblings
 }
 
 fn has_image_magic(data: &[u8]) -> bool {
