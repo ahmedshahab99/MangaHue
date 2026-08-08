@@ -132,6 +132,8 @@ pub struct PostprocessSection {
     /// Muted target grade: reshapes every pixel's saturation toward the
     /// measured profile of the reference style (low-key warm look) instead
     /// of the default saturation boost.
+    #[serde(default = "default_region_chroma_separation")]
+    pub region_chroma_separation: f32,
     #[serde(default)]
     pub muted_target_grade: bool,
     #[serde(default = "default_muted_strength")]
@@ -172,6 +174,10 @@ fn default_muted_paper_sat() -> f32 {
 
 fn default_soft_coverage() -> bool {
     true
+}
+
+fn default_region_chroma_separation() -> f32 {
+    34.0
 }
 
 fn default_muted_strength() -> f32 {
@@ -394,6 +400,7 @@ impl Default for EngineConfig {
                 natural_grading: default_natural_grading(),
                 reference_transfer: default_reference_transfer(),
                 soft_coverage: default_soft_coverage(),
+                region_chroma_separation: default_region_chroma_separation(),
                 muted_target_grade: false,
                 muted_strength: default_muted_strength(),
                 muted_hue_shift_deg: default_muted_hue_shift_deg(),

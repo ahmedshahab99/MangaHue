@@ -116,6 +116,7 @@ pub(crate) fn render_region_graph(
     soft_coverage: bool,
     soft_strength: f32,
     soft_confidence: f32,
+    chroma_separation: f32,
 ) -> RegionRenderReport {
     let (width, height) = image.dimensions();
     if width < 3
@@ -237,7 +238,16 @@ pub(crate) fn render_region_graph(
 
     // Chroma Diversity Director: after propagation, ensure adjacent regions
     // hold perceptually distinct hues (kills the flat single-hue collapse).
-    chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette);
+    // The separation is configurable: higher = bolder, more creative hue
+    // variety between neighboring regions.
+    chroma_diversity_director(
+        &mut colors,
+        &stats,
+        &adjacency,
+        &semantics,
+        &palette,
+        chroma_separation,
+    );
     // Re-evaluate semantics with the FINAL region hues: skin classification
     // must not force the render's skin treatment onto regions the director
     // deliberately moved away from the warm sector (backgrounds, clothing).
@@ -1076,13 +1086,15 @@ fn chroma_diversity_director(
     adjacency: &[Vec<(usize, f32)>],
     semantics: &[RegionSemantic],
     palette: &[(f32, f32, f32)],
+    separation: f32,
 ) {
     let n = colors.len();
     if n < 2 {
         return;
     }
-    // Min perceptual separation in opponent-space chroma distance.
-    const SEPARATION: f32 = 34.0;
+    // Min perceptual separation in opponent-space chroma distance; higher
+    // values force bolder hue variety between adjacent regions.
+    let separation = separation.clamp(0.0, 80.0);
     const SWEEPS: usize = 12;
 
     // Ordered processing: largest regions first (colorists fill big shapes
@@ -1151,8 +1163,8 @@ fn chroma_diversity_director(
         for &(neighbor, weight) in &adjacency[index] {
             let nc = assigned[neighbor];
             let d = ((cand.0 - nc.red).powi(2) + (cand.1 - nc.blue).powi(2)).sqrt();
-            if d < SEPARATION {
-                let gap = SEPARATION - d;
+            if d < separation {
+                let gap = separation - d;
                 separation_penalty += gap * weight * 3.0;
             }
         }
@@ -1230,8 +1242,8 @@ fn chroma_diversity_director(
                 let d = ((assigned[index].red - assigned[neighbor].red).powi(2)
                     + (assigned[index].blue - assigned[neighbor].blue).powi(2))
                 .sqrt();
-                if d < SEPARATION {
-                    penalty += (SEPARATION - d) * weight;
+                if d < separation {
+                    penalty += (separation - d) * weight;
                 }
             }
             if penalty > worst_score {
@@ -1552,8 +1564,9 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        let report =
-            render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
+        let report = render_region_graph(
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+        );
 
         let left = image.get_pixel(8, 5);
         let right = image.get_pixel(18, 5);
@@ -1580,8 +1593,9 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        let report =
-            render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
+        let report = render_region_graph(
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+        );
 
         let pixel = image.get_pixel(10, 10);
         assert!(pixel[0] > pixel[2]);
@@ -1599,7 +1613,9 @@ mod tests {
             ..StyleProfile::default()
         };
 
-        render_region_graph(&mut image, &original, &lines, None, &style, true, 1.0, 1.0);
+        render_region_graph(
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+        );
 
         let pixel = image.get_pixel(10, 10);
         let warm = pixel[0] as i16 - pixel[2] as i16;
@@ -1639,6 +1655,7 @@ mod tests {
             true,
             1.0,
             1.0,
+            34.0,
         );
 
         let bubble = image.get_pixel(12, 12);
@@ -1987,7 +2004,7 @@ mod tests {
         let adjacency = [vec![(1, 4.0)], vec![(0, 4.0)]];
         let palette = [(182.0, 28.0, -24.0), (92.0, -8.0, 14.0)];
 
-        chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette);
+        chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette, 34.0);
 
         assert!(natural_skin_chroma(colors[0].red, colors[0].blue));
         assert!(

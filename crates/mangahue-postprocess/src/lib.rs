@@ -121,6 +121,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.config.soft_coverage,
             input.config.soft_strength,
             input.config.soft_confidence,
+            input.config.region_chroma_separation,
         );
         report.material_regions = region_report.regions;
         report.seeded_material_regions = region_report.seeded_regions;
@@ -1419,6 +1420,7 @@ mod tests {
             natural_grading: true,
             reference_transfer: true,
             soft_coverage: true,
+            region_chroma_separation: 34.0,
             muted_target_grade: false,
             muted_strength: 0.95,
             muted_hue_shift_deg: 16.0,

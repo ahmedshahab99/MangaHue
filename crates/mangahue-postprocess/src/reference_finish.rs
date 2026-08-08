@@ -559,6 +559,7 @@ mod tests {
             bubble_cleanup: true,
             bleeding_correction: true,
             palette_correction: true,
+            region_chroma_separation: 34.0,
             final_sharpening: 0.0,
             reference_finishing: true,
             target_colorfulness: 1.35,
