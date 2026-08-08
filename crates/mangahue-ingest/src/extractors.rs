@@ -420,6 +420,124 @@ fn extract_mangadex(client: &Client, url: &Url, max_pages: usize) -> Result<Vec<
     Ok(urls)
 }
 
+// ── content tags (for content-aware style selection) ──────────────────────
+/// Extract genre/tag keywords from the source so the bot can pick a color
+/// style that fits the manga's nature (dark/horror -> dark styles,
+/// romance -> pastels, fantasy -> vibrant, ...). Best-effort: any failure
+/// yields an empty list; the caller falls back to rotation.
+pub fn extract_manga_tags(client: &Client, url: &Url, html: &str) -> Vec<String> {
+    match MangaSite::detect(url) {
+        MangaSite::Nhentai => parse_nhentai_tags(html, url),
+        MangaSite::Mangadex => extract_mangadex_tags(client, url),
+        _ => Vec::new(),
+    }
+}
+
+/// nhentai: the gallery JSON is embedded ESCAPED inside
+/// `"body":"{...}"` (i.e. `\"id\":<gid>,\"tags\":[...]`), so the
+/// needles below carry the literal backslash-quote.
+fn parse_nhentai_tags(html: &str, url: &Url) -> Vec<String> {
+    let Some(gid) = extract_nhentai_gallery_id(url) else {
+        return Vec::new();
+    };
+    // The embedded gallery JSON is escaped once inside `"body":"{...}"`,
+    // so keys read `\"id\":<gid>,` (literal backslash-quote).
+    let bs = r"\";
+    let gid_needle = format!("{bs}\"id{bs}\":{},", gid);
+    let Some(gid_pos) = html.find(&gid_needle) else {
+        return Vec::new();
+    };
+    let tags_needle = format!("{bs}\"tags{bs}\":[");
+    let Some(tags_pos) = html[gid_pos..].find(&tags_needle) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut search_from = gid_pos + tags_pos + tags_needle.len();
+    let bound = gid_pos + tags_pos + 96 * 1024;
+    let name_needle = format!("{bs}\"name{bs}\":{bs}\"");
+    while search_from < bound && search_from < html.len() {
+        let rest = &html[search_from..];
+        let Some(rel) = rest.find(&name_needle) else {
+            break;
+        };
+        let start = search_from + rel + name_needle.len();
+        let name: String = html[start..]
+            .chars()
+            .take_while(|c| *c != '"' && *c != '\\')
+            .collect();
+        if !name.is_empty() {
+            out.push(name.to_ascii_lowercase());
+        }
+        search_from = start + name.len();
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    out
+}
+
+/// MangaDex: chapter API -> manga id -> manga tags API. Two best-effort
+/// GETs, same client/UA pattern as the page extractor.
+fn extract_mangadex_tags(client: &Client, url: &Url) -> Vec<String> {
+    let chapter_id = url
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|part| !part.is_empty()))
+        .unwrap_or("")
+        .to_string();
+    if chapter_id.is_empty() || !chapter_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
+        return Vec::new();
+    }
+
+    let Ok(resp) = client
+        .get(format!(
+            "https://api.mangadex.org/chapter/{chapter_id}?includes[]=manga"
+        ))
+        .header(USER_AGENT, UA)
+        .timeout(Duration::from_secs(15))
+        .send()
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.json::<serde_json::Value>() else {
+        return Vec::new();
+    };
+    let manga_id = body["data"]["relationships"].as_array().and_then(|rels| {
+        rels.iter().find_map(|rel| {
+            if rel["type"] == "manga" {
+                rel["id"].as_str().map(str::to_string)
+            } else {
+                None
+            }
+        })
+    });
+    let Some(manga_id) = manga_id else {
+        return Vec::new();
+    };
+
+    let Ok(resp) = client
+        .get(format!(
+            "https://api.mangadex.org/manga/{manga_id}?includes[]=genre"
+        ))
+        .header(USER_AGENT, UA)
+        .timeout(Duration::from_secs(15))
+        .send()
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.json::<serde_json::Value>() else {
+        return Vec::new();
+    };
+    body["data"]["attributes"]["tags"]
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag["attributes"]["name"]["en"].as_str())
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+}
+
 // ── manganato / mangakakalot ─────────────────────────────────────────────
 fn extract_manganato(html: &str, base: &Url, max_pages: usize) -> Result<Vec<String>> {
     let document = Html::parse_document(html);
@@ -917,6 +1035,21 @@ mod tests {
     fn extract_nhentai_gallery_id_works() {
         let url = Url::parse("https://nhentai.net/g/177013/1/").unwrap();
         assert_eq!(extract_nhentai_gallery_id(&url), Some("177013".to_string()));
+    }
+
+    #[test]
+    fn parses_nhentai_embedded_tags() {
+        // Real nhentai markup: the gallery JSON is escaped inside
+        // "body":"{...}" (literal backslash-quote pairs). Build the
+        // fixture the same way the site embeds it.
+        let inner = r#"{"id":177013,"media_id":"12345","tags":[{"id":1,"name":"horror"},{"id":2,"name":"dark skin"}]}"#;
+        let bs = r"\";
+        let escaped = inner.replace('"', &format!("{bs}\""));
+        let html = format!(r#"<script id="galleryData">{{"body":"{escaped}"}}</script>"#);
+        let url = Url::parse("https://nhentai.net/g/177013/").unwrap();
+        let tags = parse_nhentai_tags(&html, &url);
+        assert!(tags.iter().any(|t| t == "horror"), "got {tags:?}");
+        assert!(tags.iter().any(|t| t == "dark skin"), "got {tags:?}");
     }
 
     #[test]

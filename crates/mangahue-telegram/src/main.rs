@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
-use mangahue_ingest::{extract_manga_urls, validate_public_url, SafePublicResolver};
+use mangahue_ingest::{
+    extract_manga_tags, extract_manga_urls, validate_public_url, SafePublicResolver,
+};
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
@@ -13,6 +15,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+mod mood;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -416,12 +420,24 @@ impl BotState {
         styles
     }
 
-    fn resolve_style_path(&self, chat_id: i64, default_style: &Option<PathBuf>) -> Option<PathBuf> {
+    fn resolve_style_path(
+        &self,
+        chat_id: i64,
+        default_style: &Option<PathBuf>,
+        job_override: Option<PathBuf>,
+    ) -> Option<PathBuf> {
         let settings = lock_or_recover(&self.per_chat_settings);
         let explicit = settings.get(&chat_id).and_then(|s| s.style_path.clone());
         drop(settings);
         if explicit.is_some() {
             return explicit;
+        }
+        // Content-aware override (source tags / page mood) wins over the
+        // creative rotation for THIS job only.
+        if let Some(override_path) = job_override {
+            if override_path.is_file() {
+                return Some(override_path);
+            }
         }
         // Creative rotation: no explicit /style choice, so vary the mood
         // palette per job. A channel then never shows the same look twice
@@ -479,6 +495,15 @@ fn load_style_name(path: &Path) -> Option<String> {
     v.get("name")
         .and_then(|n| n.as_str())
         .map(|s| s.to_string())
+}
+
+/// MarkdownV2-safe " Mood: <style name>" suffix for the scan message.
+fn mood_suffix(mood_name: &str) -> String {
+    if mood_name.is_empty() {
+        String::new()
+    } else {
+        format!(" Mood\\: *{}*\\.", mood_name.replace(['_', '-'], "\\_"))
+    }
 }
 
 fn main() -> Result<()> {
@@ -1209,7 +1234,11 @@ fn handle_photo(
     }
 
     let settings = state.get_settings(chat_id, args.batch_size);
-    let style_path = state.resolve_style_path(chat_id, &args.style);
+    // Content-aware mood: pick the style from the photo's own lighting
+    // (dark ink-heavy pages -> dark styles, bright airy pages -> pastels).
+    let mood_override = mood::select_style_for_scene(&image.to_luma8())
+        .and_then(|id| resolve_style_file(&state, id));
+    let style_path = state.resolve_style_path(chat_id, &args.style, mood_override);
     let reference_image = settings
         .reference_image
         .clone()
@@ -1918,7 +1947,6 @@ fn handle_link(
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
 
     let settings = state.get_settings(chat_id, args.batch_size);
-    let style_path = state.resolve_style_path(chat_id, &args.style);
     let cancel_kb = InlineKeyboardMarkup {
         inline_keyboard: vec![vec![
             InlineKeyboardButton::new("Cancel job").callback_data("cancel_job")
@@ -1961,8 +1989,8 @@ fn handle_link(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    let all_image_urls: Vec<String> = if content_type.starts_with("image/") {
-        vec![url.to_string()]
+    let page_html: Option<String> = if content_type.starts_with("image/") {
+        None
     } else {
         // Cap the HTML body: an attacker-controlled public URL could stream
         // hundreds of MB into RAM otherwise.
@@ -1971,15 +1999,30 @@ fn handle_link(
             .take(16 * 1024 * 1024 + 1)
             .read_to_end(&mut html_bytes)
             .with_context(|| format!("failed to read HTML from {url}"))?;
-        let html = String::from_utf8_lossy(&html_bytes).into_owned();
-        extract_manga_urls(
-            fetch_client,
-            &source_url,
-            &html,
-            &source_url,
-            args.max_pages,
-        )?
+        Some(String::from_utf8_lossy(&html_bytes).into_owned())
     };
+
+    let all_image_urls: Vec<String> = match &page_html {
+        None => vec![url.to_string()],
+        Some(html) => {
+            extract_manga_urls(fetch_client, &source_url, html, &source_url, args.max_pages)?
+        }
+    };
+
+    // Content-aware mood: the source's genre tags pick the palette for this
+    // chapter (dark/horror -> dark, romance -> pastel, fantasy -> vibrant).
+    // Falls back to creative rotation when no tags are available.
+    let tags = page_html
+        .as_deref()
+        .map(|html| extract_manga_tags(fetch_client, &source_url, html))
+        .unwrap_or_default();
+    let mood_style =
+        mood::select_style_for_tags(&tags).and_then(|id| resolve_style_file(&state, id));
+    let mood_name = mood_style
+        .as_deref()
+        .and_then(load_style_name)
+        .unwrap_or_default();
+    let style_path = state.resolve_style_path(chat_id, &args.style, mood_style);
 
     // SSRF guard: drop any extracted image URL that resolves to a private
     // or reserved host (attacker-controlled pages can point at internal
@@ -2029,15 +2072,17 @@ fn handle_link(
     let status_text = if remaining < total {
         // Never hide quota truncation: the user must know pages are skipped.
         format!(
-            "Found all *{}* page\\(s\\)\\. Daily quota allows *{}* today\\. *{}* page\\(s\\) will be skipped\\.",
+            "Found all *{}* page\\(s\\)\\. Daily quota allows *{}* today\\. *{}* page\\(s\\) will be skipped\\.{}",
             total,
             effective_total,
-            total - effective_total
+            total - effective_total,
+            mood_suffix(&mood_name)
         )
     } else {
         format!(
-            "Found all *{}* page\\(s\\)\\. Coloring them one by one in chapter order\\.",
-            effective_total
+            "Found all *{}* page\\(s\\)\\. Coloring them one by one in chapter order\\.{}",
+            effective_total,
+            mood_suffix(&mood_name)
         )
     };
     let status_msg_id = send_message(client, token, chat_id, &status_text, Some("MarkdownV2"))?;

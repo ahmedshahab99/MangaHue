@@ -1,7 +1,7 @@
 mod extractors;
 
 use anyhow::{Context, Result};
-pub use extractors::extract_manga_urls;
+pub use extractors::{extract_manga_tags, extract_manga_urls};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, REFERER, USER_AGENT};
 use scraper::{Html, Selector};
