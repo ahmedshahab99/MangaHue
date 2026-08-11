@@ -16,6 +16,10 @@ pub struct ColorMetrics {
     pub colorfulness: f32,
     /// Standard deviation of luminance as a 0-1 fraction.
     pub contrast: f32,
+    /// Mean R-B over midtones (luma 61..199), 0-255 units: positive = warm.
+    /// Same band as the warmth governor uses, so the report shows exactly
+    /// what governor_target_warmth steers.
+    pub warmth: f32,
 }
 
 /// Compute the standard page color metrics on a bounded pixel sample
@@ -30,6 +34,7 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
             avg_saturation: 0.0,
             colorfulness: 0.0,
             contrast: 0.0,
+            warmth: 0.0,
         };
     }
     let step = (total / 200_000).max(1);
@@ -77,6 +82,7 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
             avg_saturation: 0.0,
             colorfulness: 0.0,
             contrast: 0.0,
+            warmth: 0.0,
         };
     }
     let nf = n as f64;
@@ -88,6 +94,26 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
     let yb_var = (yb_sq / nf - yb_mean * yb_mean).max(0.0);
     let colorfulness =
         (rg_var.sqrt() + yb_var.sqrt()) + 0.3 * (rg_mean * rg_mean + yb_mean * yb_mean).sqrt();
+    // Warmth: mean R-B over the midtone band (luma 61..199) — the same band
+    // the governor measures, so the two always agree.
+    let mut warm_sum = 0.0f64;
+    let mut warm_n = 0u64;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let index = y as usize * width as usize + x as usize;
+        if index % step != 0 {
+            continue;
+        }
+        let luma = 0.299 * pixel[0] as f64 + 0.587 * pixel[1] as f64 + 0.114 * pixel[2] as f64;
+        if (61.0..199.0).contains(&luma) {
+            warm_sum += pixel[0] as f64 - pixel[2] as f64;
+            warm_n += 1;
+        }
+    }
+    let warmth = if warm_n > 0 {
+        (warm_sum / warm_n as f64) as f32
+    } else {
+        0.0
+    };
     ColorMetrics {
         avg_rgb: [
             (r_sum / nf).round().clamp(0.0, 255.0) as u8,
@@ -98,6 +124,7 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
         avg_saturation: (sat_sum / nf) as f32,
         colorfulness: colorfulness as f32,
         contrast: (luma_var.sqrt() / 255.0) as f32,
+        warmth,
     }
 }
 

@@ -52,9 +52,9 @@ postprocess:
   # Finishing stays luma-focused (gloss/shadow): the chroma expansion
   # amplified the model's golden warmth, so it is cut to a whisper here —
   # the smart governor owns the page's color intensity now.
-  target_colorfulness: 0.15
+  target_colorfulness: 0.18
   midtone_depth: 0.05
-  local_contrast: 0.07
+  local_contrast: 0.08
   semantic_relighting: false
   relighting_strength: 0.0
   natural_grading: false
@@ -64,13 +64,13 @@ postprocess:
   # reference's hue mass sits at 0-45 deg) with an extra push on the
   # yellow core — skin (0-20) stays untouched.
   muted_hue_shift_deg: 16.0
-  muted_yellow_shift_deg: 16.0
-  muted_dark_pull: 0.5
-  muted_dark_sat: 0.22
-  muted_mid_sat: 0.32
-  muted_bright_sat: 0.30
+  muted_yellow_shift_deg: 18.0
+  muted_dark_pull: 0.55
+  muted_dark_sat: 0.24
+  muted_mid_sat: 0.35
+  muted_bright_sat: 0.33
   muted_paper_sat: 0.02
-  muted_vivid_preserve: 1.0
+  muted_vivid_preserve: 0.9
   soft_coverage: true
   soft_strength: 0.85
   soft_confidence: 0.8
@@ -80,7 +80,7 @@ postprocess:
   model_chroma_bar_bright: 18.0
   model_chroma_bar_mid: 10.0
   model_chroma_gain: 1.0
-  palette_harmony_strength: 0.1
+  palette_harmony_strength: 0.12
   face_paint_strength: 0.45
   # Soft cel depth: ink-cast directional shadows (AO) at their own strength,
   # with the page's own estimated light direction. No photoreal relighting
@@ -91,13 +91,13 @@ postprocess:
   # model's own chroma signal. Muted pages stay muted; colorful pages keep
   # their life — the color budget follows the model's judgment.
   smart_governor: true
-  governor_target_saturation: 0.2
-  governor_target_colorfulness: 36.0
+  governor_target_saturation: 0.22
+  governor_target_colorfulness: 44.0
   governor_min_gain: 0.8
-  governor_max_gain: 1.25
+  governor_max_gain: 1.3
   # Warmth governor: the model's palette leans golden; compress warm pixels
   # toward neutral until the page's midtone R-B matches this target.
-  governor_target_warmth: 45.0
+  governor_target_warmth: 40.0
 
 output:
   format: png

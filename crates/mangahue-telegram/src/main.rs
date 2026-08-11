@@ -2736,8 +2736,9 @@ fn handle_link(
                     if stage.name == "color_metrics" {
                         let sat = stage.metrics.get("avg_saturation").copied().unwrap_or(0.0);
                         let cf = stage.metrics.get("colorfulness").copied().unwrap_or(0.0);
+                        let w = stage.metrics.get("warmth").copied().unwrap_or(0.0);
                         if sat > 0.0 || cf > 0.0 {
-                            metrics = format!(" | s={:.0}% c={:.0}", sat * 100.0, cf);
+                            metrics = format!(" | s={:.0}% c={:.0} w={:.0}", sat * 100.0, cf, w);
                         }
                         break;
                     }

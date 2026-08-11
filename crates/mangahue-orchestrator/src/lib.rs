@@ -1052,6 +1052,7 @@ impl MangaHueEngine {
                 .metric("avg_saturation", color_metrics.avg_saturation as f64)
                 .metric("colorfulness", color_metrics.colorfulness as f64)
                 .metric("contrast", color_metrics.contrast as f64)
+                .metric("warmth", color_metrics.warmth as f64)
                 .metric(
                     "chroma_signal",
                     chroma_signal.map(|v| v as f64).unwrap_or(0.0),
