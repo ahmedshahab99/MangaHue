@@ -2003,6 +2003,12 @@ use ort::{session::Session, value::Tensor};
 /// previous Python worker's settings; override with MANGAHUE_MODEL_THREADS).
 #[cfg(feature = "native-onnx")]
 fn native_session_builder() -> Result<ort::session::builder::SessionBuilder> {
+    // ort 2.0.0-rc.12's `load-dynamic` error path re-enters the API OnceLock
+    // and deadlocks the process (pykeio/ort#560/#604) whenever dlopen fails —
+    // which happens in long-lived processes with many shared libraries
+    // loaded (pykeio/ort#579). Pre-loading the library ourselves first makes
+    // ort's dlopen a no-op success, so the failure path is unreachable.
+    preload_onnx_runtime()?;
     let threads = std::env::var("MANGAHUE_MODEL_THREADS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -2014,7 +2020,68 @@ fn native_session_builder() -> Result<ort::session::builder::SessionBuilder> {
         .map_err(|e| anyhow!("failed to set ONNX graph optimization level: {e}"))?
         .with_intra_threads(threads)
         .map_err(|e| anyhow!("failed to set ONNX intra-op threads: {e}"))?;
+    // Optional CUDA execution provider (config flip for a future GPU host):
+    // MANGAHUE_CUDA=1 routes inference through the GPU build of onnxruntime
+    // with CPU fallback for unsupported ops. Unset (the current 2-core VPS)
+    // means pure CPU — no behavioral change.
+    let builder = if std::env::var("MANGAHUE_CUDA").as_deref() == Ok("1") {
+        builder
+            .with_execution_providers([ort::ep::CUDA::default().build()])
+            .map_err(|e| anyhow!("failed to enable CUDA execution provider: {e}"))?
+    } else {
+        builder
+    };
     Ok(builder)
+}
+
+/// Pre-load the ONNX Runtime shared library so `ort`'s `load-dynamic` backend
+/// never hits its rc.12 failure path (which re-enters the API `OnceLock` and
+/// deadlocks the process — pykeio/ort#560/#604).
+///
+/// `ort` resolves the library by the same name we load here (OR\_DYLIB\_PATH
+/// when set, otherwise the platform default). Loading it first — and leaking
+/// the handle so it stays resident — makes ort's own `dlopen` find it already
+/// mapped: it returns the existing handle without re-running constructors and
+/// cannot fail. Idempotent; safe to call from every entry point.
+#[cfg(feature = "native-onnx")]
+pub fn preload_onnx_runtime() -> Result<()> {
+    static PRELOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    PRELOADED
+        .get_or_init(|| {
+            let library = std::env::var("ORT_DYLIB_PATH")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    if cfg!(target_os = "windows") {
+                        "onnxruntime.dll".to_string()
+                    } else if cfg!(target_os = "macos") {
+                        "libonnxruntime.dylib".to_string()
+                    } else {
+                        "libonnxruntime.so".to_string()
+                    }
+                });
+            match unsafe { libloading::Library::new(&library) } {
+                Ok(handle) => {
+                    // Leak on purpose: the library must stay mapped for the
+                    // whole process lifetime so ort's dlopen reuses it.
+                    std::mem::forget(handle);
+                    tracing::info!(library = %library, "pre-loaded ONNX Runtime");
+                    Ok(())
+                }
+                Err(error) => {
+                    tracing::error!(
+                        library = %library,
+                        error = %error,
+                        "failed to pre-load ONNX Runtime; model inference is unavailable"
+                    );
+                    Err(format!(
+                        "failed to pre-load ONNX Runtime ({library}): {error}"
+                    ))
+                }
+            }
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 #[cfg(feature = "native-onnx")]
@@ -2237,6 +2304,239 @@ pub struct NativeDdColorOnnxBackend {
     output_name: String,
 }
 
+/// Whether the path names a Style2Paints V3 ONNX model (name contains
+/// "style2paints"). Routed to [`Style2PaintsV3OnnxBackend`].
+#[cfg(feature = "native-onnx")]
+pub fn is_style2paints_onnx_model(path: impl AsRef<Path>) -> bool {
+    let path = path.as_ref();
+    path.is_file()
+        && path.extension().and_then(|value| value.to_str()) == Some("onnx")
+        && path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("style2paints"))
+}
+
+/// Minimal contract reader for DDColor/Style2Paints-style model metadata
+/// (`{ input: {name, shape, range}, output: {name, shape, range} }`).
+#[cfg(feature = "native-onnx")]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OnnxIoSpec {
+    name: String,
+    #[serde(default)]
+    shape: Vec<i64>,
+    #[serde(default)]
+    color_space: Option<String>,
+    #[serde(default)]
+    range: Option<String>,
+}
+
+#[cfg(feature = "native-onnx")]
+#[derive(Debug, Clone, serde::Deserialize)]
+struct OnnxModelContract {
+    #[serde(default)]
+    input: Option<OnnxIoSpec>,
+    #[serde(default)]
+    output: Option<OnnxIoSpec>,
+}
+
+/// Native Rust Style2Paints V3 backend.
+///
+/// Contract (measured at export; verified against the exported graph):
+///   input  "input"  [1, 3, 512, 512]  grayscale replicated to RGB, 0..1
+///   output "output" [1, 3, 512, 512]  full sRGB (line art preserved by the
+///                                      model — NO Lab merge on this path)
+/// The contract is read from `<model>.metadata.json` when present (the file
+/// the exporter emits), with "input"/"output" + 512 + 0..1 as fallbacks.
+#[cfg(feature = "native-onnx")]
+pub struct Style2PaintsV3OnnxBackend {
+    session: Mutex<Session>,
+    input_name: String,
+    output_name: String,
+    input_size: u32,
+    input_channels: usize,
+    // (value - offset) * scale -> 0..1, per the metadata "range" field.
+    offset: f32,
+    scale: f32,
+}
+
+#[cfg(feature = "native-onnx")]
+impl Style2PaintsV3OnnxBackend {
+    fn load_contract(model_path: &Path) -> OnnxModelContract {
+        let meta_path = model_path.with_extension("metadata.json");
+        std::fs::read(&meta_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    metadata = %meta_path.display(),
+                    "Style2Paints contract missing; using defaults (input/output, 512, 0..1)"
+                );
+                OnnxModelContract {
+                    input: None,
+                    output: None,
+                }
+            })
+    }
+
+    fn range_params(range: Option<&str>) -> (f32, f32) {
+        match range.unwrap_or("").trim() {
+            "-1_1" | "-1..1" | "neg1_1" => (1.0, -1.0), // value = x*2-1
+            _ => (1.0, 0.0),
+        }
+    }
+
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self> {
+        let model_path = model_path.as_ref();
+        let mut builder = native_session_builder()?;
+        let session = builder.commit_from_file(model_path).map_err(|e| {
+            anyhow!(
+                "failed to load Style2Paints ONNX model {}: {e}",
+                model_path.display()
+            )
+        })?;
+        let contract = Self::load_contract(model_path);
+        let input = contract.input.unwrap_or(OnnxIoSpec {
+            name: "input".to_string(),
+            shape: vec![1, 3, 512, 512],
+            color_space: None,
+            range: None,
+        });
+        let output = contract.output.unwrap_or(OnnxIoSpec {
+            name: "output".to_string(),
+            shape: vec![1, 3, 512, 512],
+            color_space: None,
+            range: None,
+        });
+        let input_size = input.shape.get(2).copied().unwrap_or(512).max(1) as u32;
+        let input_channels = input.shape.get(1).copied().unwrap_or(3).max(1) as usize;
+        let (scale, offset) = Self::range_params(input.range.as_deref());
+        Ok(Self {
+            session: Mutex::new(session),
+            input_name: input.name,
+            output_name: output.name,
+            input_size,
+            input_channels,
+            scale,
+            offset,
+        })
+    }
+
+    /// Shared session keyed by the canonical model path (contract parsed
+    /// once, session reused across pages).
+    pub fn shared(model_path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let model_path = model_path.as_ref().canonicalize().with_context(|| {
+            format!(
+                "cannot resolve Style2Paints ONNX model {}",
+                model_path.as_ref().display()
+            )
+        })?;
+        let key = model_path.display().to_string();
+        static WORKERS: OnceLock<Mutex<HashMap<String, Arc<Style2PaintsV3OnnxBackend>>>> =
+            OnceLock::new();
+        let workers = WORKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut workers = workers
+            .lock()
+            .map_err(|e| anyhow!("session registry lock poisoned: {e}"))?;
+        if let Some(backend) = workers.get(&key) {
+            return Ok(Arc::clone(backend));
+        }
+        if workers.len() >= 8 {
+            if let Some(oldest) = workers.keys().next().cloned() {
+                workers.remove(&oldest);
+            }
+        }
+        let backend = Arc::new(Style2PaintsV3OnnxBackend::new(&model_path)?);
+        workers.insert(key, Arc::clone(&backend));
+        Ok(backend)
+    }
+}
+
+#[cfg(feature = "native-onnx")]
+impl ColorizationBackend for Style2PaintsV3OnnxBackend {
+    fn name(&self) -> &str {
+        "style2paints-v3-native-rust"
+    }
+
+    fn prefers_original_grayscale(&self) -> bool {
+        true
+    }
+
+    fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
+        let (w, h) = input.lineart.dimensions();
+        let gray = input.lineart.clone();
+        let size = self.input_size;
+        let resized =
+            image::imageops::resize(&gray, size, size, image::imageops::FilterType::Lanczos3);
+        let n = (size * size) as usize;
+        let channels = self.input_channels;
+        let mut tensor_data = vec![0.0f32; channels * n];
+        for y in 0..size {
+            for x in 0..size {
+                let g = resized.get_pixel(x, y)[0] as f32 / 255.0;
+                // (value - offset) * scale -> 0..1, then map to the contract range.
+                let value = g * self.scale + self.offset;
+                let idx = (y * size + x) as usize;
+                for c in 0..channels {
+                    tensor_data[c * n + idx] = value;
+                }
+            }
+        }
+        let array = ndarray::Array4::from_shape_vec(
+            (1, channels, size as usize, size as usize),
+            tensor_data,
+        )
+        .map_err(|e| EngineError::Inference(format!("tensor shape error: {e}")))?;
+        let tensor = Tensor::from_array(array)
+            .map_err(|e| EngineError::Inference(format!("failed to create tensor: {e}")))?;
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
+        let in_name = self.input_name.clone();
+        let out_name = self.output_name.clone();
+        let outputs = session
+            .run(ort::inputs![in_name => tensor])
+            .map_err(|e| EngineError::Inference(format!("Style2Paints inference failed: {e}")))?;
+        let (_, output_data) = outputs[out_name.as_str()]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
+
+        // Output [1, C, S, S] full RGB (0..1 after the inverse range map).
+        let out_channels = output_data.len() / n;
+        let (inv_scale, inv_offset) = (1.0 / self.scale, -self.offset / self.scale);
+        let mut model_rgb = RgbImage::new(size, size);
+        for i in 0..n {
+            let r = if out_channels >= 3 {
+                ((output_data[i] * inv_scale + inv_offset).clamp(0.0, 1.0) * 255.0).round() as u8
+            } else {
+                0
+            };
+            let g = if out_channels >= 3 {
+                ((output_data[n + i] * inv_scale + inv_offset).clamp(0.0, 1.0) * 255.0).round()
+                    as u8
+            } else {
+                ((output_data[i] * inv_scale + inv_offset).clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            let b = if out_channels >= 3 {
+                ((output_data[2 * n + i] * inv_scale + inv_offset).clamp(0.0, 1.0) * 255.0).round()
+                    as u8
+            } else {
+                ((output_data[i] * inv_scale + inv_offset).clamp(0.0, 1.0) * 255.0).round() as u8
+            };
+            model_rgb.put_pixel(
+                (i % size as usize) as u32,
+                (i / size as usize) as u32,
+                Rgb([r, g, b]),
+            );
+        }
+        // Back to the page size (Lanczos3 keeps the a/b upscale crisp; the
+        // engine's restore_lines pass re-encodes the ink afterwards).
+        let out = image::imageops::resize(&model_rgb, w, h, image::imageops::FilterType::Lanczos3);
+        Ok(out)
+    }
+}
+
 #[cfg(feature = "native-onnx")]
 const DDCOLOR_MODEL_SIZE: u32 = 512;
 
@@ -2444,48 +2744,69 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
         .map_err(|e| EngineError::Inference(format!("tensor shape error: {e}")))?;
         let tensor = Tensor::from_array(array)
             .map_err(|e| EngineError::Inference(format!("failed to create tensor: {e}")))?;
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
-        let in_name = self.input_name.clone();
-        let out_name = self.output_name.clone();
-        let outputs = session
-            .run(ort::inputs![in_name => tensor])
-            .map_err(|e| EngineError::Inference(format!("DDColor inference failed: {e}")))?;
-        let (_, output_data) = outputs[out_name.as_str()]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
+        // Run the model inside a tight scope: the session mutex is released
+        // as soon as the raw output is copied out, so the (expensive) edge-
+        // aware upscale and Lab merge can overlap across parallel jobs
+        // instead of serializing on the session.
+        let (a_plane, b_plane) = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|e| EngineError::Inference(format!("session lock error: {e}")))?;
+            let in_name = self.input_name.clone();
+            let out_name = self.output_name.clone();
+            let outputs = session
+                .run(ort::inputs![in_name => tensor])
+                .map_err(|e| EngineError::Inference(format!("DDColor inference failed: {e}")))?;
+            let (_, output_data) = outputs[out_name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| EngineError::Inference(format!("output extraction failed: {e}")))?;
 
-        // a/b planes at model resolution, scaled per the calibrated convention.
-        let scale = self.ab_scale;
-        let mut a_resized = image::GrayImage::new(w, h);
-        let mut b_resized = image::GrayImage::new(w, h);
-        let plane = n;
-        {
-            let mut a_model = image::GrayImage::new(DDCOLOR_MODEL_SIZE, DDCOLOR_MODEL_SIZE);
-            let mut b_model = image::GrayImage::new(DDCOLOR_MODEL_SIZE, DDCOLOR_MODEL_SIZE);
-            for i in 0..n {
-                let a = (output_data[i] * scale).clamp(-127.0, 127.0);
-                let b = (output_data[plane + i] * scale).clamp(-127.0, 127.0);
-                let x = (i % DDCOLOR_MODEL_SIZE as usize) as u32;
-                let y = (i / DDCOLOR_MODEL_SIZE as usize) as u32;
-                a_model.put_pixel(
-                    x,
-                    y,
-                    image::Luma([((a + 127.0).round() as u16).min(254) as u8]),
-                );
-                b_model.put_pixel(
-                    x,
-                    y,
-                    image::Luma([((b + 127.0).round() as u16).min(254) as u8]),
+            // a/b planes at model resolution, scaled per the calibrated
+            // convention, kept in f32 (quantizing to u8 here would cost
+            // half a Lab unit of precision in smooth gradients).
+            let scale = self.ab_scale;
+            if std::env::var("MANGAHUE_DEBUG_DDCOLOR").is_ok() {
+                let total = 2 * n;
+                let mean_abs: f32 =
+                    output_data.iter().take(total).map(|v| v.abs()).sum::<f32>() / total as f32;
+                let min = output_data
+                    .iter()
+                    .take(total)
+                    .fold(f32::MAX, |a, &b| a.min(b));
+                let max = output_data
+                    .iter()
+                    .take(total)
+                    .fold(f32::MIN, |a, &b| a.max(b));
+                eprintln!(
+                    "[ddcolor-debug] ab_scale={scale} mean|ab|={mean_abs:.3} min={min:.3} max={max:.3}"
                 );
             }
-            // Bilinear (Triangle) matches the Python worker's PIL BILINEAR.
-            a_resized =
-                image::imageops::resize(&a_model, w, h, image::imageops::FilterType::Triangle);
-            b_resized =
-                image::imageops::resize(&b_model, w, h, image::imageops::FilterType::Triangle);
+            let plane = n;
+            let mut a_plane = vec![0.0f32; n];
+            let mut b_plane = vec![0.0f32; n];
+            for i in 0..n {
+                a_plane[i] = (output_data[i] * scale).clamp(-127.0, 127.0);
+                b_plane[i] = (output_data[plane + i] * scale).clamp(-127.0, 127.0);
+            }
+            (a_plane, b_plane)
+        };
+
+        // Edge-aware chroma upscale: plain bilinear smears color across
+        // ink boundaries (hair strands, folds). A joint-bilateral
+        // upscale guided by the full-res grayscale makes chroma follow
+        // the lines — sharper color, still 100% model-derived. Env
+        // MANGAHUE_JBU_DISABLE=1 falls back to bilinear for A/B.
+        let use_jbu = std::env::var("MANGAHUE_JBU_DISABLE").is_err();
+        let a_resized: Vec<f32>;
+        let b_resized: Vec<f32>;
+        if use_jbu {
+            a_resized = joint_bilateral_upscale_ab_f32(&a_plane, &gray, w, h);
+            b_resized = joint_bilateral_upscale_ab_f32(&b_plane, &gray, w, h);
+        } else {
+            // Bilinear fallback on the f32 planes (index = y * w + x).
+            a_resized = bilinear_upscale_ab_f32(&a_plane, &gray, w, h);
+            b_resized = bilinear_upscale_ab_f32(&b_plane, &gray, w, h);
         }
 
         // Merge a/b with the ORIGINAL tile's L* and convert back to sRGB.
@@ -2494,8 +2815,8 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
             for x in 0..w {
                 let g = gray.get_pixel(x, y)[0] as f32 / 255.0;
                 let l = rgb_to_lab_l(g, g, g);
-                let a = (a_resized.get_pixel(x, y)[0] as f32) - 127.0;
-                let b = (b_resized.get_pixel(x, y)[0] as f32) - 127.0;
+                let a = a_resized[y as usize * w as usize + x as usize];
+                let b = b_resized[y as usize * w as usize + x as usize];
                 let (r, g2, bl) = lab_to_rgb(l, a, b);
                 out.put_pixel(
                     x,
@@ -2510,6 +2831,94 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
         }
         Ok(out)
     }
+}
+
+/// Joint-bilateral upscale of a 512x512 chroma plane (f32, -127..127) to the
+/// full page size.
+///
+/// The spatial kernel is a small Gaussian in source space; the range kernel
+/// compares the FULL-RES grayscale at the target pixel against the grayscale
+/// at each source sample, so chroma never crosses strong ink edges. This
+/// replaces the plain bilinear upscale (which bleeds color over lines) with
+/// a purely model-derived, edge-aware reconstruction. Unlike the older u8
+/// path, chroma stays in f32 so smooth gradients (skies, skin) keep their
+/// precision; quantization happens only at the final RGB write.
+fn joint_bilateral_upscale_ab_f32(
+    src: &[f32],
+    gray: &image::GrayImage,
+    w: u32,
+    h: u32,
+) -> Vec<f32> {
+    const RADIUS: i32 = 2;
+    const SIGMA_SPACE_SQ: f32 = 1.4f32 * 1.4f32 * 2.0; // 2 * sigma^2, sigma ~1.4 src px
+    const SIGMA_RANGE_SQ: f32 = 24.0f32 * 24.0f32 * 2.0; // 2 * sigma^2, sigma ~24 gray levels
+                                                         // The DDColor model is fixed at 512x512; the constant lives behind a
+                                                         // feature gate, so define the model side locally here.
+    const SIDE: u32 = 512;
+    let side = SIDE;
+    let sw = side as f32;
+    let sh = side as f32;
+    let mut out = vec![0.0f32; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let cx = x as f32 * sw / w as f32;
+            let cy = y as f32 * sh / h as f32;
+            let gx = (cx.round() as i32).clamp(0, side as i32 - 1);
+            let gy = (cy.round() as i32).clamp(0, side as i32 - 1);
+            let target_g = gray.get_pixel(x, y)[0] as f32;
+            let mut sum = 0.0f32;
+            let mut weight = 0.0f32;
+            for dy in -RADIUS..=RADIUS {
+                for dx in -RADIUS..=RADIUS {
+                    let sx = (gx + dx).clamp(0, side as i32 - 1) as u32;
+                    let sy = (gy + dy).clamp(0, side as i32 - 1) as u32;
+                    let ddx = sx as f32 - cx;
+                    let ddy = sy as f32 - cy;
+                    let spatial = (-(ddx * ddx + ddy * ddy) / SIGMA_SPACE_SQ).exp();
+                    let src_x = ((sx as f32 * w as f32 / sw).round() as u32).min(w - 1);
+                    let src_y = ((sy as f32 * h as f32 / sh).round() as u32).min(h - 1);
+                    let source_g = gray.get_pixel(src_x, src_y)[0] as f32;
+                    let range = (-((target_g - source_g).powi(2)) / SIGMA_RANGE_SQ).exp();
+                    let wgt = spatial * range;
+                    sum += src[(sy * side + sx) as usize] * wgt;
+                    weight += wgt;
+                }
+            }
+            out[(y * w + x) as usize] = sum / weight.max(1e-6);
+        }
+    }
+    out
+}
+
+/// Plain bilinear fallback for the f32 chroma planes (used when
+/// MANGAHUE_JBU_DISABLE=1).
+fn bilinear_upscale_ab_f32(src: &[f32], gray: &image::GrayImage, w: u32, h: u32) -> Vec<f32> {
+    const SIDE: u32 = 512; // DDColor model side (see joint_bilateral_upscale_ab_f32)
+    let side = SIDE;
+    let sw = side as f32;
+    let sh = side as f32;
+    let mut out = vec![0.0f32; (w * h) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let fx = x as f32 * sw / w as f32 - 0.5;
+            let fy = y as f32 * sh / h as f32 - 0.5;
+            let x0 = fx.floor().max(0.0) as u32;
+            let y0 = fy.floor().max(0.0) as u32;
+            let x1 = (x0 + 1).min(side - 1);
+            let y1 = (y0 + 1).min(side - 1);
+            let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+            let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+            let p00 = src[(y0 * side + x0) as usize];
+            let p10 = src[(y0 * side + x1) as usize];
+            let p01 = src[(y1 * side + x0) as usize];
+            let p11 = src[(y1 * side + x1) as usize];
+            let top = p00 + (p10 - p00) * tx;
+            let bottom = p01 + (p11 - p01) * tx;
+            out[(y * w + x) as usize] = top + (bottom - top) * ty;
+        }
+    }
+    let _ = gray;
+    out
 }
 
 #[cfg(test)]

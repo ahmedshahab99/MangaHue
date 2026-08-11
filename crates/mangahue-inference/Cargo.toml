@@ -7,15 +7,17 @@ authors.workspace = true
 
 [features]
 default = []
-native-onnx = ["dep:ndarray", "dep:ort"]
+native-onnx = ["dep:ndarray", "dep:ort", "dep:libloading"]
 
 [dependencies]
 anyhow.workspace = true
 image.workspace = true
+libloading = { version = "0.9", optional = true }
 mangahue-core = { path = "../mangahue-core" }
 ndarray = { workspace = true, optional = true }
 ort = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tracing.workspace = true
 uuid.workspace = true

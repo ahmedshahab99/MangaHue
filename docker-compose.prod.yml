@@ -97,8 +97,14 @@ services:
       - "/data/telegram"
       - "--max-pages"
       - "${TELEGRAM_MAX_PAGES:-32}"
-      - "--pyramid"
-      - "--hint-propagate"
+      # Soft-cel tier: DDColor-FULL + soft cel-shaded anime grade
+      # (region base colors, specular gloss, warm ambient, controlled sat).
+      - "--model"
+      - "/app/models/ddcolor-full-fp16.onnx"
+      - "--preset"
+      - "/app/configs/engine.telegram-soft-cel.yaml"
+      - "--style"
+      - "/app/configs/styles/soft_cel_anime.yaml"
       - "--daily-limit"
       - "${DAILY_PAGE_LIMIT:-0}"
     environment:

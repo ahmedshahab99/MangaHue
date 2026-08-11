@@ -19,7 +19,13 @@ layout:
   tile_overlap: 0
 
 inference:
-  model_path: models/manga-onnx/manga-colorize-fp16.onnx
+  # Primary model: DDColor-FULL (transformer color decoder, ~435 MB FP16).
+  # Richer, more detailed chroma than the manga-colorize U-Net (VPS A/B,
+  # 2026-08-08: ~17.4 s/page vs 12.5 s/page at 2 threads; bubble
+  # cleanliness 0.98 vs 0.49, sharper output — chroma is held close by the
+  # muted grade by design, so the win shows in cleanliness/detail, not raw
+  # saturation). Rollback: models/manga-onnx/manga-colorize-fp16.onnx
+  model_path: models/ddcolor-full-fp16.onnx
   model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
   device: cpu
   batch_size: 1
@@ -42,13 +48,15 @@ postprocess:
   bubble_cleanup: false
   bleeding_correction: false
   palette_correction: true
-  final_sharpening: 0.02
+  # Slightly stronger final sharpening than the manga tier: DDColor-FULL
+  # outputs at its native 512x512 and the upscale softens detail.
+  final_sharpening: 0.04
   reference_finishing: true
   # Creative hue variety: adjacent regions must hold perceptually distinct
-  # chroma (default 34.0; 44 = bolder, more creative color choices while
-  # the muted grade keeps the overall look natural).
-  region_chroma_separation: 44.0
-  target_colorfulness: 1.1
+  # chroma (default 34.0; 50 = bolder, more creative color choices matching
+  # the vibrant-natural sample while the muted grade keeps skin real).
+  region_chroma_separation: 50.0
+  target_colorfulness: 1.55
   midtone_depth: 0.08
   local_contrast: 0.1
   semantic_relighting: false
@@ -59,7 +67,7 @@ postprocess:
   muted_hue_shift_deg: 16.0
   muted_dark_pull: 0.92
   muted_dark_sat: 0.19
-  muted_mid_sat: 0.27
+  muted_mid_sat: 0.35
   muted_bright_sat: 0.22
   muted_paper_sat: 0.034
 

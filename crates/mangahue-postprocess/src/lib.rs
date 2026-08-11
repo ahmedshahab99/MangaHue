@@ -24,6 +24,11 @@ pub struct PostprocessInput<'a> {
     pub style: &'a StyleProfile,
     pub config: &'a PostprocessSection,
     pub reference_image: Option<&'a RgbImage>,
+    /// The model's own mean chroma on this page (opponent magnitude
+    /// |R-L|+|B-L|, 0-255 units), measured right after inference. The
+    /// smart governor uses it as the page's color budget so grading
+    /// follows what the model judged the page to be.
+    pub chroma_signal: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +65,16 @@ pub struct PostprocessReport {
     pub semantic_chroma_restored: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
+    /// Purity metrics (model-first audit): how much of the model's own
+    /// chroma survived the finishing passes unchanged.
+    #[serde(default)]
+    pub model_pixels_overridden: u64,
+    #[serde(default)]
+    pub palette_fill_pixels: u64,
+    #[serde(default)]
+    pub model_chroma_retention: f32,
+    #[serde(default)]
+    pub mean_hue_shift_deg: f32,
 }
 
 pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessReport)> {
@@ -85,6 +100,10 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         semantic_chroma_restored: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
+        model_pixels_overridden: 0,
+        palette_fill_pixels: 0,
+        model_chroma_retention: 1.0,
+        mean_hue_shift_deg: 0.0,
     };
 
     if input.config.bleeding_correction && !input.config.palette_correction {
@@ -102,7 +121,13 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     if input.config.palette_correction {
         let lut = MangaColorLUT::new(input.style);
         apply_lut_grading(&mut output, &lut, input.line_mask, input.original_grayscale);
-        apply_palette_harmony(&mut output, input.style, input.line_mask);
+        apply_palette_harmony(
+            &mut output,
+            input.style,
+            input.line_mask,
+            input.config.palette_harmony_strength,
+            input.config.model_first,
+        );
         complete_material_chroma(
             &mut output,
             input.original_grayscale,
@@ -122,6 +147,12 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.config.soft_strength,
             input.config.soft_confidence,
             input.config.region_chroma_separation,
+            input.config.model_first,
+            input.config.seed_chroma_bar_bright,
+            input.config.seed_chroma_bar_mid,
+            input.config.model_chroma_bar_bright,
+            input.config.model_chroma_bar_mid,
+            input.config.model_chroma_gain,
         );
         report.material_regions = region_report.regions;
         report.seeded_material_regions = region_report.seeded_regions;
@@ -201,11 +232,29 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.bubble_mask,
             input.config.muted_strength,
             input.config.muted_hue_shift_deg,
+            input.config.muted_yellow_shift_deg,
             input.config.muted_dark_pull,
             input.config.muted_dark_sat,
             input.config.muted_mid_sat,
             input.config.muted_bright_sat,
             input.config.muted_paper_sat,
+            input.config.muted_vivid_preserve,
+        );
+    }
+
+    // Smart governor runs last of the color passes: measured page metrics
+    // drive a bounded chroma gain toward the preset targets, scaled by the
+    // model's own chroma signal (the page's color budget).
+    if input.config.smart_governor {
+        natural_grade::smart_color_governor(
+            &mut output,
+            input.line_mask,
+            input.config.governor_target_saturation,
+            input.config.governor_target_colorfulness,
+            input.config.governor_min_gain,
+            input.config.governor_max_gain,
+            input.config.governor_target_warmth,
+            input.chroma_signal,
         );
     }
 
@@ -241,7 +290,83 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     if input.config.final_sharpening > 0.0 {
         sharpen_lightly(&mut output, input.config.final_sharpening);
     }
+    measure_purity(
+        &output,
+        &semantic_evidence,
+        input.line_mask,
+        &mut report.model_pixels_overridden,
+        &mut report.palette_fill_pixels,
+        &mut report.model_chroma_retention,
+        &mut report.mean_hue_shift_deg,
+    );
     Ok((output, report))
+}
+
+/// Model-first purity audit. Compares the final output against the pure
+/// model evidence (captured before any postprocess) on pixels where the
+/// model was confident (opponent chroma >= 16), excluding ink. Reports how
+/// many of those pixels were overridden (hue rotated > 15 deg or chroma
+/// changed by > 40%%), how many near-neutral pixels received palette fill,
+/// the mean chroma retention ratio and the mean hue shift in degrees.
+fn measure_purity(
+    output: &RgbImage,
+    evidence: &RgbImage,
+    line_mask: &GrayImage,
+    overridden: &mut u64,
+    palette_fill: &mut u64,
+    retention: &mut f32,
+    mean_hue_shift: &mut f32,
+) {
+    let (width, height) = output.dimensions();
+    if width == 0 || height == 0 || evidence.dimensions() != (width, height) {
+        return;
+    }
+    let mut confident = 0u64;
+    let mut retention_sum = 0.0f64;
+    let mut hue_shift_sum = 0.0f64;
+    let mut overridden_count = 0u64;
+    let mut fill_count = 0u64;
+    for y in 0..height {
+        for x in 0..width {
+            if line_mask.get_pixel(x, y)[0] > 180 {
+                continue;
+            }
+            let e = *evidence.get_pixel(x, y);
+            let o = *output.get_pixel(x, y);
+            let el = 0.2126 * e[0] as f32 + 0.7152 * e[1] as f32 + 0.0722 * e[2] as f32;
+            let e_mag = (e[0] as f32 - el).abs() + (e[2] as f32 - el).abs();
+            let ol = 0.2126 * o[0] as f32 + 0.7152 * o[1] as f32 + 0.0722 * o[2] as f32;
+            let o_mag = (o[0] as f32 - ol).abs() + (o[2] as f32 - ol).abs();
+            if e_mag >= 16.0 {
+                confident += 1;
+                if o_mag > 0.5 {
+                    retention_sum += (o_mag / e_mag).min(3.0) as f64;
+                }
+                // Opponent-space hue angle difference.
+                let e_angle = e_mag.atan2((e[2] as f32 - el) as f32);
+                let o_angle = o_mag.atan2((o[2] as f32 - ol) as f32);
+                let mut delta = (e_angle - o_angle).abs();
+                while delta > std::f32::consts::PI {
+                    delta -= std::f32::consts::PI * 2.0;
+                }
+                hue_shift_sum += (delta * 180.0 / std::f32::consts::PI) as f64;
+                let chroma_ratio = o_mag / e_mag.max(0.01);
+                if delta * 180.0 / std::f32::consts::PI > 15.0
+                    || !(0.6..=1.67).contains(&chroma_ratio)
+                {
+                    overridden_count += 1;
+                }
+            } else if e_mag < 8.0 && o_mag > 10.0 {
+                fill_count += 1;
+            }
+        }
+    }
+    if confident > 0 {
+        *overridden = overridden_count;
+        *retention = (retention_sum / confident as f64) as f32;
+        *mean_hue_shift = (hue_shift_sum / confident as f64) as f32;
+    }
+    *palette_fill = fill_count;
 }
 
 pub fn cross_tile_coherence(
@@ -757,10 +882,17 @@ impl MangaColorLUT {
     }
 }
 
-fn apply_palette_harmony(image: &mut RgbImage, style: &StyleProfile, line_mask: &GrayImage) {
+fn apply_palette_harmony(
+    image: &mut RgbImage,
+    style: &StyleProfile,
+    line_mask: &GrayImage,
+    strength: f32,
+    model_first: bool,
+) {
     if style.palette.is_empty() {
         return;
     }
+    let strength = strength.clamp(0.0, 0.5);
     let palette = style
         .palette
         .iter()
@@ -814,9 +946,15 @@ fn apply_palette_harmony(image: &mut RgbImage, style: &StyleProfile, line_mask: 
             continue;
         };
 
-        let strength = 0.16 * (1.0 - ink).powi(2);
-        let harmonized_cb = cb + (target_cb - cb) * strength;
-        let harmonized_cr = cr + (target_cr - cr) * strength;
+        let mut pull = strength * (1.0 - ink).powi(2);
+        // Model-first: the palette pull yields to existing chroma — neutral
+        // pixels keep the harmony nudge, model-colored pixels stay untouched.
+        if model_first {
+            let chroma_gate = ((saturation - 8.0) / 18.0).clamp(0.0, 1.0);
+            pull *= 1.0 - chroma_gate;
+        }
+        let harmonized_cb = cb + (target_cb - cb) * pull;
+        let harmonized_cr = cr + (target_cr - cr) * pull;
         pixel[0] = (luma + harmonized_cr).round().clamp(0.0, 255.0) as u8;
         pixel[2] = (luma + harmonized_cb).round().clamp(0.0, 255.0) as u8;
         pixel[1] = ((luma - 0.2126 * pixel[0] as f32 - 0.0722 * pixel[2] as f32) / 0.7152)
@@ -1431,6 +1569,23 @@ mod tests {
             muted_mid_sat: 0.27,
             muted_bright_sat: 0.22,
             muted_paper_sat: 0.034,
+            muted_vivid_preserve: 0.0,
+            muted_yellow_shift_deg: 0.0,
+            model_first: false,
+            seed_chroma_bar_bright: 48.0,
+            seed_chroma_bar_mid: 24.0,
+            model_chroma_bar_bright: 40.0,
+            model_chroma_bar_mid: 20.0,
+            model_chroma_gain: 1.3,
+            palette_harmony_strength: 0.16,
+            face_paint_strength: 0.92,
+            ambient_occlusion_strength: 0.0,
+            smart_governor: false,
+            governor_target_saturation: 0.20,
+            governor_target_colorfulness: 36.0,
+            governor_min_gain: 0.8,
+            governor_max_gain: 1.25,
+            governor_target_warmth: 45.0,
         };
 
         let (output, report) = finalize(PostprocessInput {
@@ -1444,6 +1599,7 @@ mod tests {
             style: &style,
             config: &config,
             reference_image: None,
+            chroma_signal: None,
         })
         .unwrap();
 
@@ -1558,7 +1714,7 @@ mod tests {
         image.put_pixel(1, 0, Rgb([240, 240, 240]));
         let lines = GrayImage::from_pixel(2, 1, Luma([0]));
 
-        apply_palette_harmony(&mut image, &style, &lines);
+        apply_palette_harmony(&mut image, &style, &lines, 0.16, false);
 
         let colored = image.get_pixel(0, 0);
         assert!(colored[1] > 120);

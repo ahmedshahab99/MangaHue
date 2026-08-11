@@ -1,11 +1,14 @@
 id: soft_cel_anime
-name: Soft Cel Semi-Realistic
-saturation: 1.2
-contrast: 1.1
+name: Soft Cel Anime
+saturation: 1.0
+contrast: 1.05
 brightness: 0.0
-shadow_strength: 0.62
-highlight_strength: 0.5
+shadow_strength: 0.6
+highlight_strength: 0.45
 line_strength: 1.0
+# Soft cel-shaded anime: clean region-aware base colors, warm skin, large
+# dark/light hair masses, folds guided by the line art. Moderate saturation
+# and warm ambient lighting; shadows stay simple and readable.
 # Rich material palette: warm skin + varied clothing/background hues so
 # the region renderer paints DISTINCT materials instead of forcing
 # everything into warm tones.

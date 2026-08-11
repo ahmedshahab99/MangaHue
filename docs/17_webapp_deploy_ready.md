@@ -215,7 +215,8 @@ sudo chown -R mangahue:mangahue /opt/mangahue/web
 ```
 /opt/mangahue/
   bin/mangahue-api, bin/mangahue
-  models/ddcolor-tiny-fp16.onnx, ddcolor-tiny.metadata.json
+  models/ddcolor-full-fp16.onnx, ddcolor-full.metadata.json   # studio tier
+  models/ddcolor-tiny-fp16.onnx, ddcolor-tiny.metadata.json   # fast tier
   web/app/out/            # static webapp
   configs/engine.studio.yaml, configs/styles/
   python/                 # mangahue_train package

@@ -57,6 +57,10 @@ struct RegionColor {
     blue: f32,
     confidence: f32,
     seeded: bool,
+    /// The region's hue comes from confident MODEL chroma (passed the
+    /// chroma bar) rather than the palette tier. Model-first mode freezes
+    /// these regions against palette re-hueing.
+    model_derived: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -117,6 +121,12 @@ pub(crate) fn render_region_graph(
     soft_strength: f32,
     soft_confidence: f32,
     chroma_separation: f32,
+    model_first: bool,
+    seed_chroma_bar_bright: f32,
+    seed_chroma_bar_mid: f32,
+    model_chroma_bar_bright: f32,
+    model_chroma_bar_mid: f32,
+    model_chroma_gain: f32,
 ) -> RegionRenderReport {
     let (width, height) = image.dimensions();
     if width < 3
@@ -213,6 +223,11 @@ pub(crate) fn render_region_graph(
                 soft_coverage,
                 soft_strength,
                 soft_confidence,
+                seed_chroma_bar_bright,
+                seed_chroma_bar_mid,
+                model_chroma_bar_bright,
+                model_chroma_bar_mid,
+                model_chroma_gain,
             )
         })
         .collect::<Vec<_>>();
@@ -247,6 +262,7 @@ pub(crate) fn render_region_graph(
         &semantics,
         &palette,
         chroma_separation,
+        model_first,
     );
     // Re-evaluate semantics with the FINAL region hues: skin classification
     // must not force the render's skin treatment onto regions the director
@@ -268,7 +284,7 @@ pub(crate) fn render_region_graph(
     let illumination = box_blur_gray(original_gray, 6);
     let ink_distance = distance_to_ink(line_mask);
     let mut report = RegionRenderReport {
-        regions: stats.iter().filter(|region| region.count >= 20).count() as u64,
+        regions: stats.iter().filter(|region| region.count >= 8).count() as u64,
         seeded_regions: seed_derived,
         inferred_regions: colors
             .iter()
@@ -286,14 +302,14 @@ pub(crate) fn render_region_graph(
         for x in 0..width {
             let index = (y * width + x) as usize;
             let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
-            if ink > 0.47 {
+            if ink > 0.55 {
                 continue;
             }
             let Some(&region_index) = root_to_region.get(&roots[index]) else {
                 continue;
             };
             let region = stats[region_index];
-            if region.count < 20 {
+            if region.count < 8 {
                 continue;
             }
             let color = colors[region_index];
@@ -310,6 +326,7 @@ pub(crate) fn render_region_graph(
                 semantics[region_index],
                 face_cavity[index],
                 style,
+                model_first,
             );
             report.pixels_rendered += 1;
         }
@@ -528,7 +545,7 @@ fn infer_region_semantics(
         .zip(colors)
         .enumerate()
         .map(|(index, (region, color))| {
-            if region.count < 20 {
+            if region.count < 8 {
                 return RegionSemantic::default();
             }
             let count = region.count as f64;
@@ -837,6 +854,11 @@ fn infer_region_color(
     soft_coverage: bool,
     soft_strength: f32,
     soft_confidence: f32,
+    seed_chroma_bar_bright: f32,
+    seed_chroma_bar_mid: f32,
+    model_chroma_bar_bright: f32,
+    model_chroma_bar_mid: f32,
+    model_chroma_gain: f32,
 ) -> RegionColor {
     if region.count < 20 {
         return RegionColor::default();
@@ -855,8 +877,16 @@ fn infer_region_color(
     // palette hue. Midtone regions keep model color only when it is
     // clearly visible too.
     let bright_region = mean_luma > 230.0;
-    let seed_chroma_bar = if bright_region { 48.0 } else { 24.0 };
-    let chroma_bar = if bright_region { 40.0 } else { 20.0 };
+    let seed_chroma_bar = if bright_region {
+        seed_chroma_bar_bright
+    } else {
+        seed_chroma_bar_mid
+    };
+    let chroma_bar = if bright_region {
+        model_chroma_bar_bright
+    } else {
+        model_chroma_bar_mid
+    };
     if region.touches_border && mean_luma > 150.0 && existing_magnitude < 12.0 {
         // Only near-neutral border regions (scanner paper casts) are remapped
         // to a warm palette hue. Vivid content — blue skies, water, red
@@ -876,6 +906,7 @@ fn infer_region_color(
                 blue: blue * 0.78,
                 confidence: 0.36,
                 seeded: false,
+                model_derived: false,
             };
         }
     }
@@ -892,6 +923,7 @@ fn infer_region_color(
                 blue: seed_blue,
                 confidence: (0.38 + seed_ratio * 5.5).clamp(0.38, 0.94),
                 seeded: true,
+                model_derived: true,
             };
         }
     }
@@ -902,10 +934,11 @@ fn infer_region_color(
     // need clearly visible chroma to count as colored.
     if existing_magnitude >= chroma_bar {
         return RegionColor {
-            red: existing_red * 1.3,
-            blue: existing_blue * 1.3,
+            red: existing_red * model_chroma_gain,
+            blue: existing_blue * model_chroma_gain,
             confidence: 0.28,
             seeded: false,
+            model_derived: true,
         };
     }
 
@@ -946,10 +979,13 @@ fn infer_region_color(
             (0.75, 0.28)
         };
         return RegionColor {
-            red: red * soft * soft_strength.clamp(0.5, 1.6),
+            // Bright-region tints drop their warm component by half: warm
+            // cream on bright neutral areas is what turns pages yellow.
+            red: red * soft * soft_strength.clamp(0.5, 1.6) * if red > 0.0 { 0.5 } else { 1.0 },
             blue: blue * soft * soft_strength.clamp(0.5, 1.6),
             confidence: (confidence * soft_confidence.clamp(0.5, 1.6)).clamp(0.1, 0.6),
             seeded: false,
+            model_derived: false,
         };
     }
 
@@ -961,6 +997,7 @@ fn infer_region_color(
         blue: blue * 0.72,
         confidence: area_confidence * if mean_luma > 224.0 { 0.45 } else { 0.72 },
         seeded: false,
+        model_derived: false,
     }
 }
 
@@ -969,12 +1006,27 @@ fn palette_score(color: (f32, f32, f32), luma: f32, texture: f32, touches_border
     let luma_cost = (palette_luma - luma).abs();
     let chroma = red.abs() + blue.abs();
     let bright_penalty = if luma > 220.0 { chroma * 0.42 } else { 0.0 };
+    // Warm hues on BRIGHT regions read as yellow-cream across whole pages
+    // (bright neutral areas dominate manga). Push bright regions toward
+    // cool/neutral palette entries instead.
+    let warm_bright_penalty = if luma > 200.0 && red > 0.0 {
+        red.min(80.0) * 0.35
+    } else {
+        0.0
+    };
+    // Bright backgrounds prefer COOL palette entries (soft-cel anime rooms
+    // and skies are cool; warm creams are what made pages read yellow).
+    let cool_bright_bonus = if luma > 200.0 && red < 0.0 {
+        -(-red).min(60.0) * 0.25
+    } else {
+        0.0
+    };
     let border_bonus = if touches_border && texture < 9.0 {
         -chroma.min(36.0) * 0.12
     } else {
         0.0
     };
-    luma_cost + bright_penalty + border_bonus
+    luma_cost + bright_penalty + warm_bright_penalty + cool_bright_bonus + border_bonus
 }
 
 fn build_adjacency(
@@ -1039,7 +1091,7 @@ fn propagate_graph_colors(
     let mut next = colors.clone();
     for _ in 0..7 {
         for index in 0..colors.len() {
-            if stats[index].count < 20 || colors[index].seeded {
+            if stats[index].count < 20 || colors[index].seeded || colors[index].model_derived {
                 next[index] = colors[index];
                 continue;
             }
@@ -1087,6 +1139,7 @@ fn chroma_diversity_director(
     semantics: &[RegionSemantic],
     palette: &[(f32, f32, f32)],
     separation: f32,
+    model_first: bool,
 ) {
     let n = colors.len();
     if n < 2 {
@@ -1179,10 +1232,14 @@ fn chroma_diversity_director(
         // nearly every pixel, so most regions reach conf 0.9+ and would
         // otherwise freeze the page into the model's single warm cast.
         // Faces stay warm; everything else is free for the director.
-        if colors[index].seeded
+        // In model-first mode, every region whose hue came from confident
+        // MODEL chroma is locked too: the director may vary palette-filled
+        // regions, never the model's own color decisions.
+        if (colors[index].seeded
             && colors[index].confidence >= 0.7
             && semantics[index].skin > 0.42
-            && natural_skin_chroma(colors[index].red, colors[index].blue)
+            && natural_skin_chroma(colors[index].red, colors[index].blue))
+            || (model_first && colors[index].model_derived)
         {
             locked[index] = true;
         }
@@ -1209,6 +1266,7 @@ fn chroma_diversity_director(
                 blue: cand.1,
                 confidence: best.confidence,
                 seeded: false,
+                model_derived: false,
             };
             let s = score(index, cand, &assigned);
             if s < best_score {
@@ -1218,6 +1276,7 @@ fn chroma_diversity_director(
                     blue: cand.1,
                     confidence: best.confidence,
                     seeded: false,
+                    model_derived: false,
                 };
             }
         }
@@ -1263,6 +1322,7 @@ fn chroma_diversity_director(
                 blue: cand.1,
                 confidence: best.confidence,
                 seeded: false,
+                model_derived: false,
             };
             let s = score(index, cand, &assigned);
             if s < best_score {
@@ -1272,6 +1332,7 @@ fn chroma_diversity_director(
                     blue: cand.1,
                     confidence: best.confidence,
                     seeded: false,
+                    model_derived: false,
                 };
             }
         }
@@ -1331,6 +1392,7 @@ fn render_material_pixel(
     semantic: RegionSemantic,
     face_cavity: f32,
     style: &StyleProfile,
+    model_first: bool,
 ) {
     let current_luma = rgb_luma(pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
     let original_detail = original as f32 - illumination as f32;
@@ -1344,8 +1406,20 @@ fn render_material_pixel(
     // instead of a linear ramp that banded inside large regions.
     let cx = (local_x - 0.5) * 2.0;
     let cy = (local_y - 0.5) * 2.0;
-    let radius = (cx * cx + cy * cy).sqrt().min(1.0);
-    let directional_light = (1.0 - radius) * style.highlight_strength * 8.0;
+    let directional_light = if std::env::var("MANGAHUE_BANDLIGHT_DISABLE").is_err() {
+        // Directional cel lighting: a soft highlight BAND offset toward the
+        // light (top-left) — the lit side lifts, the shadow side stays, the
+        // classic soft-cel light/shadow split across every region.
+        let light_x = -0.55f32;
+        let light_y = -0.84f32;
+        let axis = (cx * light_x + cy * light_y).clamp(-1.0, 1.0); // +1 = lit corner
+        let band = 0.5 + axis * 0.5; // 0 shadow .. 1 lit
+        let band_highlight = ((band - 0.42) / 0.4).clamp(0.0, 1.0);
+        band_highlight * style.highlight_strength * 8.0
+    } else {
+        let radius = (cx * cx + cy * cy).sqrt().min(1.0);
+        (1.0 - radius) * style.highlight_strength * 8.0
+    };
 
     let mut red = color.red;
     let mut blue = color.blue;
@@ -1442,7 +1516,14 @@ fn render_material_pixel(
     let confidence = color.confidence.clamp(0.0, 1.0);
     let existing_red = pixel[0] as f32 - current_luma;
     let existing_blue = pixel[2] as f32 - current_luma;
-    let evidence_blend = (0.28 + confidence * 0.68) * (1.0 - ink).powi(2);
+    let mut evidence_blend = (0.28 + confidence * 0.68) * (1.0 - ink).powi(2);
+    // Model-first pass-through: pixels in a model-derived region keep their
+    // own per-pixel chroma — the region color becomes a gentle nudge (40%%
+    // of the normal blend) instead of a repaint, so the model's local color
+    // variation survives.
+    if model_first && color.model_derived {
+        evidence_blend *= 0.4;
+    }
     let blend = if face_skin {
         evidence_blend.max(0.76 * (1.0 - ink).powi(2))
     } else if semantic_skin {
@@ -1565,7 +1646,8 @@ mod tests {
         };
 
         let report = render_region_graph(
-            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0, false, 48.0, 24.0,
+            40.0, 20.0, 1.3,
         );
 
         let left = image.get_pixel(8, 5);
@@ -1594,7 +1676,8 @@ mod tests {
         };
 
         let report = render_region_graph(
-            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0, false, 48.0, 24.0,
+            40.0, 20.0, 1.3,
         );
 
         let pixel = image.get_pixel(10, 10);
@@ -1614,7 +1697,8 @@ mod tests {
         };
 
         render_region_graph(
-            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0,
+            &mut image, &original, &lines, None, &style, true, 1.0, 1.0, 34.0, false, 48.0, 24.0,
+            40.0, 20.0, 1.3,
         );
 
         let pixel = image.get_pixel(10, 10);
@@ -1656,6 +1740,12 @@ mod tests {
             1.0,
             1.0,
             34.0,
+            false,
+            48.0,
+            24.0,
+            40.0,
+            20.0,
+            1.3,
         );
 
         let bubble = image.get_pixel(12, 12);
@@ -1845,6 +1935,7 @@ mod tests {
             },
             0.8,
             &StyleProfile::default(),
+            false,
         );
 
         assert!(pixel[0] as i16 - pixel[2] as i16 >= 35);
@@ -1885,10 +1976,12 @@ mod tests {
                 blue: -5.0,
                 confidence: 0.4,
                 seeded: true,
+                model_derived: false,
             },
             RegionSemantic::default(),
             0.0,
             &StyleProfile::default(),
+            false,
         );
 
         assert!(pixel[0] as i16 - pixel[2] as i16 >= 25);
@@ -1920,6 +2013,7 @@ mod tests {
             blue: -22.0,
             confidence: 0.7,
             seeded: true,
+            model_derived: false,
         }];
 
         let semantics = infer_region_semantics(&[region], &colors, &original, &lines, Some(&[0.8]));
@@ -1953,6 +2047,7 @@ mod tests {
             blue: -22.0,
             confidence: 0.7,
             seeded: true,
+            model_derived: false,
         }];
 
         let semantics = infer_region_semantics(&[region], &colors, &original, &lines, None);
@@ -1985,12 +2080,14 @@ mod tests {
                 blue: -140.0,
                 confidence: 0.82,
                 seeded: true,
+                model_derived: false,
             },
             RegionColor {
                 red: 24.0,
                 blue: -18.0,
                 confidence: 0.5,
                 seeded: false,
+                model_derived: false,
             },
         ];
         let semantics = [
@@ -2004,7 +2101,15 @@ mod tests {
         let adjacency = [vec![(1, 4.0)], vec![(0, 4.0)]];
         let palette = [(182.0, 28.0, -24.0), (92.0, -8.0, 14.0)];
 
-        chroma_diversity_director(&mut colors, &stats, &adjacency, &semantics, &palette, 34.0);
+        chroma_diversity_director(
+            &mut colors,
+            &stats,
+            &adjacency,
+            &semantics,
+            &palette,
+            34.0,
+            false,
+        );
 
         assert!(natural_skin_chroma(colors[0].red, colors[0].blue));
         assert!(

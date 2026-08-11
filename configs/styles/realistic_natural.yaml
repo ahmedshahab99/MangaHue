@@ -1,7 +1,7 @@
 id: realistic_natural
 name: Realistic Natural
-saturation: 1.0
-contrast: 1.03
+saturation: 1.08
+contrast: 1.06
 brightness: 0.0
 shadow_strength: 0.5
 highlight_strength: 0.25
@@ -56,4 +56,4 @@ palette:
 protected_colors:
   - "#ffffff"
   - "#000000"
-notes: "Realistic natural look: no saturation boost, gentle contrast, low-chroma material palette so skin reads as skin and clothes as fabric."
+notes: "Vibrant natural look: slight saturation boost, gentle contrast lift, low-chroma material palette so skin reads as skin and clothes as fabric — a touch more life than pure real-world flat."

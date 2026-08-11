@@ -12,18 +12,38 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 mod mood;
-use std::sync::{Arc, Mutex};
+mod palette_feedback;
+mod watermark;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: usize = 10;
 const DEFAULT_DAILY_PAGE_LIMIT: usize = 0;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
+/// Cap for user-supplied photos and URL images. 32 MP keeps the full-res
+/// reconstruction buffers (five f32 planes) under ~0.7 GB on the 5.4 GB VPS
+/// while still covering essentially every scanlation page.
+const MAX_PHOTO_PIXELS: u64 = 32_000_000;
+
+/// Max attempts for a Telegram API call before giving up on a transient
+/// failure (5xx, 429, timeout, connection reset). Telegram intermittently
+/// blocks this datacenter IP with 502s; without retries a single blip drops
+/// the delivered page entirely (the engine had already colorized it).
+const TELEGRAM_MAX_ATTEMPTS: usize = 3;
+/// First retry delay in seconds; each retry doubles it (2s, 4s).
+const TELEGRAM_RETRY_BASE_SECS: u64 = 2;
+
+/// Telegram Bot API base URL. Defaults to api.telegram.org; the
+/// `--telegram-api-base` flag / `MANGAHUE_TELEGRAM_API` env can point at a
+/// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
+static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DeliveryFormat {
@@ -60,6 +80,13 @@ struct Args {
     token: Option<String>,
     #[arg(long, default_value = "TELEGRAM_BOT_TOKEN")]
     token_env: String,
+    #[arg(
+        long,
+        env = "MANGAHUE_TELEGRAM_API",
+        default_value = "https://api.telegram.org",
+        help = "Telegram Bot API base URL; point at a Cloudflare Worker or regional proxy when the VPS IP is blocked"
+    )]
+    telegram_api_base: String,
     #[arg(long, default_value = ".mangahue/telegram")]
     work_dir: PathBuf,
     #[arg(
@@ -110,10 +137,20 @@ struct Args {
         help = "Artist palette directory (configs/palettes/*.yaml)"
     )]
     palettes_dir: PathBuf,
+    #[arg(
+        long,
+        help = "Per-chapter palette feedback: extract the first page's dominant hues and merge them as accent colors for the rest of the chapter (creative variety, model-derived)"
+    )]
+    palette_feedback: bool,
     #[arg(long, default_value_t = 2)]
     max_concurrent_jobs: usize,
     #[arg(long, help = "Stop a chapter after the first failed page")]
     fail_fast: bool,
+    #[arg(
+        long,
+        help = "Artifact cache directory: identical re-sent links are served instantly from cache"
+    )]
+    cache_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 30)]
     poll_timeout_seconds: u64,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE, help = "Pages per media-group batch")]
@@ -128,6 +165,11 @@ struct Args {
         help = "Max pages per user per day; 0 disables the daily quota"
     )]
     daily_limit: usize,
+    #[arg(
+        long,
+        help = "Allow standalone photo colorization (off by default: the launch product is chapter links; references via a photo captioned 'ref' always work)"
+    )]
+    photos_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,7 +252,7 @@ struct DailyUsage {
     pages: HashMap<i64, usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PerChatSettings {
     style_path: Option<PathBuf>,
     batch_size: usize,
@@ -221,12 +263,21 @@ struct PerChatSettings {
     auto_palette: bool,
 }
 
+/// A job waiting for a free worker slot (FIFO, shared across all chats).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum QueuedJob {
+    Link { url: String },
+    Photo { file_id: String },
+}
+
 struct BotState {
     active_jobs: AtomicUsize,
     active_chats: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     per_chat_settings: Mutex<HashMap<i64, PerChatSettings>>,
     /// Per-chat job counter driving the creative style rotation.
     job_counter: Mutex<HashMap<i64, u64>>,
+    /// FIFO queue of jobs waiting for a worker slot (chat_id, job).
+    queue: Mutex<VecDeque<(i64, QueuedJob)>>,
     usage_lock: Mutex<()>,
     usage_path: PathBuf,
     daily_limit: usize,
@@ -259,6 +310,85 @@ impl BotState {
     fn finish(&self, chat_id: i64) {
         lock_or_recover(&self.active_chats).remove(&chat_id);
         self.active_jobs.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Add a job to the FIFO queue. Returns its 1-based position, or
+    /// usize::MAX when this chat already has a queued/running job.
+    fn enqueue(&self, chat_id: i64, job: QueuedJob) -> usize {
+        let mut queue = lock_or_recover(&self.queue);
+        if queue.iter().any(|(cid, _)| *cid == chat_id) {
+            return usize::MAX;
+        }
+        queue.push_back((chat_id, job));
+        self.persist_queue_locked(&queue);
+        queue.len()
+    }
+
+    fn queue_len(&self) -> usize {
+        lock_or_recover(&self.queue).len()
+    }
+
+    fn queue_position(&self, chat_id: i64) -> Option<usize> {
+        lock_or_recover(&self.queue)
+            .iter()
+            .position(|(cid, _)| *cid == chat_id)
+    }
+
+    /// Called when a worker slot frees up: start the next queued job.
+    fn try_dispatch_next(
+        self: &Arc<Self>,
+        client: &Client,
+        fetch_client: &Client,
+        token: &str,
+        args: &Args,
+    ) {
+        let next = {
+            let mut queue = lock_or_recover(&self.queue);
+            let mut candidate = None;
+            // Bounded scan: a job whose owner is still active (chat sent a
+            // new request while its previous job was running) cannot start
+            // yet, but must never be dropped — defer it to the back and try
+            // the next one. The scan is bounded by the queue length so a
+            // queue of all-blocked jobs cannot spin forever.
+            let max_scans = queue.len();
+            for _ in 0..max_scans {
+                let Some((cid, job)) = queue.pop_front() else {
+                    break;
+                };
+                if lock_or_recover(&self.active_chats).contains_key(&cid) {
+                    tracing::warn!(
+                        chat_id = cid,
+                        "dispatch deferring queued job: chat still has a running job"
+                    );
+                    queue.push_back((cid, job));
+                    continue;
+                }
+                candidate = Some((cid, job));
+                break;
+            }
+            candidate
+        };
+        // Reflect the pop (or deferral) on disk so a crash cannot resurrect
+        // an already-dispatched job.
+        self.persist_queue();
+        let Some((chat_id, job)) = next else {
+            return;
+        };
+        let Some(cancel_token) = self.try_start(chat_id, args.max_concurrent_jobs) else {
+            // Pool still full (a race) — put the job back at the front.
+            lock_or_recover(&self.queue).push_front((chat_id, job));
+            return;
+        };
+        spawn_job(
+            client.clone(),
+            fetch_client.clone(),
+            token.to_string(),
+            args.clone(),
+            Arc::clone(self),
+            chat_id,
+            job,
+            cancel_token,
+        );
     }
 
     fn is_active(&self, chat_id: i64) -> bool {
@@ -295,6 +425,7 @@ impl BotState {
             auto_palette: false,
         });
         entry.reference_image = Some(path);
+        self.persist_settings_locked(chat_id, &settings);
     }
 
     fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
@@ -307,6 +438,7 @@ impl BotState {
             auto_palette: false,
         });
         entry.style_path = path;
+        self.persist_settings_locked(chat_id, &settings);
     }
 
     fn set_palette(&self, chat_id: i64, path: Option<PathBuf>, auto: bool) {
@@ -320,6 +452,7 @@ impl BotState {
         });
         entry.palette_path = path;
         entry.auto_palette = auto;
+        self.persist_settings_locked(chat_id, &settings);
     }
 
     fn set_batch_size(&self, chat_id: i64, size: usize) {
@@ -332,6 +465,47 @@ impl BotState {
             auto_palette: false,
         });
         entry.batch_size = size.clamp(1, 10);
+        self.persist_settings_locked(chat_id, &settings);
+    }
+
+    /// Settings live in `<work_dir>/settings/chat_<id>.json` so /style,
+    /// /batch, /palette and reference choices survive restarts and deploys.
+    fn settings_dir(&self) -> PathBuf {
+        // usage_path = <work_dir>/usage/daily.json → parent(parent()) is the
+        // work dir; the bot is always started with a work_dir.
+        self.usage_path
+            .parent()
+            .and_then(|usage| usage.parent())
+            .map(|work| work.join("settings"))
+            .unwrap_or_else(|| PathBuf::from("settings"))
+    }
+
+    fn persist_settings_locked(
+        &self,
+        chat_id: i64,
+        settings: &std::sync::MutexGuard<'_, HashMap<i64, PerChatSettings>>,
+    ) {
+        let Some(settings) = settings.get(&chat_id) else {
+            return;
+        };
+        let dir = self.settings_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("chat_{chat_id}.json"));
+        let tmp = path.with_extension("json.tmp");
+        if let Err(error) =
+            std::fs::write(&tmp, serde_json::to_string(settings).unwrap_or_default())
+        {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "failed to persist chat settings"
+            );
+        } else if let Err(error) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "failed to commit chat settings"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Load usage, resetting the counter whenever the stored date is not
@@ -360,8 +534,13 @@ impl BotState {
 
     fn write_usage_atomic(&self, json: &str) {
         let tmp = self.usage_path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.usage_path);
+        if let Err(error) = std::fs::write(&tmp, json) {
+            tracing::warn!(error = format!("{error:#}"), "failed to persist usage file");
+        } else if let Err(error) = std::fs::rename(&tmp, &self.usage_path) {
+            // Windows refuses to rename over an existing file; best-effort
+            // remove + rename keeps quota enforcement working everywhere.
+            tracing::warn!(error = format!("{error:#}"), "failed to commit usage file");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -392,6 +571,50 @@ impl BotState {
         usage.pages.get(&chat_id).copied().unwrap_or(0)
     }
 
+    /// /clean: forget this chat's daily usage (privacy + fresh quota).
+    fn clear_usage(&self, chat_id: i64) {
+        let _guard = lock_or_recover(&self.usage_lock);
+        let mut usage = self.load_usage_locked();
+        usage.pages.remove(&chat_id);
+        if let Ok(json) = serde_json::to_string(&usage) {
+            self.write_usage_atomic(&json);
+        }
+    }
+
+    /// Remove a chat's queued job (used by /cancel for queued work).
+    fn dequeue(&self, chat_id: i64) -> bool {
+        let mut queue = lock_or_recover(&self.queue);
+        let before = queue.len();
+        queue.retain(|(cid, _)| *cid != chat_id);
+        let removed = queue.len() != before;
+        if removed {
+            self.persist_queue_locked(&queue);
+        }
+        removed
+    }
+
+    /// Write the current queue to disk (outside the queue lock).
+    fn persist_queue(&self) {
+        let queue = lock_or_recover(&self.queue);
+        self.persist_queue_locked(&queue);
+    }
+
+    /// The queue is persisted to `<work_dir>/settings/queue.json` so queued
+    /// jobs survive restarts and deploys.
+    fn persist_queue_locked(&self, queue: &std::sync::MutexGuard<'_, VecDeque<(i64, QueuedJob)>>) {
+        let dir = self.settings_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("queue.json");
+        let tmp = path.with_extension("json.tmp");
+        let json = serde_json::to_string(&**queue).unwrap_or_else(|_| "[]".to_string());
+        if let Err(error) = std::fs::write(&tmp, &json) {
+            tracing::warn!(error = format!("{error:#}"), "failed to persist queue");
+        } else if let Err(error) = std::fs::rename(&tmp, &path) {
+            tracing::warn!(error = format!("{error:#}"), "failed to commit queue");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     fn available_styles(&self) -> Vec<(String, String)> {
         let mut styles: Vec<(String, String)> = Vec::new();
         styles.extend(
@@ -404,7 +627,10 @@ impl BotState {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if path.extension().map(|e| e == "json").unwrap_or(false) {
+                        if matches!(
+                            path.extension().and_then(|e| e.to_str()),
+                            Some("json" | "yaml" | "yml")
+                        ) {
                             let id = path
                                 .file_stem()
                                 .and_then(|s| s.to_str())
@@ -498,12 +724,46 @@ fn load_style_name(path: &Path) -> Option<String> {
 }
 
 /// MarkdownV2-safe " Mood: <style name>" suffix for the scan message.
+/// Only the interpolated name is escaped; the literal markers stay literal.
 fn mood_suffix(mood_name: &str) -> String {
     if mood_name.is_empty() {
         String::new()
     } else {
-        format!(" Mood\\: *{}*\\.", mood_name.replace(['_', '-'], "\\_"))
+        format!(" Mood\\: *{}*\\.", md2_escape(mood_name))
     }
+}
+
+/// Escape a string for Telegram MarkdownV2 so interpolated user/artist
+/// names can never break the message or inject formatting.
+fn md2_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '_' | '*'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '~'
+                | '`'
+                | '>'
+                | '#'
+                | '+'
+                | '-'
+                | '='
+                | '|'
+                | '{'
+                | '}'
+                | '.'
+                | '!'
+                | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn main() -> Result<()> {
@@ -511,6 +771,15 @@ fn main() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("mangahue=info")
         .try_init();
+    // Pre-load the ONNX Runtime shared library before anything else: ort
+    // 2.0.0-rc.12 deadlocks on its load-dynamic failure path (pykeio/ort
+    // #560/#604), which triggers in long-lived processes with many shared
+    // libraries already mapped (#579). Loading the library here — while the
+    // process is still clean — makes ort's dlopen a no-op success. Fail fast
+    // instead of hanging on the first job.
+    mangahue_inference::preload_onnx_runtime().with_context(|| {
+        "ONNX Runtime pre-load failed; refusing to start a bot that would hang on every job"
+    })?;
     let token = args
         .token
         .clone()
@@ -527,8 +796,22 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build Telegram HTTP client")?;
     let fetch_client = build_fetch_client()?;
+    let _ = TELEGRAM_API_BASE.set(args.telegram_api_base.trim_end_matches('/').to_string());
 
-    let identity = configure_bot(&client, &token)?;
+    // Startup must survive a Telegram API outage: if getMe fails (502 block,
+    // proxy down), keep retrying instead of exiting into a systemd crash loop.
+    let identity = loop {
+        match configure_bot(&client, &token) {
+            Ok(identity) => break identity,
+            Err(error) => {
+                tracing::error!(
+                    error = format!("{error:#}"),
+                    "Telegram unreachable at startup; retrying in 30s"
+                );
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        }
+    };
     tracing::info!(
         bot_id = identity.id,
         username = identity.username.as_deref().unwrap_or("unknown"),
@@ -566,6 +849,7 @@ fn main() -> Result<()> {
         active_chats: Mutex::new(HashMap::new()),
         per_chat_settings: Mutex::new(HashMap::new()),
         job_counter: Mutex::new(HashMap::new()),
+        queue: Mutex::new(VecDeque::new()),
         usage_lock: Mutex::new(()),
         usage_path,
         daily_limit: args.daily_limit,
@@ -576,6 +860,20 @@ fn main() -> Result<()> {
     // Re-hydrate per-chat reference photos after a restart so users keep
     // their saved style reference.
     restore_reference_photos(&state, &args.work_dir.join("references"));
+    // Re-hydrate /style, /batch, /palette choices and queued jobs so a
+    // deploy never resets user state or silently drops queued work.
+    restore_chat_settings(&state);
+    let restored_queue = restore_persisted_queue(&state);
+    if restored_queue > 0 {
+        tracing::info!(
+            restored = restored_queue,
+            "restored queued jobs after restart"
+        );
+        // The slots are free at boot: start the restored queue immediately.
+        for _ in 0..args.max_concurrent_jobs {
+            state.try_dispatch_next(&client, &fetch_client, &token, &args);
+        }
+    }
 
     let mut offset = None;
     let mut backoff = Duration::from_secs(1);
@@ -720,6 +1018,19 @@ fn process_update(
         }
 
         // Colorize the image directly.
+        // Launch mode is chapter-first: standalone photo colorization is gated
+        // behind --photos-enabled (references captioned "ref"/"style" above
+        // always work).
+        if !args.photos_enabled {
+            let _ = send_message(
+                client,
+                token,
+                chat_id,
+                "Single-photo colorization is coming soon. For now, send a comic chapter link and I will colorize the whole chapter for you!",
+                None,
+            );
+            return Ok(());
+        }
         if state.remaining_pages_today(chat_id) == 0 {
             send_message(
                     client,
@@ -733,65 +1044,85 @@ fn process_update(
                 )?;
             return Ok(());
         }
-        let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
-            send_message(
+        // Fairness first: never jump ahead of an existing queue, and never
+        // take a slot we might abandon — an abandoned slot is leaked forever
+        // (active_jobs never decremented) and wedges the whole bot once all
+        // slots are gone.
+        if state.queue_len() > 0 {
+            let position = state.enqueue(
+                chat_id,
+                QueuedJob::Photo {
+                    file_id: file_id.clone(),
+                },
+            );
+            if position == usize::MAX {
+                send_message(
                     client,
                     token,
                     chat_id,
-                    "A MangaHue job is already active for this chat. Wait for it to finish, or use /cancel.",
+                    "You already have a job queued or running. Wait for it to finish, or use /cancel.",
                     None,
                 )?;
+            } else {
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    &format!(
+                        "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                    ),
+                    None,
+                )?;
+            }
+            return Ok(());
+        }
+        let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
+            // A slot was taken between the queue check and now — queue
+            // instead of blocking (never leak the slot we did not take).
+            let position = state.enqueue(
+                chat_id,
+                QueuedJob::Photo {
+                    file_id: file_id.clone(),
+                },
+            );
+            if position == usize::MAX {
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    "You already have a job queued or running. Wait for it to finish, or use /cancel.",
+                    None,
+                )?;
+            } else {
+                send_message(
+                    client,
+                    token,
+                    chat_id,
+                    &format!(
+                        "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                    ),
+                    None,
+                )?;
+            }
             return Ok(());
         };
         let client = client.clone();
+        let fetch_client = fetch_client.clone();
         let token = token.to_string();
         let args = args.clone();
         let state = Arc::clone(state);
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handle_photo(
-                    &client,
-                    &token,
-                    &args,
-                    &state,
-                    chat_id,
-                    &file_id,
-                    cancel_token,
-                )
-            }));
-            // Always release the chat slot, even on error or panic.
-            state.finish(chat_id);
-            match result {
-                // A returned Err (not a panic) used to be silently dropped,
-                // leaving the user with a stale "Scanning…" message forever.
-                Ok(Err(error)) => {
-                    let _ = send_message(
-                        &client,
-                        &token,
-                        chat_id,
-                        &format!("Could not colorize this image: {error}"),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    let message = if let Some(payload) = error.downcast_ref::<&str>() {
-                        (*payload).to_string()
-                    } else if let Some(payload) = error.downcast_ref::<String>() {
-                        payload.clone()
-                    } else {
-                        "internal error".to_string()
-                    };
-                    let _ = send_message(
-                        &client,
-                        &token,
-                        chat_id,
-                        &format!("Could not colorize this image: {message}"),
-                        None,
-                    );
-                }
-                Ok(Ok(())) => {}
-            }
-        });
+        spawn_job(
+            client,
+            fetch_client,
+            token,
+            args,
+            state,
+            chat_id,
+            QueuedJob::Photo {
+                file_id: file_id.clone(),
+            },
+            cancel_token,
+        );
         return Ok(());
     }
 
@@ -837,7 +1168,7 @@ fn process_update(
         }
     };
 
-    let validation = validate_user_url(&url);
+    let validation = validate_user_url(&url, args.photos_enabled);
     if let Some(warning) = validation.warning {
         send_message(client, token, chat_id, &warning, None)?;
     }
@@ -861,14 +1192,54 @@ fn process_update(
         return Ok(());
     }
 
+    // Fairness first: never jump ahead of an existing queue, and never
+    // take a slot we might abandon (abandoned slots leak forever and wedge
+    // the bot once all slots are gone).
+    if state.queue_len() > 0 {
+        let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
+        if position == usize::MAX {
+            send_message(
+                client,
+                token,
+                chat_id,
+                "You already have a job queued or running. Wait for it to finish, or use /cancel.",
+                None,
+            )?;
+        } else {
+            send_message(
+                client,
+                token,
+                chat_id,
+                &format!(
+                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                ),
+                None,
+            )?;
+        }
+        return Ok(());
+    }
     let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
-        send_message(
-            client,
-            token,
-            chat_id,
-            "A MangaHue job is already active for this chat, or the worker pool is full.",
-            None,
-        )?;
+        // A slot was taken between the queue check and now — queue instead.
+        let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
+        if position == usize::MAX {
+            send_message(
+                client,
+                token,
+                chat_id,
+                "You already have a job queued or running. Wait for it to finish, or use /cancel.",
+                None,
+            )?;
+        } else {
+            send_message(
+                client,
+                token,
+                chat_id,
+                &format!(
+                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                ),
+                None,
+            )?;
+        }
         return Ok(());
     };
 
@@ -877,29 +1248,65 @@ fn process_update(
     let token = token.to_string();
     let args = args.clone();
     let state = Arc::clone(state);
+    spawn_job(
+        client,
+        fetch_client,
+        token,
+        args,
+        state,
+        chat_id,
+        QueuedJob::Link { url: url.clone() },
+        cancel_token,
+    );
+    return Ok(());
+}
+
+/// Spawn a job (link or photo) on a worker thread; on completion, release
+/// the chat slot and dispatch the next queued job. Errors are reported to
+/// the user instead of being dropped.
+fn spawn_job(
+    client: Client,
+    fetch_client: Client,
+    token: String,
+    args: Args,
+    state: Arc<BotState>,
+    chat_id: i64,
+    job: QueuedJob,
+    cancel_token: Arc<AtomicBool>,
+) {
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle_link(
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &job {
+            QueuedJob::Link { url } => handle_link(
                 &client,
                 &fetch_client,
                 &token,
                 &args,
                 &state,
                 chat_id,
-                &url,
+                url,
                 cancel_token,
-            )
+            ),
+            QueuedJob::Photo { file_id } => handle_photo(
+                &client,
+                &token,
+                &args,
+                &state,
+                chat_id,
+                file_id,
+                cancel_token,
+            ),
         }));
+        // Always release the chat slot, even on error or panic.
         state.finish(chat_id);
+        // A slot freed up: start the next queued job (if any).
+        state.try_dispatch_next(&client, &fetch_client, &token, &args);
         match result {
-            // A returned Err (not a panic) used to be silently dropped,
-            // leaving the user with a stale "Scanning…" message forever.
             Ok(Err(error)) => {
                 let _ = send_message(
                     &client,
                     &token,
                     chat_id,
-                    &format!("MangaHue could not finish this link: {error}"),
+                    &format!("MangaHue could not finish this job: {error}"),
                     None,
                 );
             }
@@ -915,14 +1322,13 @@ fn process_update(
                     &client,
                     &token,
                     chat_id,
-                    &format!("MangaHue could not finish this link: {message}"),
+                    &format!("MangaHue could not finish this job: {message}"),
                     None,
                 );
             }
             Ok(Ok(())) => {}
         }
     });
-    Ok(())
 }
 
 fn handle_command(
@@ -945,13 +1351,14 @@ fn handle_command(
         "/start" => cmd_start(client, token, chat_id),
         "/help" => cmd_help(client, token, state, chat_id),
         "/status" => cmd_status(client, token, state, chat_id),
+        "/queue" => cmd_queue(client, token, state, chat_id),
         "/cancel" => cmd_cancel(client, token, state, chat_id),
         "/style" => cmd_style(client, token, state, chat_id, &arg),
         "/palette" => cmd_palette(client, token, state, chat_id, &arg),
         "/batch" => cmd_batch(client, token, state, chat_id, &arg, args.batch_size),
         "/stats" => cmd_stats(client, token, state, chat_id),
         "/clean" => cmd_clean(client, token, state, args, chat_id),
-        "/resetref" => cmd_reset_reference(client, token, state, chat_id),
+        "/resetref" => cmd_reset_reference(client, token, args, state, chat_id),
         "/memory" => cmd_memory(client, token, args, chat_id),
         "/color" => cmd_color(client, token, args, chat_id, &arg),
         _ => {
@@ -977,10 +1384,25 @@ fn cmd_start(client: &Client, token: &str, chat_id: i64) -> Result<()> {
 fn cmd_reset_reference(
     client: &Client,
     token: &str,
+    args: &Args,
     state: &Arc<BotState>,
     chat_id: i64,
 ) -> Result<()> {
     state.set_reference_image(chat_id, PathBuf::new());
+    // Clear the reference on disk too, or it resurrects after a restart
+    // (restore_reference_photos re-registers whatever is on disk).
+    let ref_file = args
+        .work_dir
+        .join("references")
+        .join(format!("chat_{chat_id}.jpg"));
+    if let Err(error) = std::fs::remove_file(&ref_file) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "failed to remove reference file"
+            );
+        }
+    }
     send_message(
         client,
         token,
@@ -1009,7 +1431,7 @@ fn cmd_memory(client: &Client, token: &str, args: &Args, chat_id: i64) -> Result
     Ok(())
 }
 
-/// /color <x> <y> <radius> #RRGGBB â€” add a color memory hint (normalized 0-1 coords).
+/// /color <x> <y> <radius> #RRGGBB — add a color memory hint (normalized 0-1 coords).
 fn cmd_color(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str) -> Result<()> {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     if parts.len() < 4 {
@@ -1017,7 +1439,7 @@ fn cmd_color(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str)
             client,
             token,
             chat_id,
-            "Usage: /color <x> <y> <radius> <hex>  â€” e.g. /color 0.5 0.3 0.05 #f5c9a8 (coordinates are 0-1, relative to the page)",
+            "Usage: /color <x> <y> <radius> <hex>  — e.g. /color 0.5 0.3 0.05 #f5c9a8 (coordinates are 0-1, relative to the page)",
             None,
         )?;
         return Ok(());
@@ -1069,6 +1491,14 @@ fn cmd_color(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str)
         strength: 0.9,
         source: mangahue_core::HintSource::User,
     });
+    // The memory file is re-parsed for every page of every job: cap it so an
+    // automated flood of /color commands cannot balloon it into multi-MB
+    // parses per page. Newest hints are kept (they override older ones).
+    const MAX_USER_HINTS: usize = 200;
+    if file.hints.len() > MAX_USER_HINTS {
+        let split = file.hints.len() - MAX_USER_HINTS;
+        file.hints.drain(..split);
+    }
     std::fs::write(&memory_path, serde_json::to_string_pretty(&file)?)
         .context("failed to save color memory")?;
     send_message(
@@ -1117,15 +1547,20 @@ fn fetch_telegram_file(client: &Client, token: &str, file_id: &str) -> Result<Ve
         file_path: Option<String>,
     }
 
-    let envelope: FileEnvelope = client
-        .get(telegram_url(token, "getFile"))
-        .query(&[("file_id", file_id)])
-        .send()
-        .context("failed to call getFile")?
-        .error_for_status()
-        .context("Telegram getFile failed")?
-        .json()
-        .context("failed to parse getFile response")?;
+    let envelope: FileEnvelope = telegram_retry("getFile", || {
+        // The inner let pins the Deserialize target so the trailing `?` has
+        // an anchor inside the closure (tail-`?` chains confuse inference).
+        let envelope: FileEnvelope = client
+            .get(telegram_url(token, "getFile"))
+            .query(&[("file_id", file_id)])
+            .send()
+            .context("failed to call getFile")?
+            .error_for_status()
+            .context("Telegram getFile failed")?
+            .json()
+            .context("failed to parse getFile response")?;
+        Ok(envelope)
+    })?;
     if !envelope.ok {
         anyhow::bail!(
             "Telegram getFile failed: {}",
@@ -1137,15 +1572,18 @@ fn fetch_telegram_file(client: &Client, token: &str, file_id: &str) -> Result<Ve
         .and_then(|r| r.file_path)
         .ok_or_else(|| anyhow::anyhow!("Telegram did not return a file path"))?;
 
-    let url = format!("https://api.telegram.org/file/bot{token}/{remote_path}");
+    // File downloads live under the same API base so a proxy covers them too.
+    let url = format!("{}/file/bot{token}/{remote_path}", api_base());
     // Cap the body: an unbounded read lets a huge upload fill RAM before
     // any size check runs.
-    let response = client
-        .get(&url)
-        .send()
-        .context("failed to download Telegram file")?
-        .error_for_status()
-        .context("Telegram file download failed")?;
+    let response = telegram_retry("telegram file download", || {
+        client
+            .get(&url)
+            .send()
+            .context("failed to download Telegram file")?
+            .error_for_status()
+            .context("Telegram file download failed")
+    })?;
     use std::io::Read as _;
     let mut reader = response.take(MAX_TELEGRAM_FILE_BYTES + 1);
     let mut bytes = Vec::new();
@@ -1191,7 +1629,7 @@ fn handle_photo(
         client,
         token,
         chat_id,
-        "Got it! Coloring your imageâ€¦ This takes about 3 minutes. You can cancel anytime.",
+        "Got it! Coloring your image… This takes about 3 minutes. You can cancel anytime.",
         Some(&cancel_markup),
     )?;
 
@@ -1218,7 +1656,7 @@ fn handle_photo(
         .context("uploaded file has invalid dimensions")?;
     if img_width > 50_000
         || img_height > 50_000
-        || img_width as u64 * img_height as u64 > 120_000_000
+        || img_width as u64 * img_height as u64 > MAX_PHOTO_PIXELS
     {
         cleanup_dir(&job_dir);
         anyhow::bail!("image dimensions exceed security limits");
@@ -1296,6 +1734,7 @@ fn handle_photo(
         hint_propagation_enabled: args.hint_propagate,
         palette_path: settings.palette_path.clone(),
         auto_palette: settings.auto_palette,
+        cache_dir: args.cache_dir.clone(),
         cancel_token: Some(Arc::clone(&cancel_token)),
         progress_sender: Some(progress_sender),
         ..ColorizeRequest::default()
@@ -1319,24 +1758,36 @@ fn handle_photo(
             );
             let delivery_path =
                 prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
-            send_chat_action(client, token, chat_id, "upload_document")?;
+            // Cosmetic typing indicator: never abort the photo job on this.
+            let _ = send_chat_action(client, token, chat_id, "upload_document");
             if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption) {
                 tracing::error!(error = %e, "send failed");
+                // Never report success without a delivered image, and never
+                // charge quota for a page the user did not receive.
+                let _ = edit_message_with_markup(
+                    client,
+                    token,
+                    chat_id,
+                    status_msg_id,
+                    "The image was colorized but Telegram blocked the delivery (temporary API issue). It was not counted against your quota — please send it again.",
+                    Some(r#"{"inline_keyboard":[]}"#),
+                );
+            } else {
+                state.record_pages(chat_id, 1);
+                let _ = edit_message_with_markup(
+                    client,
+                    token,
+                    chat_id,
+                    status_msg_id,
+                    "Done! Send another photo or a manga chapter link to keep going.",
+                    Some(r#"{"inline_keyboard":[]}"#),
+                );
             }
             if delivery_path != output_path {
                 let _ = std::fs::remove_file(&delivery_path);
             }
             let _ = std::fs::remove_file(&output_path);
             let _ = std::fs::remove_file(&local_path);
-            state.record_pages(chat_id, 1);
-            let _ = edit_message_with_markup(
-                client,
-                token,
-                chat_id,
-                status_msg_id,
-                "Done! Send another photo or a manga chapter link to keep going.",
-                Some(r#"{"inline_keyboard":[]}"#),
-            );
         }
         Err(error) => {
             if cancel_token.load(Ordering::Acquire) {
@@ -1407,15 +1858,42 @@ fn cmd_status(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64)
     } else {
         "No MangaHue job is active for this chat. Send a URL to start."
     };
-    send_message(client, token, chat_id, status, None)?;
+    let queue_len = state.queue_len();
+    let status = if queue_len > 0 {
+        format!("{status}\n{queue_len} job(s) waiting in the queue.")
+    } else {
+        status.to_string()
+    };
+    send_message(client, token, chat_id, &status, None)?;
+    Ok(())
+}
+
+/// /queue — report this chat's position in the FIFO job queue.
+fn cmd_queue(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -> Result<()> {
+    let message = match state.queue_position(chat_id) {
+        Some(position) => format!(
+            "You are #{position} in the queue ({} job(s) waiting total).",
+            state.queue_len()
+        ),
+        None => {
+            if state.is_active(chat_id) {
+                "Your job is running — no queue position.".to_string()
+            } else {
+                "You have no queued jobs. Send a URL to start one.".to_string()
+            }
+        }
+    };
+    send_message(client, token, chat_id, &message, None)?;
     Ok(())
 }
 
 fn cmd_cancel(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -> Result<()> {
-    let status = if state.cancel(chat_id) {
-        "Cancellation requested. MangaHue will stop at the next safe checkpoint."
-    } else {
-        "No active MangaHue job to cancel."
+    let cancelled_active = state.cancel(chat_id);
+    let removed_queued = state.dequeue(chat_id);
+    let status = match (cancelled_active, removed_queued) {
+        (true, _) => "Cancellation requested. MangaHue will stop at the next safe checkpoint.",
+        (false, true) => "Queued job cancelled — nothing was running.",
+        (false, false) => "No active or queued MangaHue job to cancel.",
     };
     send_message(client, token, chat_id, status, None)?;
     Ok(())
@@ -1457,6 +1935,21 @@ fn cmd_palette(
                 return Ok(());
             }
             _ => {
+                // Only plain artist-palette ids are accepted: anything with
+                // separators could walk out of the palette directory.
+                if !arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                {
+                    send_message(
+                        client,
+                        token,
+                        chat_id,
+                        "Palette names may only contain letters, digits, '-' and '_'. Use /palette to see available palettes.",
+                        None,
+                    )?;
+                    return Ok(());
+                }
                 let candidate = dir.join(format!("{arg}.yaml"));
                 if candidate.is_file() {
                     state.set_palette(chat_id, Some(candidate), false);
@@ -1464,7 +1957,10 @@ fn cmd_palette(
                         client,
                         token,
                         chat_id,
-                        &format!("Artist palette set to *{arg}* for this series.",),
+                        &format!(
+                            "Artist palette set to *{}* for this series.",
+                            md2_escape(arg)
+                        ),
                         Some("MarkdownV2"),
                     )?;
                     return Ok(());
@@ -1542,7 +2038,7 @@ fn cmd_style(
                 client,
                 token,
                 chat_id,
-                &format!("Style set to *{}*.", name),
+                &format!("Style set to *{}*.", md2_escape(name)),
                 Some("MarkdownV2"),
             )?;
             return Ok(());
@@ -1746,6 +2242,8 @@ fn cmd_clean(
     {
         let _ = lock_or_recover(&state.per_chat_settings).remove(&chat_id);
     }
+    state.clear_usage(chat_id);
+    removed_any = true;
 
     if removed_any {
         send_message(
@@ -1839,7 +2337,7 @@ fn handle_callback(
                 client,
                 token,
                 chat_id,
-                &format!("Style set to *{}*.", name),
+                &format!("Style set to *{}*.", md2_escape(name)),
                 Some("MarkdownV2"),
             )?;
         }
@@ -1879,7 +2377,7 @@ struct UrlValidation {
     warning: Option<String>,
 }
 
-fn validate_user_url(url: &str) -> UrlValidation {
+fn validate_user_url(url: &str, photos_enabled: bool) -> UrlValidation {
     let parsed = match url::Url::parse(url) {
         Ok(u) => u,
         Err(e) => {
@@ -1907,6 +2405,14 @@ fn validate_user_url(url: &str) -> UrlValidation {
     }
 
     if is_direct_image_url(&parsed) {
+        if !photos_enabled {
+            return UrlValidation {
+                error: Some(
+                    "Single-image colorization is coming soon. Send a comic chapter link and I will colorize the whole chapter!".to_string(),
+                ),
+                warning: None,
+            };
+        }
         return UrlValidation {
             error: None,
             warning: Some("Processing single image...".to_string()),
@@ -1945,6 +2451,12 @@ fn handle_link(
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    // Chapter title for the page watermark (best-effort; failures just mean
+    // the watermark shows page numbers only).
+    let job_title = fetch_page_title(fetch_client, url).unwrap_or_default();
+    if !job_title.is_empty() {
+        tracing::info!(title = %job_title, "chapter title detected for watermark");
+    }
 
     let settings = state.get_settings(chat_id, args.batch_size);
     let cancel_kb = InlineKeyboardMarkup {
@@ -1955,7 +2467,7 @@ fn handle_link(
     let cancel_markup = serde_json::to_string(&cancel_kb).unwrap_or_default();
 
     // Reference: only the chat's own saved reference photo (caption "ref").
-    // No global default and no auto-cover fetch â€” pages colorize with the
+    // No global default and no auto-cover fetch — pages colorize with the
     // soft cel style by default.
     let reference_image = settings
         .reference_image
@@ -1972,35 +2484,11 @@ fn handle_link(
     )?;
 
     let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
-    let page_resp = fetch_client
-        .get(url)
-        .header(USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        .header(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header(REFERER, "https://www.google.com/")
-        .send()
-        .with_context(|| format!("failed to fetch {url}"))?
-        .error_for_status()
-        .with_context(|| format!("server rejected {url}"))?;
-
-    let content_type = page_resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let page_html: Option<String> = if content_type.starts_with("image/") {
-        None
-    } else {
-        // Cap the HTML body: an attacker-controlled public URL could stream
-        // hundreds of MB into RAM otherwise.
-        let mut html_bytes = Vec::new();
-        page_resp
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut html_bytes)
-            .with_context(|| format!("failed to read HTML from {url}"))?;
-        Some(String::from_utf8_lossy(&html_bytes).into_owned())
-    };
+    // The site may be Cloudflare-fronted (allporncomic.com challenges the
+    // rustls TLS fingerprint): the challenge-safe fetch falls back to the
+    // system curl, which passes.
+    let page_html: Option<String> =
+        mangahue_ingest::fetch_html_cloudflare_safe(fetch_client, url, 16 * 1024 * 1024);
 
     let all_image_urls: Vec<String> = match &page_html {
         None => vec![url.to_string()],
@@ -2114,6 +2602,11 @@ fn handle_link(
         page_times: Vec<f32>,
     }
     let counters = std::rc::Rc::new(std::cell::RefCell::new(PageCounters::default()));
+    // Per-chapter palette feedback: the first successful page seeds the
+    // accent palette the rest of the chapter grades toward (model-derived
+    // variety; paper/skin/hair slots in the style stay untouched).
+    let chapter_palette: std::rc::Rc<std::cell::RefCell<Option<Vec<mangahue_core::ColorRgb>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     // Downloads that failed transiently (CDN hiccups) are retried once
     // after the main pass instead of being silently dropped.
     let mut retry_queue: Vec<(usize, String, PathBuf)> = Vec::new();
@@ -2190,6 +2683,8 @@ fn handle_link(
             hint_propagation_enabled: args.hint_propagate,
             palette_path: settings.palette_path.clone(),
             auto_palette: settings.auto_palette,
+            palette_override: chapter_palette.borrow().clone(),
+            cache_dir: args.cache_dir.clone(),
             cancel_token: Some(Arc::clone(&cancel_token)),
             progress_sender: Some(progress_sender),
             ..ColorizeRequest::default()
@@ -2202,6 +2697,21 @@ fn handle_link(
 
         match result {
             Ok(colorize_result) => {
+                // Chapter palette feedback: seed the accents from the first
+                // colored page so later pages of this chapter share its
+                // color universe (deterministic per job, model-derived).
+                if args.palette_feedback && chapter_palette.borrow().is_none() {
+                    if let Ok(image) = image::open(&output_path) {
+                        let accents = palette_feedback::extract_accent_palette(&image.to_rgb8());
+                        if !accents.is_empty() {
+                            tracing::info!(
+                                accents = accents.len(),
+                                "chapter palette feedback: seeded accents from first page"
+                            );
+                            *chapter_palette.borrow_mut() = Some(accents);
+                        }
+                    }
+                }
                 if cancel_token.load(Ordering::Acquire) {
                     let _ = edit_message_with_markup(
                         client,
@@ -2214,16 +2724,54 @@ fn handle_link(
                     cleanup_dir(&job_dir);
                     return Ok(true);
                 }
-                let caption = format!(
-                    "MangaHue p.{} | {}",
-                    position + 1,
-                    colorize_result
-                        .report
-                        .director_verdict
-                        .unwrap_or_else(|| "colored".to_string())
-                );
+                let verdict = colorize_result
+                    .report
+                    .director_verdict
+                    .clone()
+                    .unwrap_or_else(|| "colored".to_string());
+                // Compact page color metrics for the caption (saturation +
+                // colorfulness from the color_metrics stage, e.g. "| s=19% c=35").
+                let mut metrics = String::new();
+                for stage in &colorize_result.report.stage_reports {
+                    if stage.name == "color_metrics" {
+                        let sat = stage.metrics.get("avg_saturation").copied().unwrap_or(0.0);
+                        let cf = stage.metrics.get("colorfulness").copied().unwrap_or(0.0);
+                        if sat > 0.0 || cf > 0.0 {
+                            metrics = format!(" | s={:.0}% c={:.0}", sat * 100.0, cf);
+                        }
+                        break;
+                    }
+                }
+                let caption = format!("MangaHue p.{} | {}{}", position + 1, verdict, metrics);
                 let delivery_path =
                     prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+                // Page watermark: manga title + page number on the image.
+                if let Ok(mut page_image) = image::open(&delivery_path) {
+                    let mut rgb = page_image.to_rgb8();
+                    watermark::draw_page_watermark(
+                        &mut rgb,
+                        &job_title,
+                        position + 1,
+                        effective_total,
+                    );
+                    // Re-encode with the configured quality: plain save()
+                    // would silently drop JPEG quality to the crate default
+                    // (80) and soften every delivered page.
+                    if matches!(args.delivery_format, DeliveryFormat::Jpeg) {
+                        use image::codecs::jpeg::JpegEncoder;
+                        let mut file = std::fs::File::create(&delivery_path)?;
+                        let mut encoder =
+                            JpegEncoder::new_with_quality(&mut file, args.jpeg_quality);
+                        encoder.encode(
+                            rgb.as_raw(),
+                            rgb.width(),
+                            rgb.height(),
+                            image::ExtendedColorType::Rgb8,
+                        )?;
+                    } else {
+                        let _ = rgb.save(&delivery_path);
+                    }
+                }
                 ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
                 // Cosmetic typing indicator: never abort the chapter on this.
                 let _ = send_chat_action(client, token, chat_id, "upload_document");
@@ -2232,13 +2780,15 @@ fn handle_link(
                     c.failed += 1;
                 } else {
                     c.sent += 1;
+                    // Quota is charged only for pages actually delivered:
+                    // retrying failed pages must not double-charge.
+                    state.record_pages(chat_id, 1);
                 }
                 if delivery_path != output_path {
                     let _ = std::fs::remove_file(&delivery_path);
                 }
                 let _ = std::fs::remove_file(&output_path);
                 let _ = std::fs::remove_file(local_path);
-                state.record_pages(chat_id, 1);
             }
             Err(error) => {
                 if cancel_token.load(Ordering::Acquire) {
@@ -2253,17 +2803,30 @@ fn handle_link(
                     cleanup_dir(&job_dir);
                     return Ok(true);
                 }
+                // Evidence for undecodable pages: file existence, size and
+                // magic bytes of the exact file that failed, plus the full
+                // error chain (Debug shows every context level).
+                let file_evidence = std::fs::read(local_path).ok().map(|bytes| {
+                    let magic = if bytes.len() >= 12 {
+                        format!("{} {} {} {}", bytes[0], bytes[1], bytes[2], bytes[3])
+                    } else {
+                        format!("only {} bytes", bytes.len())
+                    };
+                    format!("exists size={} first_bytes=[{magic}]", bytes.len())
+                });
+                let file_evidence = file_evidence.unwrap_or_else(|| "file missing".to_string());
+                tracing::warn!(
+                    page = position + 1,
+                    file = %file_evidence,
+                    error = format!("{error:#}"),
+                    "page colorization failed, continuing"
+                );
                 c.failed += 1;
                 c.failed_pages.push(local_path.clone());
                 if args.fail_fast {
                     cleanup_dir(&job_dir);
                     return Err(error);
                 }
-                tracing::warn!(
-                    page = position + 1,
-                    error = %error,
-                    "page colorization failed, continuing"
-                );
             }
         }
 
@@ -2453,11 +3016,11 @@ fn format_progress(
         total_batches
     );
     if failed > 0 {
-        text.push_str(&format!(" | Failed: {failed}"));
+        text.push_str(&format!(" \\| Failed: {failed}"));
     }
     if let Some(e) = eta {
         if e > 0.0 {
-            text.push_str(&format!(" | ETA: ~{:.0}s", e));
+            text.push_str(&format!(" \\| ETA: \\~{:.0}s", e));
         }
     }
     text
@@ -2465,12 +3028,12 @@ fn format_progress(
 
 fn progress_bar(done: usize, total: usize, width: usize) -> String {
     if total == 0 {
-        return "â–‘".repeat(width);
+        return "░".repeat(width);
     }
     let filled = ((done as f64 / total as f64) * width as f64).round() as usize;
     let filled = filled.min(width);
     let empty = width.saturating_sub(filled);
-    format!("{}{}", "â–“".repeat(filled), "â–‘".repeat(empty))
+    format!("{}{}", "▓".repeat(filled), "░".repeat(empty))
 }
 
 fn estimate_eta(times: &[f32], done: usize, total: usize) -> Option<f32> {
@@ -2602,7 +3165,9 @@ fn download_image_url_telegram(
                     .header(REFERER, referer)
                     .header(
                         ACCEPT,
-                        "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+                        // No image/avif: the image crate build has no avif
+                        // decoder, and nhentai serves avif when asked for it.
+                        "image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
                     )
                     .timeout(Duration::from_secs(60))
                     .send()
@@ -2626,6 +3191,42 @@ fn download_image_url_telegram(
                 if !content_type.starts_with("image/") && !has_image_magic(&data) {
                     anyhow::bail!("URL returned non-image content ({content_type})");
                 }
+                // Header-only dimension validation BEFORE decode: a small
+                // file with a huge IHDR would otherwise allocate gigabytes
+                // at decode time (decode bomb).
+                let (img_width, img_height) = image::ImageReader::new(std::io::Cursor::new(&data))
+                    .with_guessed_format()
+                    .with_context(|| {
+                        format!(
+                            "URL returned undecodable image content ({content_type}, {} bytes)",
+                            data.len()
+                        )
+                    })?
+                    .into_dimensions()
+                    .with_context(|| {
+                        format!(
+                            "URL image has invalid dimensions ({content_type}, {} bytes)",
+                            data.len()
+                        )
+                    })?;
+                if img_width > 50_000
+                    || img_height > 50_000
+                    || img_width as u64 * img_height as u64 > MAX_PHOTO_PIXELS
+                {
+                    anyhow::bail!("image dimensions exceed security limits");
+                }
+                // Decode-verify BEFORE writing: throttled CDN hosts sometimes
+                // return 200 with an HTML error body or an undecodable
+                // variant (e.g. avif) under an image/* content type. Writing
+                // such a file makes the whole colorize job fail later with a
+                // confusing "failed to load" — retrying the sibling hosts
+                // here instead usually gets the real image.
+                image::load_from_memory(&data).with_context(|| {
+                    format!(
+                        "URL returned undecodable image content ({content_type}, {} bytes)",
+                        data.len()
+                    )
+                })?;
                 if let Some(parent) = output.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -2778,6 +3379,99 @@ fn restore_reference_photos(state: &BotState, references_dir: &Path) {
     }
 }
 
+/// After a restart, reload per-chat settings (/style, /batch, /palette,
+/// reference photo) from `<work_dir>/settings/chat_<id>.json`.
+fn restore_chat_settings(state: &BotState) {
+    let dir = state.settings_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut restored = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        let Some(chat_str) = name_str
+            .strip_prefix("chat_")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(chat_id) = chat_str.parse::<i64>() else {
+            continue;
+        };
+        let Ok(data) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(settings) = serde_json::from_str::<PerChatSettings>(&data) else {
+            continue;
+        };
+        // Never point at a reference file that is gone (the user may have
+        // used /clean or /resetref while the bot was down).
+        let settings = PerChatSettings {
+            reference_image: settings.reference_image.filter(|p| p.is_file()),
+            ..settings
+        };
+        lock_or_recover(&state.per_chat_settings).insert(chat_id, settings);
+        restored += 1;
+    }
+    if restored > 0 {
+        tracing::info!(restored, "restored per-chat settings after restart");
+    }
+}
+
+/// After a restart, re-queue jobs that were waiting when the bot stopped.
+/// Returns how many were restored.
+fn restore_persisted_queue(state: &BotState) -> usize {
+    let path = state.settings_dir().join("queue.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let Ok(queue) = serde_json::from_str::<Vec<(i64, QueuedJob)>>(&data) else {
+        return 0;
+    };
+    if queue.is_empty() {
+        return 0;
+    }
+    {
+        let mut current = lock_or_recover(&state.queue);
+        for (chat_id, job) in queue {
+            // Never double-queue a chat that is already represented.
+            if !current.iter().any(|(cid, _)| *cid == chat_id) {
+                current.push_back((chat_id, job));
+            }
+        }
+        let restored = current.len();
+        drop(current);
+        // The queue file is now authoritative again (dedup may have shrunk
+        // it, and dispatch will keep it updated from here on).
+        state.persist_queue();
+        return restored;
+    }
+}
+
+/// Best-effort chapter title extraction from the page HTML `<title>` tag
+/// (nhentai-style galleries put the manga name first). Failures return
+/// None — the watermark then shows page numbers only.
+fn fetch_page_title(client: &Client, url: &str) -> Option<String> {
+    // Cloudflare-fronted sites challenge rustls: use the curl fallback too.
+    let html = mangahue_ingest::fetch_html_cloudflare_safe(client, url, 1024 * 1024)?;
+    let start = html.find("<title")?;
+    let gt = html[start..].find('>')? + start + 1;
+    let end = html[gt..].find("</title")? + gt;
+    let mut title = html[gt..end].trim().to_string();
+    // "Manga Title - Other stuff" → keep the first segment.
+    if let Some((head, _)) = title.split_once(" - ") {
+        title = head.trim().to_string();
+    }
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
 fn humanize_stage(stage: &str) -> &str {
     match stage {
         "queued" => "queued",
@@ -2798,57 +3492,74 @@ fn get_updates(
     offset: Option<i64>,
     timeout: u64,
 ) -> Result<Vec<Update>> {
-    let url = telegram_url(token, "getUpdates");
-    let mut body = json!({
-        "timeout": timeout,
-        "allowed_updates": ["message", "callback_query"]
-    });
-    if let Some(offset) = offset {
-        body["offset"] = json!(offset);
-    }
-    let envelope: TelegramEnvelope<Vec<Update>> = client
-        .post(url)
-        .json(&body)
-        .send()
-        .context("failed to call getUpdates")?
-        .error_for_status()
-        .context("Telegram getUpdates failed")?
-        .json()
-        .context("failed to parse getUpdates response")?;
-    telegram_result(envelope)
+    telegram_retry("getUpdates", || {
+        let url = telegram_url(token, "getUpdates");
+        let mut body = json!({
+            "timeout": timeout,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        if let Some(offset) = offset {
+            body["offset"] = json!(offset);
+        }
+        let envelope: TelegramEnvelope<Vec<Update>> = client
+            .post(url)
+            .json(&body)
+            .send()
+            .context("failed to call getUpdates")?
+            .error_for_status()
+            .context("Telegram getUpdates failed")?
+            .json()
+            .context("failed to parse getUpdates response")?;
+        telegram_result(envelope)
+    })
 }
 
 fn configure_bot(client: &Client, token: &str) -> Result<BotIdentity> {
-    let identity: TelegramEnvelope<BotIdentity> = client
-        .get(telegram_url(token, "getMe"))
-        .send()
-        .context("failed to call getMe")?
-        .error_for_status()
-        .context("Telegram getMe failed")?
-        .json()
-        .context("failed to parse getMe response")?;
+    let identity: TelegramEnvelope<BotIdentity> = telegram_retry("getMe", || {
+        // Inner annotation: tail-`?` chains without a local type anchor
+        // confuse the Deserialize inference inside the retry closure.
+        let envelope: TelegramEnvelope<BotIdentity> = client
+            .get(telegram_url(token, "getMe"))
+            .send()
+            .context("failed to call getMe")?
+            .error_for_status()
+            .context("Telegram getMe failed")?
+            .json()
+            .context("failed to parse getMe response")?;
+        Ok(envelope)
+    })?;
     let identity = telegram_result(identity)?;
-    let commands: TelegramEnvelope<bool> = client
-        .post(telegram_url(token, "setMyCommands"))
-        .json(&json!({
-            "commands": [
-                {"command": "start", "description": "Show MangaHue instructions"},
-                {"command": "help", "description": "Show all commands and usage"},
-                {"command": "status", "description": "Check the active chapter job"},
-                {"command": "cancel", "description": "Cancel the active chapter job"},
-                {"command": "style", "description": "List and choose color styles"},
-                {"command": "batch", "description": "Show or set batch size (1-10)"},
-                {"command": "stats", "description": "Show daily page usage"},
-                {"command": "clean", "description": "Delete all your job data"}
-            ]
-        }))
-        .send()
-        .context("failed to call setMyCommands")?
-        .error_for_status()
-        .context("Telegram setMyCommands failed")?
-        .json()
-        .context("failed to parse setMyCommands response")?;
-    let _ = telegram_result(commands)?;
+    // Registering commands is best-effort: a failure here must never block
+    // startup (the bot stays usable without the command menu).
+    if let Err(error) = telegram_retry("setMyCommands", || {
+        let commands: TelegramEnvelope<bool> = client
+            .post(telegram_url(token, "setMyCommands"))
+            .json(&json!({
+                "commands": [
+                    {"command": "start", "description": "Show MangaHue instructions"},
+                    {"command": "help", "description": "Show all commands and usage"},
+                    {"command": "status", "description": "Check the active chapter job"},
+                    {"command": "cancel", "description": "Cancel the active chapter job"},
+                    {"command": "style", "description": "List and choose color styles"},
+                    {"command": "batch", "description": "Show or set batch size (1-10)"},
+                    {"command": "stats", "description": "Show daily page usage"},
+                    {"command": "clean", "description": "Delete all your job data"}
+                ]
+            }))
+            .send()
+            .context("failed to call setMyCommands")?
+            .error_for_status()
+            .context("Telegram setMyCommands failed")?
+            .json()
+            .context("failed to parse setMyCommands response")?;
+        let _ = telegram_result(commands)?;
+        Ok(())
+    }) {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "failed to register bot commands"
+        );
+    }
     Ok(identity)
 }
 
@@ -2859,31 +3570,33 @@ fn send_message(
     text: &str,
     parse_mode_or_markup: Option<&str>,
 ) -> Result<i64> {
-    let mut body = json!({
-        "chat_id": chat_id,
-        "text": text
-    });
+    telegram_retry("sendMessage", || {
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text
+        });
 
-    if let Some(pm) = parse_mode_or_markup {
-        if pm.starts_with('{') {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(pm) {
-                body["reply_markup"] = parsed;
+        if let Some(pm) = parse_mode_or_markup {
+            if pm.starts_with('{') {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(pm) {
+                    body["reply_markup"] = parsed;
+                }
+            } else {
+                body["parse_mode"] = json!(pm);
             }
-        } else {
-            body["parse_mode"] = json!(pm);
         }
-    }
 
-    let envelope: TelegramEnvelope<SentMessage> = client
-        .post(telegram_url(token, "sendMessage"))
-        .json(&body)
-        .send()
-        .context("failed to call sendMessage")?
-        .error_for_status()
-        .context("Telegram sendMessage failed")?
-        .json()
-        .context("failed to parse sendMessage response")?;
-    Ok(telegram_result(envelope)?.message_id)
+        let envelope: TelegramEnvelope<SentMessage> = client
+            .post(telegram_url(token, "sendMessage"))
+            .json(&body)
+            .send()
+            .context("failed to call sendMessage")?
+            .error_for_status()
+            .context("Telegram sendMessage failed")?
+            .json()
+            .context("failed to parse sendMessage response")?;
+        Ok(telegram_result(envelope)?.message_id)
+    })
 }
 
 fn edit_message(
@@ -2906,48 +3619,52 @@ fn edit_message_with_markup(
     text: &str,
     markup: Option<&str>,
 ) -> Result<()> {
-    let mut body = json!({
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text
-    });
-    if text.contains('*') || text.contains('`') {
-        body["parse_mode"] = json!("MarkdownV2");
-    }
-    if let Some(markup) = markup {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(markup) {
-            body["reply_markup"] = parsed;
+    telegram_retry("editMessageText", || {
+        let mut body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text
+        });
+        if text.contains('*') || text.contains('`') {
+            body["parse_mode"] = json!("MarkdownV2");
         }
-    }
+        if let Some(markup) = markup {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(markup) {
+                body["reply_markup"] = parsed;
+            }
+        }
 
-    let envelope: TelegramEnvelope<serde_json::Value> = client
-        .post(telegram_url(token, "editMessageText"))
-        .json(&body)
-        .send()
-        .context("failed to call editMessageText")?
-        .error_for_status()
-        .context("Telegram editMessageText failed")?
-        .json()
-        .context("failed to parse editMessageText response")?;
-    let _ = telegram_result(envelope)?;
-    Ok(())
+        let envelope: TelegramEnvelope<serde_json::Value> = client
+            .post(telegram_url(token, "editMessageText"))
+            .json(&body)
+            .send()
+            .context("failed to call editMessageText")?
+            .error_for_status()
+            .context("Telegram editMessageText failed")?
+            .json()
+            .context("failed to parse editMessageText response")?;
+        let _ = telegram_result(envelope)?;
+        Ok(())
+    })
 }
 
 fn send_chat_action(client: &Client, token: &str, chat_id: i64, action: &str) -> Result<()> {
-    let envelope: TelegramEnvelope<serde_json::Value> = client
-        .post(telegram_url(token, "sendChatAction"))
-        .json(&json!({
-            "chat_id": chat_id,
-            "action": action
-        }))
-        .send()
-        .context("failed to call sendChatAction")?
-        .error_for_status()
-        .context("Telegram sendChatAction failed")?
-        .json()
-        .context("failed to parse sendChatAction response")?;
-    let _ = telegram_result(envelope)?;
-    Ok(())
+    telegram_retry("sendChatAction", || {
+        let envelope: TelegramEnvelope<serde_json::Value> = client
+            .post(telegram_url(token, "sendChatAction"))
+            .json(&json!({
+                "chat_id": chat_id,
+                "action": action
+            }))
+            .send()
+            .context("failed to call sendChatAction")?
+            .error_for_status()
+            .context("Telegram sendChatAction failed")?
+            .json()
+            .context("failed to parse sendChatAction response")?;
+        let _ = telegram_result(envelope)?;
+        Ok(())
+    })
 }
 
 fn send_document(
@@ -2957,22 +3674,26 @@ fn send_document(
     path: &Path,
     caption: &str,
 ) -> Result<()> {
-    let form = Form::new()
-        .text("chat_id", chat_id.to_string())
-        .text("caption", caption.to_string())
-        .file("document", path)
-        .with_context(|| format!("failed to attach {}", path.display()))?;
-    let envelope: TelegramEnvelope<serde_json::Value> = client
-        .post(telegram_url(token, "sendDocument"))
-        .multipart(form)
-        .send()
-        .context("failed to call sendDocument")?
-        .error_for_status()
-        .context("Telegram sendDocument failed")?
-        .json()
-        .context("failed to parse sendDocument response")?;
-    let _ = telegram_result(envelope)?;
-    Ok(())
+    // The multipart form is rebuilt on every attempt: a failed request
+    // consumes it, and the file must be re-attached for the next try.
+    telegram_retry("sendDocument", || {
+        let form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", caption.to_string())
+            .file("document", path)
+            .with_context(|| format!("failed to attach {}", path.display()))?;
+        let envelope: TelegramEnvelope<serde_json::Value> = client
+            .post(telegram_url(token, "sendDocument"))
+            .multipart(form)
+            .send()
+            .context("failed to call sendDocument")?
+            .error_for_status()
+            .context("Telegram sendDocument failed")?
+            .json()
+            .context("failed to parse sendDocument response")?;
+        let _ = telegram_result(envelope)?;
+        Ok(())
+    })
 }
 
 fn answer_callback_query(
@@ -2982,27 +3703,45 @@ fn answer_callback_query(
     text: Option<&str>,
     show_alert: Option<bool>,
 ) -> Result<()> {
-    let mut body = json!({
-        "callback_query_id": callback_query_id
-    });
-    if let Some(t) = text {
-        body["text"] = json!(t);
-    }
-    if let Some(a) = show_alert {
-        body["show_alert"] = json!(a);
-    }
-    let envelope: TelegramEnvelope<serde_json::Value> = client
-        .post(telegram_url(token, "answerCallbackQuery"))
-        .json(&body)
-        .send()
-        .context("failed to call answerCallbackQuery")?
-        .error_for_status()
-        .context("Telegram answerCallbackQuery failed")?
-        .json()
-        .context("failed to parse answerCallbackQuery response")?;
-    let _ = telegram_result(envelope)?;
-    Ok(())
+    telegram_retry("answerCallbackQuery", || {
+        let mut body = json!({
+            "callback_query_id": callback_query_id
+        });
+        if let Some(t) = text {
+            body["text"] = json!(t);
+        }
+        if let Some(a) = show_alert {
+            body["show_alert"] = json!(a);
+        }
+        let envelope: TelegramEnvelope<serde_json::Value> = client
+            .post(telegram_url(token, "answerCallbackQuery"))
+            .json(&body)
+            .send()
+            .context("failed to call answerCallbackQuery")?
+            .error_for_status()
+            .context("Telegram answerCallbackQuery failed")?
+            .json()
+            .context("failed to parse answerCallbackQuery response")?;
+        let _ = telegram_result(envelope)?;
+        Ok(())
+    })
 }
+
+/// A Telegram API error returned inside a JSON envelope (ok:false), kept
+/// typed so the retry helper can tell transient wording ("too many requests")
+/// from permanent rejections ("message is not modified").
+#[derive(Debug)]
+struct TelegramApiError {
+    description: String,
+}
+
+impl std::fmt::Display for TelegramApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Telegram API error: {}", self.description)
+    }
+}
+
+impl std::error::Error for TelegramApiError {}
 
 fn telegram_result<T>(envelope: TelegramEnvelope<T>) -> Result<T> {
     if envelope.ok {
@@ -3010,17 +3749,83 @@ fn telegram_result<T>(envelope: TelegramEnvelope<T>) -> Result<T> {
             .result
             .context("Telegram response was ok but had no result")
     } else {
-        anyhow::bail!(
-            "Telegram API error: {}",
-            envelope
+        Err(TelegramApiError {
+            description: envelope
                 .description
-                .unwrap_or_else(|| "unknown error".to_string())
-        );
+                .unwrap_or_else(|| "unknown error".to_string()),
+        }
+        .into())
     }
 }
 
+/// Retry a Telegram API call on transient failures. Permanent errors (4xx
+/// validation, blocked users, "message is not modified") fail immediately;
+/// everything else gets up to [TELEGRAM_MAX_ATTEMPTS] tries with exponential
+/// backoff. This is what keeps a chapter alive through the 502/504 gateway
+/// storms this bot has already survived.
+fn telegram_retry<T>(label: &str, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut delay = Duration::from_secs(TELEGRAM_RETRY_BASE_SECS);
+    let mut round = 1u32;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if round < TELEGRAM_MAX_ATTEMPTS as u32 && is_transient_telegram_error(&error) =>
+            {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    attempt = round,
+                    retry_in_secs = delay.as_secs(),
+                    "{label} transient failure, retrying"
+                );
+                std::thread::sleep(delay);
+                delay *= 2;
+                round += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// True when a Telegram call failed in a way a retry can fix: HTTP 5xx and
+/// 429 (the 502/504 gateway storms this bot has seen), timeouts, connection
+/// errors, and "too many requests" style envelope errors.
+fn is_transient_telegram_error(error: &anyhow::Error) -> bool {
+    if let Some(request_error) = error.downcast_ref::<reqwest::Error>() {
+        return request_error.is_timeout()
+            || request_error.is_connect()
+            || request_error.is_request()
+            || request_error.is_status()
+                && request_error
+                    .status()
+                    .is_some_and(|status| status.is_server_error() || status.as_u16() == 429);
+    }
+    if let Some(api) = error.downcast_ref::<TelegramApiError>() {
+        let description = api.description.to_lowercase();
+        return description.contains("too many requests")
+            || description.contains("retry after")
+            || description.contains("flood");
+    }
+    // Unknown error kinds are permanent by default: retrying wastes ~6s per
+    // call and, on the polling thread, stalls every other user. Transient
+    // HTTP/gateway failures are already classified above.
+    false
+}
+
+/// The configured Bot API base URL (defaults to the official endpoint).
+fn api_base() -> &'static str {
+    TELEGRAM_API_BASE
+        .get()
+        .map(String::as_str)
+        .unwrap_or("https://api.telegram.org")
+}
+
 fn telegram_url(token: &str, method: &str) -> String {
-    format!("https://api.telegram.org/bot{token}/{method}")
+    telegram_url_at(api_base(), token, method)
+}
+
+fn telegram_url_at(base: &str, token: &str, method: &str) -> String {
+    format!("{base}/bot{token}/{method}")
 }
 
 fn first_url(text: &str) -> Option<String> {
@@ -3072,6 +3877,7 @@ mod tests {
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
             job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
@@ -3106,12 +3912,15 @@ mod tests {
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
             job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
+
+        // No job can start when the pool is full.
         let first = state.try_start(10, 1).unwrap();
         assert!(state.try_start(10, 1).is_none());
         assert!(state.try_start(11, 1).is_none());
@@ -3124,6 +3933,32 @@ mod tests {
     }
 
     #[test]
+    fn queue_is_fifo_and_dedups_per_chat() {
+        let state = BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            usage_lock: Mutex::new(()),
+            usage_path: PathBuf::from("test_usage.json"),
+            daily_limit: 100,
+            styles_dir: None,
+            palettes_dir: PathBuf::from("configs/palettes"),
+        };
+        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "a".into() }), 1);
+        assert_eq!(state.enqueue(2, QueuedJob::Link { url: "b".into() }), 2);
+        // Duplicate chat must not enqueue twice.
+        assert_eq!(
+            state.enqueue(1, QueuedJob::Link { url: "c".into() }),
+            usize::MAX
+        );
+        assert_eq!(state.queue_len(), 2);
+        assert_eq!(state.queue_position(2), Some(1));
+        assert_eq!(state.queue_position(9), None);
+    }
+
+    #[test]
     fn zero_daily_limit_means_unlimited_access() {
         let dir = tempfile::tempdir().unwrap();
         let state = BotState {
@@ -3131,6 +3966,7 @@ mod tests {
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
             job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
@@ -3138,6 +3974,7 @@ mod tests {
             palettes_dir: PathBuf::from("configs/palettes"),
         };
 
+        // No daily limit means unlimited page usage.
         state.record_pages(42, 250);
         assert_eq!(state.pages_used_today(42), 250);
         assert_eq!(state.remaining_pages_today(42), usize::MAX);
@@ -3165,6 +4002,7 @@ mod tests {
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
             job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 100,
@@ -3181,15 +4019,19 @@ mod tests {
 
     #[test]
     fn validates_direct_image_urls() {
-        let v = validate_user_url("https://example.com/page.png");
+        let v = validate_user_url("https://example.com/page.png", true);
         assert!(v.error.is_none());
         assert!(v.warning.is_some());
 
-        let v = validate_user_url("https://example.com/chapter/1");
+        // Photos disabled (launch mode): direct image URLs are refused.
+        let v = validate_user_url("https://example.com/page.png", false);
+        assert!(v.error.is_some());
+
+        let v = validate_user_url("https://example.com/chapter/1", true);
         assert!(v.error.is_none());
         assert!(v.warning.is_none());
 
-        let v = validate_user_url("http://127.0.0.1/page.png");
+        let v = validate_user_url("http://127.0.0.1/page.png", true);
         assert!(v.error.is_some());
     }
 
@@ -3255,8 +4097,95 @@ mod tests {
 
     #[test]
     fn formats_progress_bar_correctly() {
-        assert_eq!(progress_bar(0, 10, 10), "â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘â–‘");
-        assert_eq!(progress_bar(5, 10, 10), "â–“â–“â–“â–“â–“â–‘â–‘â–‘â–‘â–‘");
-        assert_eq!(progress_bar(10, 10, 10), "â–“â–“â–“â–“â–“â–“â–“â–“â–“â–“");
+        assert_eq!(progress_bar(0, 10, 10), "░░░░░░░░░░");
+        assert_eq!(progress_bar(5, 10, 10), "▓▓▓▓▓░░░░░");
+        assert_eq!(progress_bar(10, 10, 10), "▓▓▓▓▓▓▓▓▓▓");
+    }
+
+    #[test]
+    fn md2_escape_handles_all_specials() {
+        assert_eq!(md2_escape("plain name"), "plain name");
+        assert_eq!(md2_escape("a_b*c(d)"), "a\\_b\\*c\\(d\\)");
+        assert_eq!(
+            md2_escape("Natural Manga (default)"),
+            "Natural Manga \\(default\\)"
+        );
+        assert_eq!(md2_escape("x~y.z!"), "x\\~y\\.z\\!");
+    }
+
+    #[test]
+    fn dequeue_removes_only_the_chats_job() {
+        let state = BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            usage_lock: Mutex::new(()),
+            usage_path: PathBuf::from("test_usage.json"),
+            daily_limit: 0,
+            styles_dir: None,
+            palettes_dir: PathBuf::from("configs/palettes"),
+        };
+        let mut queue = lock_or_recover(&state.queue);
+        queue.push_back((
+            1,
+            QueuedJob::Photo {
+                file_id: "a".into(),
+            },
+        ));
+        queue.push_back((
+            2,
+            QueuedJob::Photo {
+                file_id: "b".into(),
+            },
+        ));
+        drop(queue);
+
+        assert!(state.dequeue(1));
+        assert!(!state.dequeue(1));
+        assert_eq!(state.queue_len(), 1);
+        assert_eq!(state.queue_position(2), Some(0));
+    }
+
+    #[test]
+    fn slot_lifecycle_never_leaks_with_queue_fairness_order() {
+        // Regression for the C1 slot leak: the photo/link paths now check
+        // the queue BEFORE taking a slot, so a request that gets queued can
+        // never hold a slot. Verify the two primitives together: a queued
+        // chat consumes no slot, and finishing releases the slot for the
+        // next job.
+        let state = BotState {
+            active_jobs: AtomicUsize::new(0),
+            active_chats: Mutex::new(HashMap::new()),
+            per_chat_settings: Mutex::new(HashMap::new()),
+            job_counter: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            usage_lock: Mutex::new(()),
+            usage_path: PathBuf::from("test_usage.json"),
+            daily_limit: 0,
+            styles_dir: None,
+            palettes_dir: PathBuf::from("configs/palettes"),
+        };
+        // Chat 1 takes the only slot in a 1-slot pool.
+        let cancel = state.try_start(1, 1).unwrap();
+        // Chat 2 is queued (as the fixed call sites do when the queue is
+        // non-empty): it must not hold a slot.
+        state.enqueue(
+            2,
+            QueuedJob::Photo {
+                file_id: "b".into(),
+            },
+        );
+        assert_eq!(state.active_jobs.load(Ordering::Acquire), 1);
+        assert!(state.try_start(2, 1).is_none());
+        // Job 1 finishes: slot freed, dispatch starts the queued job.
+        state.finish(1);
+        drop(cancel);
+        assert_eq!(state.active_jobs.load(Ordering::Acquire), 0);
+        let next_cancel = state.try_start(2, 1).unwrap();
+        state.finish(2);
+        drop(next_cancel);
+        assert_eq!(state.active_jobs.load(Ordering::Acquire), 0);
     }
 }

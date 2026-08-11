@@ -64,11 +64,12 @@ pub fn load_image(path: impl AsRef<Path>) -> Result<MangaImage> {
     // Validate dimensions from the header BEFORE decoding: a crafted image
     // with a huge IHDR would otherwise allocate gigabytes at decode time.
     if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
-        if let Ok((width, height)) = image::image_dimensions(path) {
+        if let Ok((width, height)) = image_dimensions_magic_first(path) {
             validate_image_dimensions(width, height, name)?;
         }
     }
-    let image = image::open(path).with_context(|| format!("failed to load {}", path.display()))?;
+    let image = open_image_magic_first(path)
+        .with_context(|| format!("failed to load {}", path.display()))?;
     let (width, height) = image.dimensions();
     validate_image_dimensions(width, height, "image")?;
     let size = ImageSize::new(width, height);
@@ -87,6 +88,38 @@ pub fn load_image(path: impl AsRef<Path>) -> Result<MangaImage> {
         is_webtoon_like: height > width.saturating_mul(3),
     };
     Ok(MangaImage { info, image })
+}
+
+/// Open an image by sniffing its CONTENT (magic bytes) instead of trusting
+/// the file extension. `image::open` decodes by extension, so a JPEG served
+/// under a `.png` URL (common with CDNs) fails with "Invalid PNG signature"
+/// even though the bytes are perfectly decodable.
+pub fn open_image_magic_first(path: impl AsRef<Path>) -> Result<image::DynamicImage> {
+    let path = path.as_ref();
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    image::ImageReader::new(std::io::BufReader::new(file))
+        .with_guessed_format()
+        .with_context(|| {
+            format!(
+                "failed to guess image format for {} (extension-based open would have used the file extension)",
+                path.display()
+            )
+        })?
+        .decode()
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+/// Content-sniffed dimensions (magic-first), same rationale as
+/// [`open_image_magic_first`].
+pub fn image_dimensions_magic_first(path: impl AsRef<Path>) -> Result<(u32, u32)> {
+    let path = path.as_ref();
+    image::ImageReader::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess format for {}", path.display()))?
+        .into_dimensions()
+        .with_context(|| format!("failed to read dimensions for {}", path.display()))
 }
 
 pub fn import_chapter_to_dir(
@@ -495,7 +528,7 @@ fn import_chapter_archive(
 }
 
 fn chapter_page_from_path(index: usize, path: &Path) -> Result<ChapterPage> {
-    let (width, height) = image::image_dimensions(path)
+    let (width, height) = image_dimensions_magic_first(path)
         .with_context(|| format!("failed to inspect image dimensions for {}", path.display()))?;
     validate_image_dimensions(width, height, &path.display().to_string())?;
     let bytes = fs::metadata(path)

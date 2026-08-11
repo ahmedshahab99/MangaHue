@@ -7,7 +7,9 @@ use std::io::Read;
 use std::time::Duration;
 use url::Url;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Browser-like UA used for all site fetches. Also used by the
+/// Cloudflare-safe fetch fallback (curl) in the ingest lib.
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 #[derive(Debug)]
 pub enum MangaSite {
@@ -16,6 +18,8 @@ pub enum MangaSite {
     Manganato,
     Ehentai,
     Imhentai,
+    AllPornComic,
+    IlikeComix,
     Generic,
 }
 
@@ -36,6 +40,10 @@ impl MangaSite {
             Self::Ehentai
         } else if host.contains("imhentai.xxx") || host.contains("imhentai.com") {
             Self::Imhentai
+        } else if host.contains("allporncomic.com") || host.contains("allporncomic.net") {
+            Self::AllPornComic
+        } else if host.contains("ilikecomix.com") {
+            Self::IlikeComix
         } else {
             Self::Generic
         }
@@ -55,6 +63,8 @@ pub fn extract_manga_urls(
         MangaSite::Manganato => extract_manganato(html, base, max_pages),
         MangaSite::Ehentai => extract_ehentai(client, url, html, base, max_pages),
         MangaSite::Imhentai => extract_imhentai(html, base, max_pages),
+        MangaSite::AllPornComic => extract_madara(client, url, html, base, max_pages),
+        MangaSite::IlikeComix => extract_madara(client, url, html, base, max_pages),
         MangaSite::Generic => extract_generic(html, base, max_pages),
     }
 }
@@ -701,6 +711,163 @@ fn extract_imhentai(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Stri
     Ok(urls.into_iter().take(max_pages).collect())
 }
 
+// ── Madara / wp-manga theme sites (allporncomic.com, ilikecomix.com) ─────
+// Both run the same Madara reader: chapter pages carry the page images as
+// `.reading-content img.wp-manga-chapter-img` with lazy `data-src` attrs
+// (allporncomic even puts a leading space in data-src — trimmed here).
+//
+// allporncomic:  series https://allporncomic.com/porncomic/<slug>/
+//                chapter https://allporncomic.com/porncomic/<slug>/<chapter>/
+// ilikecomix:    series https://ilikecomix.com/manga/c/<slug>/
+//                chapter https://ilikecomix.com/manga/c/<slug>/<chapter>/
+//
+// A series URL resolves to its most recent chapter (the first chapter link
+// in the page, matching the "Read Last" button the site itself uses).
+fn extract_madara(
+    client: &Client,
+    url: &Url,
+    html: &str,
+    base: &Url,
+    max_pages: usize,
+) -> Result<Vec<String>> {
+    let chapter_html = if is_madara_series_page(url) {
+        match first_madara_chapter(html, base) {
+            Some(chapter_url) => {
+                // Follow the chapter link: series pages have no page images.
+                // Cloudflare-fronted variants (allporncomic) challenge
+                // rustls: use the challenge-safe fetch (curl fallback);
+                // non-challenged sites (ilikecomix) take the reqwest path.
+                match crate::fetch_html_cloudflare_safe(
+                    client,
+                    chapter_url.as_str(),
+                    16 * 1024 * 1024,
+                ) {
+                    Some(fetched) => fetched,
+                    None => {
+                        anyhow::bail!("failed to load chapter page {chapter_url} for series {url}");
+                    }
+                }
+            }
+            None => {
+                anyhow::bail!("no chapters found on series page {url} (is it a chapter URL?)");
+            }
+        }
+    } else {
+        html.to_string()
+    };
+
+    let document = Html::parse_document(&chapter_html);
+    let urls = parse_madara_chapter(&document, base, max_pages)?;
+    if urls.is_empty() {
+        anyhow::bail!("no page images found in the Madara chapter");
+    }
+    Ok(urls)
+}
+
+/// Extract the ordered page images from a parsed Madara chapter page.
+fn parse_madara_chapter(document: &Html, base: &Url, max_pages: usize) -> Result<Vec<String>> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Precise reader selector: only the chapter's own page images (covers,
+    // avatars and ad slots live outside .reading-content).
+    collect_madara_images(
+        document,
+        ".reading-content img.wp-manga-chapter-img",
+        base,
+        &mut urls,
+        &mut seen,
+    );
+    // Defensive fallback: some Madara variants omit the class and only keep
+    // plain images inside the reader container.
+    if urls.len() < 2 {
+        collect_madara_images(document, ".reading-content img", base, &mut urls, &mut seen);
+    }
+    Ok(urls.into_iter().take(max_pages).collect())
+}
+
+fn collect_madara_images(
+    document: &Html,
+    selector_text: &str,
+    base: &Url,
+    urls: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    let Ok(sel) = Selector::parse(selector_text) else {
+        return;
+    };
+    for img in document.select(&sel) {
+        for attr in &["data-src", "src"] {
+            let Some(raw) = img.value().attr(attr) else {
+                continue;
+            };
+            let candidate = normalize_embedded_url(raw);
+            if candidate.is_empty() || candidate.starts_with("data:") {
+                continue;
+            }
+            if let Ok(abs) = base.join(&candidate) {
+                let mut abs = abs;
+                abs.set_fragment(None);
+                let normalized = abs.to_string();
+                if seen.insert(normalized.clone()) {
+                    urls.push(normalized);
+                }
+            }
+        }
+    }
+}
+
+/// Series pages: /porncomic/<slug>/ (allporncomic, 2 segments) or
+/// /manga/c/<slug>/ (ilikecomix, 3 segments). Chapter pages have one more
+/// path segment than the series page.
+fn is_madara_series_page(url: &Url) -> bool {
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|segments| segments.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    (segments.len() == 2 && segments[0] == "porncomic")
+        || (segments.len() == 3 && segments[0] == "manga" && segments[1] == "c")
+}
+
+/// First chapter link on a series page (the site's own "Read Last" button).
+fn first_madara_chapter(html: &str, base: &Url) -> Option<Url> {
+    let document = Html::parse_document(html);
+    // Prefer the explicit "Read Last" button, then the chapter list, then a
+    // site-specific deep link (allporncomic only has the /porncomic/ prefix;
+    // ilikecomix uses /manga/c/).
+    for selector_text in [
+        "#btn-read-last[href]",
+        "li.wp-manga-chapter a[href]",
+        "a[href*='/porncomic/']",
+        "a[href*='/manga/c/']",
+    ] {
+        let Ok(sel) = Selector::parse(selector_text) else {
+            continue;
+        };
+        for a in document.select(&sel) {
+            let Some(href) = a.value().attr("href") else {
+                continue;
+            };
+            if let Ok(abs) = base.join(href) {
+                if is_madara_chapter_url(&abs) {
+                    return Some(abs);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A chapter URL has one segment beyond the series prefix.
+fn is_madara_chapter_url(url: &Url) -> bool {
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|segments| segments.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    (segments.len() == 3 && segments[0] == "porncomic")
+        || (segments.len() == 4 && segments[0] == "manga" && segments[1] == "c")
+}
+
 // ── Generic ──────────────────────────────────────────────────────────────
 fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<String>> {
     let document = Html::parse_document(html);
@@ -1010,6 +1177,196 @@ mod tests {
     fn detects_nhentai_url() {
         let url = Url::parse("https://nhentai.net/g/177013/").unwrap();
         assert!(matches!(MangaSite::detect(&url), MangaSite::Nhentai));
+    }
+
+    #[test]
+    fn detects_allporncomic_url() {
+        let url = Url::parse(
+            "https://allporncomic.com/porncomic/2-x-1-lunch-dragon-ball-yamamoto/1-2-x-1-lunch/",
+        )
+        .unwrap();
+        assert!(matches!(MangaSite::detect(&url), MangaSite::AllPornComic));
+    }
+
+    #[test]
+    fn detects_ilikecomix_url() {
+        let url = Url::parse(
+            "https://ilikecomix.com/manga/c/bubble-butt-princess-jabcomix/8-bubble-butt-princess-issue-8/",
+        )
+        .unwrap();
+        assert!(matches!(MangaSite::detect(&url), MangaSite::IlikeComix));
+    }
+
+    #[test]
+    fn madara_series_page_detection() {
+        let apc_series = Url::parse("https://allporncomic.com/porncomic/some-comic/").unwrap();
+        let apc_chapter =
+            Url::parse("https://allporncomic.com/porncomic/some-comic/chapter-1/").unwrap();
+        let ilc_series = Url::parse("https://ilikecomix.com/manga/c/some-comic/").unwrap();
+        let ilc_chapter =
+            Url::parse("https://ilikecomix.com/manga/c/some-comic/chapter-1/").unwrap();
+        assert!(is_madara_series_page(&apc_series));
+        assert!(!is_madara_series_page(&apc_chapter));
+        assert!(is_madara_series_page(&ilc_series));
+        assert!(!is_madara_series_page(&ilc_chapter));
+        // Homepage / category pages are not series pages either.
+        let home = Url::parse("https://allporncomic.com/").unwrap();
+        let cat = Url::parse("https://allporncomic.com/porncomic-cat/hentaib/").unwrap();
+        assert!(!is_madara_series_page(&home));
+        assert!(!is_madara_series_page(&cat));
+    }
+
+    #[test]
+    fn allporncomic_chapter_extracts_reader_images_only() {
+        // Real markup from allporncomic.com: wp-manga-chapter-img elements
+        // with a LEADING SPACE in data-src (site quirk), plus a cover image
+        // and a lazy placeholder that must NOT leak into the result.
+        let html = r#"
+<div class="reading-content">
+  <img id="image-0" data-src=" https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//abc/01_PAGE001.jpg" class="wp-manga-chapter-img img-responsive lazyload-ordered effect-fade">
+  <img id="image-1" data-src=" https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//abc/02_PAGE002.jpg" class="wp-manga-chapter-img img-responsive lazyload-ordered effect-fade">
+  <img id="image-2" src="https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//abc/03_PAGE003.jpg" class="wp-manga-chapter-img img-responsive">
+</div>
+<img class="img-responsive" src="data:image/svg+xml;base64,PHN2Zz4=" data-src="https://cdn.allporncomic.com/wp-content/uploads/2018/12/books-stack-of-three-1.png">
+"#;
+        let base = Url::parse("https://allporncomic.com/porncomic/some-comic/chapter-1/").unwrap();
+        let urls = parse_madara_chapter(&Html::parse_document(html), &base, 100).unwrap();
+        assert_eq!(urls.len(), 3);
+        assert_eq!(
+            urls[0],
+            "https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//abc/01_PAGE001.jpg"
+        );
+        assert_eq!(
+            urls[2],
+            "https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//abc/03_PAGE003.jpg"
+        );
+    }
+
+    #[test]
+    fn madara_series_page_picks_read_last_button() {
+        let html = r#"
+<ul class="wp-manga-chapters">
+  <li class="wp-manga-chapter"><a href="https://allporncomic.com/porncomic/some-comic/chapter-3/">Chapter 3</a></li>
+  <li class="wp-manga-chapter"><a href="https://allporncomic.com/porncomic/some-comic/chapter-2/">Chapter 2</a></li>
+</ul>
+<a href="https://allporncomic.com/porncomic/some-comic/chapter-3/" id="btn-read-last" class="c-btn c-btn_style-1">Read Last</a>
+"#;
+        let base = Url::parse("https://allporncomic.com/porncomic/some-comic/").unwrap();
+        let chapter = first_madara_chapter(html, &base).unwrap();
+        assert_eq!(
+            chapter.as_str(),
+            "https://allporncomic.com/porncomic/some-comic/chapter-3/"
+        );
+    }
+
+    #[test]
+    fn madara_ilikecomix_series_picks_first_chapter_link() {
+        let html = r#"
+<ul class="wp-manga-chapters">
+  <li class="wp-manga-chapter"><a href="https://ilikecomix.com/manga/c/some-comic/1-first-issue/">Issue 1</a></li>
+  <li class="wp-manga-chapter"><a href="https://ilikecomix.com/manga/c/some-comic/2-second-issue/">Issue 2</a></li>
+</ul>
+"#;
+        let base = Url::parse("https://ilikecomix.com/manga/c/some-comic/").unwrap();
+        let chapter = first_madara_chapter(html, &base).unwrap();
+        assert_eq!(
+            chapter.as_str(),
+            "https://ilikecomix.com/manga/c/some-comic/1-first-issue/"
+        );
+    }
+
+    #[test]
+    fn allporncomic_chapter_without_class_falls_back_to_reader() {
+        let html = r#"
+<div class="reading-content">
+  <img data-src="https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//x/1.jpg">
+  <img data-src="https://cdn.allporncomic.com/wp-content/uploads/WP-manga/data//x/2.jpg">
+</div>
+"#;
+        let base = Url::parse("https://allporncomic.com/porncomic/some-comic/chapter-1/").unwrap();
+        let urls = parse_madara_chapter(&Html::parse_document(html), &base, 100).unwrap();
+        assert_eq!(urls.len(), 2);
+    }
+
+    /// Live check against the real site (run with `-- --ignored`; not part
+    /// of the default offline suite).
+    #[test]
+    #[ignore = "network"]
+    fn live_allporncomic_chapter_extraction() {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(UA)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = Url::parse(
+            "https://allporncomic.com/porncomic/2-x-1-lunch-dragon-ball-yamamoto/1-2-x-1-lunch/",
+        )
+        .unwrap();
+        // The site is Cloudflare-fronted and challenges rustls: exercise the
+        // same challenge-safe path the bot uses (curl fallback).
+        let html = crate::fetch_html_cloudflare_safe(&client, url.as_str(), 16 * 1024 * 1024)
+            .expect("chapter HTML should fetch (reqwest or curl fallback)");
+        assert!(html.contains("reading-content"));
+        let urls = extract_madara(&client, &url, &html, &url, 500).unwrap();
+        assert!(urls.len() >= 30, "expected ~35 pages, got {}", urls.len());
+        assert!(
+            urls[0].contains("WP-manga/data"),
+            "unexpected first URL: {}",
+            urls[0]
+        );
+        assert!(urls[0].starts_with("https://cdn.allporncomic.com/"));
+    }
+
+    /// A series URL must resolve to its most recent chapter's pages.
+    #[test]
+    #[ignore = "network"]
+    fn live_allporncomic_series_follows_latest_chapter() {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(UA)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url =
+            Url::parse("https://allporncomic.com/porncomic/2-x-1-lunch-dragon-ball-yamamoto/")
+                .unwrap();
+        let html = crate::fetch_html_cloudflare_safe(&client, url.as_str(), 16 * 1024 * 1024)
+            .expect("series HTML should fetch (reqwest or curl fallback)");
+        let urls = extract_madara(&client, &url, &html, &url, 500).unwrap();
+        assert!(
+            urls.len() >= 30,
+            "series URL should follow to the latest chapter, got {} pages",
+            urls.len()
+        );
+        assert!(urls[0].contains("WP-manga/data"));
+    }
+
+    /// ilikecomix.com — same Madara reader, no Cloudflare challenge.
+    #[test]
+    #[ignore = "network"]
+    fn live_ilikecomix_chapter_extraction() {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(UA)
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let url = Url::parse(
+            "https://ilikecomix.com/manga/c/bubble-butt-princess-jabcomix/8-bubble-butt-princess-issue-8/",
+        )
+        .unwrap();
+        let html = crate::fetch_html_cloudflare_safe(&client, url.as_str(), 16 * 1024 * 1024)
+            .expect("chapter HTML should fetch");
+        assert!(html.contains("reading-content"));
+        let urls = extract_madara(&client, &url, &html, &url, 500).unwrap();
+        assert!(
+            urls.len() >= 10,
+            "expected many pages, got {}",
+            urls.len()
+        );
+        assert!(
+            urls[0].contains("WP-manga/data"),
+            "unexpected first URL: {}",
+            urls[0]
+        );
     }
 
     #[test]

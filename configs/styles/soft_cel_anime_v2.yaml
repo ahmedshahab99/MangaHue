@@ -1,0 +1,61 @@
+id: soft_cel_anime_v2
+name: Soft Cel Anime v2
+saturation: 1.0
+contrast: 1.05
+brightness: 0.0
+shadow_strength: 0.45
+highlight_strength: 0.3
+line_strength: 1.0
+# Soft cel-shaded anime: clean region-aware base colors, warm skin, large
+# dark/light hair masses, folds guided by the line art. Moderate saturation,
+# NEUTRAL ambient lighting (the warm cast is kept gentle so pages never turn
+# brown/orange); shadows stay simple and readable.
+palette:
+  # skin (warm, low chroma)
+  - "#efc7ae"
+  - "#e3b296"
+  - "#d8a086"
+  - "#c98d74"
+  - "#f2d8c4"
+  # hair (natural dark + variety)
+  - "#3a3038"
+  - "#4d4038"
+  - "#5c4a3a"
+  - "#6b5a4e"
+  - "#2e2a33"
+  - "#8a6a52"
+  # clothing — blues
+  - "#4a6fa5"
+  - "#2f5d8a"
+  - "#5b8fc0"
+  - "#1e3a5f"
+  # clothing — reds / pinks
+  - "#b34a4a"
+  - "#c25f5f"
+  - "#d4817a"
+  # clothing — greens
+  - "#4d7c5a"
+  - "#6d9a6a"
+  - "#3c6b50"
+  # clothing — purples
+  - "#7a5c8f"
+  - "#6a4d7a"
+  # clothing — yellows / khakis (kept muted — pages read yellow fast)
+  - "#b8954e"
+  - "#9c8f6a"
+  # fabric neutrals
+  - "#8a7a6e"
+  - "#a89a8e"
+  # backgrounds — cool
+  - "#9fb4c7"
+  - "#7d93a8"
+  - "#b8c4d0"
+  # backgrounds — neutral (cool beige, NOT yellow cream: bright neutral
+  # regions dominate manga pages and warm creams turned them yellow)
+  - "#c8c2b4"
+  - "#b6b0a4"
+  - "#dedad2"
+protected_colors:
+  - "#ffffff"
+  - "#000000"
+notes: "Soft cel semi-realistic with de-warmed ambient: gentle shading, natural skin, distinct materials, cool+warm backgrounds, no brown cast."

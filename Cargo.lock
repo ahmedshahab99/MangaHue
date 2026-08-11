@@ -1640,12 +1640,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
+ "libloading",
  "mangahue-core",
  "ndarray",
  "ort",
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
  "uuid",
 ]
 
@@ -1654,6 +1656,7 @@ name = "mangahue-ingest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "reqwest",
  "scraper",
  "serde",
@@ -1796,12 +1799,15 @@ dependencies = [
 name = "mangahue-telegram"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "chrono",
  "clap",
  "image",
+ "imageproc",
  "mangahue-core",
  "mangahue-export",
+ "mangahue-inference",
  "mangahue-ingest",
  "mangahue-orchestrator",
  "reqwest",

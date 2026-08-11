@@ -5,7 +5,8 @@
 #     --preset configs/engine.studio.yaml \
 #     --style configs/styles/target_style.yaml
 # Rollback to the fast tier: --model models/ddcolor-tiny-fp16.onnx
-# (the bot's production preset is engine.ensemble.yaml — unchanged).
+# (the bot's production preset is engine.telegram-hq.yaml with
+# models/ddcolor-full-fp16.onnx — see configs/systemd/mangahue-pro.service).
 engine:
   mode: quality
   parallel_jobs: 1

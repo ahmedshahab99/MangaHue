@@ -72,6 +72,12 @@ pub struct ColorizeRequest {
     /// fingerprint (brightness/contrast) from the scene palettes.
     #[serde(default)]
     pub auto_palette: bool,
+    /// Per-chapter accent palette extracted from the manga's own colored
+    /// output. Merged into the style palette's accent slots (>= 9) before
+    /// scene re-weighting, so each manga gets its own color universe while
+    /// paper/skin/hair slots stay natural.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_override: Option<Vec<ColorRgb>>,
     /// Client-side draft: a colorized image produced OUTSIDE the engine
     /// (e.g. by the WebGPU web app). When set, the orchestrator skips model
     /// inference and uses the draft as the model output, then runs the full
@@ -230,6 +236,57 @@ impl MangaHueEngine {
         };
 
         let manga_image = load_image(&request.input_path)?;
+
+        // Already-colored pass-through: full-color western comics are
+        // common, and re-colorizing them wastes inference time and distorts
+        // the artist's original palette. Measured on the ORIGINAL input
+        // before any preprocessing.
+        if config.engine.skip_already_colored {
+            let (mean_sat, colored_fraction) = measure_page_colorfulness(&manga_image.image);
+            let already_colored = mean_sat >= config.engine.already_colored_sat_threshold
+                && colored_fraction >= config.engine.already_colored_colored_fraction;
+            report.add_stage_report(
+                StageReport::new("color_metrics")
+                    .metric("avg_saturation", mean_sat as f64)
+                    .metric("colorfulness", (colored_fraction * 100.0) as f64)
+                    .metric("already_colored", if already_colored { 1.0 } else { 0.0 }),
+            );
+            if already_colored {
+                report.warn(format!(
+                    "page already colored (mean sat {mean_sat:.3}, colored share {colored_fraction:.3}); passing through untouched"
+                ));
+                info!(
+                    mean_sat,
+                    colored_fraction, "already-colored page passed through without inference"
+                );
+                save_rgb(&request.output_path, &manga_image.image.to_rgb8())?;
+                emit_progress(&progress, "done", 6, 6, None);
+                report.total_ms = total_start.elapsed().as_millis();
+                report.director_verdict = Some("already colored".to_string());
+                report.add_stage_report(
+                    StageReport::new("postprocess")
+                        .note("skipped: page already colored, original passed through"),
+                );
+                if config.output.write_report {
+                    let path = mangahue_image::sibling_with_suffix(
+                        &request.output_path,
+                        ".report",
+                        "json",
+                    );
+                    fs::write(&path, serde_json::to_string_pretty(&report)?)
+                        .with_context(|| format!("failed to write report {}", path.display()))?;
+                }
+                return Ok(ColorizeResult {
+                    output_path: request.output_path,
+                    report,
+                    quality_report_path: None,
+                    confidence_map_path: None,
+                    idempotency_key: None,
+                    from_cache: false,
+                });
+            }
+        }
+
         let resized = mangahue_image::resize_to_max(
             &manga_image.image,
             config.preprocess.max_input_dimension,
@@ -281,6 +338,15 @@ impl MangaHueEngine {
                 palette_path.display()
             ));
             palette_style.palette = colors;
+        }
+        if let Some(accents) = request.palette_override.as_deref() {
+            if !accents.is_empty() {
+                report.warn(format!(
+                    "chapter palette accents merged: {} color(s)",
+                    accents.len()
+                ));
+                palette_style.palette = merge_artist_accents(&palette_style.palette, accents);
+            }
         }
         let scene_style = {
             let mut adapted = palette_style.clone();
@@ -780,6 +846,34 @@ impl MangaHueEngine {
         let mut merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
 
+        // The model's own chroma signal: mean opponent magnitude of the
+        // inference output, measured before any postprocess. The smart
+        // governor uses it as this page's color budget.
+        let chroma_signal = {
+            let (mw, mh) = merged.dimensions();
+            let total = (mw as usize).saturating_mul(mh as usize);
+            let step = (total / 100_000).max(1);
+            let mut sum = 0.0f64;
+            let mut n = 0u64;
+            for (x, y, pixel) in merged.enumerate_pixels() {
+                let index = y as usize * mw as usize + x as usize;
+                if index % step != 0 {
+                    continue;
+                }
+                let r = pixel[0] as f32;
+                let g = pixel[1] as f32;
+                let b = pixel[2] as f32;
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                sum += ((r - luma).abs() + (b - luma).abs()) as f64;
+                n += 1;
+            }
+            if n > 0 {
+                Some((sum / n as f64) as f32)
+            } else {
+                None
+            }
+        };
+
         cross_tile_coherence(
             &mut merged,
             &preprocess.line_mask,
@@ -858,6 +952,7 @@ impl MangaHueEngine {
             style: &scene_style,
             config: &config.postprocess,
             reference_image: reference_image.as_ref(),
+            chroma_signal,
         })?;
         if check_cancel(&cancel) {
             return Err(anyhow!("colorization cancelled during postprocess"));
@@ -927,6 +1022,39 @@ impl MangaHueEngine {
                 .metric(
                     "tone_pixels_preserved",
                     postprocess_report.tone_pixels_preserved as f64,
+                )
+                .metric(
+                    "model_pixels_overridden",
+                    postprocess_report.model_pixels_overridden as f64,
+                )
+                .metric(
+                    "palette_fill_pixels",
+                    postprocess_report.palette_fill_pixels as f64,
+                )
+                .metric(
+                    "model_chroma_retention",
+                    postprocess_report.model_chroma_retention as f64,
+                )
+                .metric(
+                    "mean_hue_shift_deg",
+                    postprocess_report.mean_hue_shift_deg as f64,
+                ),
+        );
+        // Standard page color metrics (avg RGB, brightness, saturation,
+        // colorfulness, contrast) measured on the final working-res image.
+        let color_metrics = mangahue_eval::analyze_color_metrics(&final_image);
+        report.add_stage_report(
+            StageReport::new("color_metrics")
+                .metric("avg_r", color_metrics.avg_rgb[0] as f64)
+                .metric("avg_g", color_metrics.avg_rgb[1] as f64)
+                .metric("avg_b", color_metrics.avg_rgb[2] as f64)
+                .metric("brightness", color_metrics.brightness as f64)
+                .metric("avg_saturation", color_metrics.avg_saturation as f64)
+                .metric("colorfulness", color_metrics.colorfulness as f64)
+                .metric("contrast", color_metrics.contrast as f64)
+                .metric(
+                    "chroma_signal",
+                    chroma_signal.map(|v| v as f64).unwrap_or(0.0),
                 ),
         );
         if let Some(raster) = &region_lock_raster {
@@ -1218,6 +1346,19 @@ fn select_backend_for_model(
             reference_path,
         )?));
     }
+    #[cfg(feature = "native-onnx")]
+    if mangahue_inference::is_style2paints_onnx_model(model_path) {
+        // Style2Paints V3: full-RGB cel output, native Rust session.
+        return Ok(Box::new(
+            mangahue_inference::Style2PaintsV3OnnxBackend::shared(model_path)?,
+        ));
+    }
+    #[cfg(not(feature = "native-onnx"))]
+    if is_style2paints_model_name(model_path) {
+        anyhow::bail!(
+            "Style2Paints models require the native-onnx build (mangahue-telegram/mangahue-cli are built with it)"
+        );
+    }
     if mangahue_inference::is_ddcolor_onnx_model(model_path) {
         #[cfg(feature = "native-onnx")]
         {
@@ -1488,6 +1629,62 @@ fn resolve_parallel_jobs(requested: usize) -> usize {
     }
 }
 
+/// Style2Paints ONNX models are identified by file name; the native-onnx
+/// build also verifies the file exists (see mangahue-inference). Kept here
+/// so non-native builds can still produce a clear error for them.
+fn is_style2paints_model_name(path: &Path) -> bool {
+    path.extension().and_then(|value| value.to_str()) == Some("onnx")
+        && path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("style2paints"))
+}
+
+/// Measure how colorful a page already is: (mean HSV saturation over
+/// non-paper/non-ink pixels, share of those pixels with real color). A
+/// grayscale scan sits near (0.00-0.03, 0.00); a colored page is typically
+/// (0.15-0.45, 0.4-0.9). Sampled (<= 200k pixels) so the check costs
+/// milliseconds even on huge pages.
+fn measure_page_colorfulness(image: &image::DynamicImage) -> (f32, f32) {
+    let rgb = image.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let total = w as usize * h as usize;
+    let step = (total / 200_000).max(1);
+    let mut sat_sum = 0.0f64;
+    let mut sat_n = 0u64;
+    let mut colored = 0u64;
+    for (x, y, pixel) in rgb.enumerate_pixels() {
+        let index = y as usize * w as usize + x as usize;
+        if index % step != 0 {
+            continue;
+        }
+        let r = pixel[0] as f32 / 255.0;
+        let g = pixel[1] as f32 / 255.0;
+        let b = pixel[2] as f32 / 255.0;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        // Skip pure paper (white) and pure ink (black): they dominate
+        // every manga page and would dilute the color signal.
+        if !(0.10..0.96).contains(&luma) {
+            continue;
+        }
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        sat_sum += sat as f64;
+        sat_n += 1;
+        if sat > 0.15 {
+            colored += 1;
+        }
+    }
+    if sat_n == 0 {
+        return (0.0, 0.0);
+    }
+    (
+        (sat_sum / sat_n as f64) as f32,
+        colored as f32 / sat_n as f32,
+    )
+}
+
 fn build_pool(jobs: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(jobs.max(1))
@@ -1650,6 +1847,45 @@ mod tests {
 
         assert_eq!(&merged[..9], &base[..9]);
         assert_eq!(&merged[9..11], accents.as_slice());
+    }
+
+    #[test]
+    fn colorfulness_detects_grayscale_vs_colored_pages() {
+        use image::RgbImage;
+        // A pure grayscale page: near-zero saturation everywhere.
+        let mut gray = RgbImage::new(64, 64);
+        for (x, y, p) in gray.enumerate_pixels_mut() {
+            let v = (40 + (x * 3 + y) % 160) as u8;
+            p[0] = v;
+            p[1] = v;
+            p[2] = v;
+        }
+        let (mean_sat, colored_fraction) =
+            measure_page_colorfulness(&image::DynamicImage::ImageRgb8(gray));
+        assert!(mean_sat < 0.02, "grayscale mean sat: {mean_sat}");
+        assert!(colored_fraction < 0.02);
+
+        // A colored page: skin-tone blocks + saturated background.
+        let mut colored = RgbImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                let p = if x < 32 {
+                    Rgb([242, 208, 182]) // skin
+                } else if y < 32 {
+                    Rgb([56, 104, 214]) // blue sky
+                } else {
+                    Rgb([120, 200, 90]) // green field
+                };
+                colored.put_pixel(x, y, p);
+            }
+        }
+        let (mean_sat, colored_fraction) =
+            measure_page_colorfulness(&image::DynamicImage::ImageRgb8(colored));
+        assert!(mean_sat > 0.15, "colored page mean sat: {mean_sat}");
+        assert!(
+            colored_fraction > 0.5,
+            "colored page share: {colored_fraction}"
+        );
     }
 
     #[test]

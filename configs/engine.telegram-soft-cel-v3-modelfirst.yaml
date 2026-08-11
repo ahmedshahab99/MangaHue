@@ -1,0 +1,74 @@
+engine:
+  mode: fast
+  parallel_jobs: 1
+  pyramid_enabled: false
+  hint_propagation_enabled: false
+
+preprocess:
+  denoise_enabled: false
+  denoise_strength: 0
+  max_input_dimension: 1024
+  line_sharpening: 0.35
+
+layout:
+  tiling_enabled: false
+  tile_size: 1024
+  tile_overlap: 0
+
+inference:
+  model_path: models/ddcolor-full-fp16.onnx
+  model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
+  device: cpu
+  batch_size: 1
+  input_size: 1024
+  fp16_enabled: false
+  resize_policy: fit
+
+hints:
+  user_hints_enabled: false
+  character_memory_enabled: false
+  style_hints_enabled: true
+  hint_blur_radius: 4.0
+  hint_strength: 1.0
+  region_style_hints_enabled: true
+  region_style_hint_budget: 18
+
+postprocess:
+  restore_lines: true
+  line_strength: 1.0
+  bubble_cleanup: false
+  bleeding_correction: false
+  palette_correction: true
+  region_chroma_separation: 44.0
+  final_sharpening: 0.0
+  reference_finishing: true
+  target_colorfulness: 1.0
+  midtone_depth: 0.0
+  local_contrast: 0.0
+  semantic_relighting: false
+  relighting_strength: 0.0
+  natural_grading: false
+  muted_target_grade: false
+  muted_strength: 0.0
+  muted_hue_shift_deg: 0.0
+  muted_dark_pull: 0.0
+  muted_dark_sat: 0.0
+  muted_mid_sat: 0.0
+  muted_bright_sat: 0.0
+  muted_paper_sat: 0.0
+  muted_vivid_preserve: 0.0
+  soft_coverage: true
+  soft_strength: 1.0
+  soft_confidence: 0.9
+
+output:
+  format: png
+  quality: 95
+  write_report: true
+  write_intermediates: false
+
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.18

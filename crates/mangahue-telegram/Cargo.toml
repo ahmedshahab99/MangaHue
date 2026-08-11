@@ -13,8 +13,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 image.workspace = true
+imageproc.workspace = true
+ab_glyph = "0.2"
 mangahue-core = { path = "../mangahue-core" }
 mangahue-ingest = { path = "../mangahue-ingest" }
+mangahue-inference = { path = "../mangahue-inference", features = ["native-onnx"] }
 mangahue-orchestrator = { path = "../mangahue-orchestrator", features = ["native-onnx"] }
 mangahue-export = { path = "../mangahue-export" }
 reqwest.workspace = true

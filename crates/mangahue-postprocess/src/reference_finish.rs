@@ -45,9 +45,8 @@ pub(crate) fn finish_reference_style(
         .collect::<Vec<_>>();
     let local = box_mean(&luma, width, height, 7);
     let scene = box_mean(&luma, width, height, 29);
-    let ink_distance = config
-        .semantic_relighting
-        .then(|| distance_from_ink(line_mask, 18));
+    let want_directional = config.semantic_relighting || config.ambient_occlusion_strength > 0.0;
+    let ink_distance = want_directional.then(|| distance_from_ink(line_mask, 18));
     let mut report = ReferenceFinishReport::default();
 
     // Specular ridge field: second-derivative of local luma highlights thin
@@ -67,13 +66,12 @@ pub(crate) fn finish_reference_style(
 
     // Estimate the dominant light direction from the page's gradient field,
     // then build a directional AO field: ink casts shadows away from light.
-    let (light_dir_x, light_dir_y) = if config.semantic_relighting {
+    let (light_dir_x, light_dir_y) = if want_directional {
         estimate_light_direction(&luma, width, height, line_mask, bubble_mask)
     } else {
         (-0.55_f32, -0.84_f32)
     };
-    let directional_ao = config
-        .semantic_relighting
+    let directional_ao = want_directional
         .then(|| {
             ink_distance.as_ref().map(|distance| {
                 directional_ink_ao(distance, width, height, light_dir_x, light_dir_y, line_mask)
@@ -150,12 +148,15 @@ pub(crate) fn finish_reference_style(
                 let material_gate = (1.0 - paper) * bell(original, 0.55, 0.52);
                 let mut ao = 0.0;
                 if let Some(ao_field) = directional_ao.as_ref() {
-                    // Ink casts shadow on the side facing away from light.
-                    ao = ao_field[index] * shadow_support * 0.03;
+                    // Ink-cast shadow away from the light: its own strength
+                    // knob so cel AO works without photoreal relighting.
+                    ao =
+                        ao_field[index] * shadow_support * 0.03 * config.ambient_occlusion_strength;
                 }
                 relighting = config.relighting_strength
                     * material_gate
-                    * (directional * 0.34 - edge_depth * shadow_support * 0.018 - ao);
+                    * (directional * 0.34 - edge_depth * shadow_support * 0.018)
+                    - ao;
             }
             let mut target_luma =
                 (old_luma - depth - style_shadow + style_highlight + local_shape + relighting)
@@ -166,19 +167,28 @@ pub(crate) fn finish_reference_style(
             let chroma_room = bell(target_luma, 0.48, 0.52);
             // Deep expansion: midtones get the strongest lift (2.1-2.4x),
             // highlights damped by chroma_room, capped to stay in gamut.
+            // The neutral gain is deliberately modest: chroma expansion
+            // amplifies the model's warm bias (R-B scales with it), and a
+            // strong gain turned pages brown/orange.
             let expansion = (1.0
                 + config.target_colorfulness
                     * neutral_gate
                     * chroma_room
-                    * (0.55 + (1.0 - vivid_gate) * 0.35))
-                .min(2.4);
+                    * (0.35 + (1.0 - vivid_gate) * 0.20))
+                .min(1.9);
             let mut centered = [
                 (rgb[0] - old_luma) * expansion,
                 (rgb[1] - old_luma) * expansion,
                 (rgb[2] - old_luma) * expansion,
             ];
 
-            let warm_material = centered[0] > centered[2] + 0.008;
+            // Warm boosts are deliberately gentle: heavy warm-cast grading
+            // turned pages brown/orange. Keep the directional warmth so skin
+            // still reads as skin, but at roughly half the previous strength.
+            // warm_material requires r > g too — yellow/green hues (r ~ g)
+            // must NOT be amplified or the page reads yellow.
+            let warm_material =
+                centered[0] > centered[2] + 0.008 && centered[0] > centered[1] + 0.002;
             let cool_material = centered[2] > centered[0] + 0.008;
             let shadow_tint = shadow_support * style.shadow_strength * 0.008;
             // Skin subsurface scattering: shadows on skin go deep-warm amber,
@@ -189,21 +199,24 @@ pub(crate) fn finish_reference_style(
                 && original < 0.80
                 && chroma < 0.28
                 && centered[0] < 0.16;
+            // Warm boosts are deliberately gentle: heavy warm-cast grading
+            // turned pages brown/orange. Keep the directional warmth so skin
+            // still reads as skin, but at roughly half the previous strength.
             if skin_like {
                 let s = shadow_support;
-                centered[0] += s * 0.045;
-                centered[2] -= s * 0.016;
-                centered[0] += smoothstep(0.0, 0.12, broad_detail) * 0.018;
+                centered[0] += s * 0.025;
+                centered[2] -= s * 0.008;
+                centered[0] += smoothstep(0.0, 0.12, broad_detail) * 0.010;
             }
             if warm_material {
-                centered[0] += highlight_support * style.highlight_strength * 0.014;
-                centered[2] -= shadow_tint * 0.60;
+                centered[0] += highlight_support * style.highlight_strength * 0.007;
+                centered[2] -= shadow_tint * 0.30;
             } else if cool_material {
-                centered[0] += shadow_tint * 0.18;
-                centered[2] += shadow_tint * 0.12;
+                centered[0] += shadow_tint * 0.10;
+                centered[2] += shadow_tint * 0.07;
             } else if neutral_gate > 0.15 {
-                centered[0] += highlight_support * 0.004;
-                centered[2] += shadow_tint * 0.08;
+                centered[0] += highlight_support * 0.002;
+                centered[2] += shadow_tint * 0.05;
             }
 
             // Specular highlights: thin convex ridges brighten and desaturate
@@ -237,7 +250,13 @@ pub(crate) fn finish_reference_style(
                             SKIN_LINEAR[2] * (1.0 - w) + SKIN_SHA_LINEAR[2] * w,
                         ];
                         let base_luma = 0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2];
-                        let k = (fm * 0.92).min(0.92);
+                        // The peach injection yields to real model skin chroma:
+                        // near-white faces get the full base, faces the model
+                        // already colored keep their own hue. face_paint_strength
+                        // scales the ceiling (model-first presets lower it).
+                        let chroma_gate = 1.0 - smoothstep(0.035, 0.10, chroma);
+                        let k = (fm * config.face_paint_strength * chroma_gate)
+                            .min(config.face_paint_strength);
                         centered[0] = centered[0] * (1.0 - k) + (base[0] - base_luma) * k;
                         centered[1] = centered[1] * (1.0 - k) + (base[1] - base_luma) * k;
                         centered[2] = centered[2] * (1.0 - k) + (base[2] - base_luma) * k;
@@ -580,6 +599,23 @@ mod tests {
             muted_mid_sat: 0.27,
             muted_bright_sat: 0.22,
             muted_paper_sat: 0.034,
+            muted_vivid_preserve: 0.0,
+            muted_yellow_shift_deg: 0.0,
+            model_first: false,
+            seed_chroma_bar_bright: 48.0,
+            seed_chroma_bar_mid: 24.0,
+            model_chroma_bar_bright: 40.0,
+            model_chroma_bar_mid: 20.0,
+            model_chroma_gain: 1.3,
+            palette_harmony_strength: 0.16,
+            face_paint_strength: 0.92,
+            ambient_occlusion_strength: 0.0,
+            smart_governor: false,
+            governor_target_saturation: 0.20,
+            governor_target_colorfulness: 36.0,
+            governor_min_gain: 0.8,
+            governor_max_gain: 1.25,
+            governor_target_warmth: 45.0,
         }
     }
 

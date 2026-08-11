@@ -239,7 +239,98 @@ pub fn validate_public_url(url: &Url) -> Result<()> {
     Ok(())
 }
 
-/// reqwest DNS resolver that rejects any hostname resolving to private,
+/// Fetch a page's HTML with a Cloudflare-challenge fallback.
+///
+/// Some sites (Cloudflare-fronted ones like allporncomic.com) fingerprint
+/// the TLS stack: rustls (reqwest's default here) gets a JS challenge
+/// ("Just a moment…", HTTP 403/503) while OpenSSL-based clients like curl
+/// pass. When reqwest hits a challenge, the page is re-fetched with the
+/// system `curl` (present on every Linux host and Windows 10+). The URL must
+/// already be SSRF-validated by the caller; the fallback re-validates it.
+pub fn fetch_html_cloudflare_safe(client: &Client, url: &str, max_bytes: u64) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if validate_public_url(&parsed).is_err() {
+        return None;
+    }
+    // Try reqwest first; ANY failure (challenge, reset, timeout, 4xx/5xx)
+    // falls through to the curl fallback — the rustls TLS fingerprint is
+    // exactly what Cloudflare rejects, so the direct attempt failing is
+    // the expected case for challenged sites, not an error.
+    let direct = (|| -> Option<String> {
+        let response = client
+            .get(url)
+            .header(USER_AGENT, crate::extractors::UA)
+            .header(
+                ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .ok()?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        response.take(max_bytes + 1).read_to_end(&mut bytes).ok()?;
+        if bytes.len() as u64 > max_bytes {
+            return None;
+        }
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        if status.is_success() && !looks_like_cloudflare_challenge(&body) {
+            Some(body)
+        } else {
+            None
+        }
+    })();
+    direct.or_else(|| curl_fetch_html(url, max_bytes))
+}
+
+/// True when a body is a Cloudflare JS challenge rather than real content.
+/// NOTE: "challenge-platform" must NOT be checked — Cloudflare embeds its
+/// beacon script on every legit page, so that marker appears on real
+/// content too (this exact mistake silently rejected valid pages).
+fn looks_like_cloudflare_challenge(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("just a moment")
+        || lower.contains("attention required")
+        || lower.contains("cf-error-details")
+        || lower.contains("cf-chl-opt")
+}
+
+/// Shell out to the system curl. No shell involved (arg-array exec), the
+/// URL is validated by the caller + re-validated in the wrapper, and
+/// redirects are capped so a compromised site cannot point curl at internal
+/// hosts more than a few hops.
+fn curl_fetch_html(url: &str, max_bytes: u64) -> Option<String> {
+    use std::process::Command;
+    let output = Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            "30",
+            "--max-redirs",
+            "3",
+            "-A",
+            crate::extractors::UA,
+            "-H",
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+        ])
+        .arg(url)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let bytes = output.stdout;
+    if bytes.len() as u64 > max_bytes {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if looks_like_cloudflare_challenge(&body) {
+        return None;
+    }
+    Some(body)
+}
 /// reserved, or otherwise unsafe addresses. Because reqwest connects to the
 /// addresses this resolver returns, the check and the connection share a
 /// single resolution — closing the DNS-rebinding window.
@@ -388,7 +479,9 @@ pub fn download_image_url_with_referer(
                     .header(USER_AGENT, user_agent)
                     .header(
                         ACCEPT,
-                        "image/avif,image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
+                        // No image/avif: the image crate build has no avif
+                        // decoder, and nhentai serves avif when asked for it.
+                        "image/webp,image/png,image/jpeg,image/*;q=0.9,*/*;q=0.5",
                     );
                 if let Some(referer) = referer {
                     request = request.header(REFERER, referer.as_str());
@@ -500,6 +593,18 @@ fn download_image_response(
         let _ = fs::remove_file(&partial_path);
         anyhow::bail!("image exceeded {max_bytes} bytes");
     }
+    // Decode-verify BEFORE committing: throttled CDN hosts sometimes return
+    // 200 with an HTML error body or an undecodable variant (e.g. avif)
+    // under an image/* content type. The caller's retry loop re-tries the
+    // sibling CDN hosts when this fails, which usually gets the real image.
+    // Magic-first (never trust the extension): CDNs routinely serve JPEG
+    // content under .png URLs, which image::open would reject.
+    image::ImageReader::open(&partial_path)
+        .with_context(|| format!("failed to open downloaded image from {url}"))?
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format from {url}"))?
+        .decode()
+        .with_context(|| format!("undecodable image content from {url} ({bytes} bytes)"))?;
     if local_path.exists() {
         fs::remove_file(&local_path)
             .with_context(|| format!("failed to replace {}", local_path.display()))?;

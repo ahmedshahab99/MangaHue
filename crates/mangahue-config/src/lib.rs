@@ -34,6 +34,30 @@ pub struct EngineSection {
     pub pyramid_enabled: bool,
     #[serde(default)]
     pub hint_propagation_enabled: bool,
+    /// Pass already-colored pages through untouched instead of re-colorizing
+    /// them (full-color western comics are common).
+    #[serde(default = "default_skip_already_colored")]
+    pub skip_already_colored: bool,
+    /// Mean HSV saturation (over non-paper pixels) above which a page counts
+    /// as already colored.
+    #[serde(default = "default_already_colored_sat_threshold")]
+    pub already_colored_sat_threshold: f32,
+    /// Minimum share of non-paper pixels carrying real color (sat > 0.15)
+    /// for the already-colored verdict (rejects warm-tinted grayscale).
+    #[serde(default = "default_already_colored_colored_fraction")]
+    pub already_colored_colored_fraction: f32,
+}
+
+fn default_skip_already_colored() -> bool {
+    true
+}
+
+fn default_already_colored_sat_threshold() -> f32 {
+    0.08
+}
+
+fn default_already_colored_colored_fraction() -> f32 {
+    0.05
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +178,73 @@ pub struct PostprocessSection {
     pub muted_bright_sat: f32,
     #[serde(default = "default_muted_paper_sat")]
     pub muted_paper_sat: f32,
+    /// Fraction of vivid saturation the muted grade's hard knee keeps
+    /// (0.0 = legacy: S > 0.55 is halved; 1.0 = the knee is a no-op).
+    /// Lets presets hold "moderate" instead of "flat" saturation.
+    #[serde(default = "default_muted_vivid_preserve")]
+    pub muted_vivid_preserve: f32,
+    /// Yellow-band hue shift (degrees): rotates hues in the 40-75 deg band
+    /// toward orange. The model over-produces yellow on manga pages; the
+    /// soft-cel reference is orange/skin with almost no yellow. Skin
+    /// (0-40 deg) is untouched.
+    #[serde(default)]
+    pub muted_yellow_shift_deg: f32,
+    /// Model-first purity mode: region machinery preserves the model's own
+    /// chroma wherever it is confident (lower confidence bars, director and
+    /// propagation freeze model-derived regions, palette harmony yields to
+    /// model color, face paint defers to real skin chroma). The palette
+    /// becomes a fallback for genuinely neutral regions only.
+    #[serde(default)]
+    pub model_first: bool,
+    /// Confidence bars for the region color decision ladder. Regions whose
+    /// model chroma magnitude (|R-L| + |B-L|, 0-255 scale) passes the bar
+    /// keep the model's hue; weaker chroma falls to the palette tier.
+    #[serde(default = "default_seed_chroma_bar_bright")]
+    pub seed_chroma_bar_bright: f32,
+    #[serde(default = "default_seed_chroma_bar_mid")]
+    pub seed_chroma_bar_mid: f32,
+    #[serde(default = "default_model_chroma_bar_bright")]
+    pub model_chroma_bar_bright: f32,
+    #[serde(default = "default_model_chroma_bar_mid")]
+    pub model_chroma_bar_mid: f32,
+    /// Gain applied to confident model chroma when a region keeps its own
+    /// hue (1.0 = exact pass-through; legacy 1.3 amplified it).
+    #[serde(default = "default_model_chroma_gain")]
+    pub model_chroma_gain: f32,
+    /// Strength of the global palette-harmony pull on every pixel. In
+    /// model-first mode the pull is additionally gated by per-pixel chroma
+    /// so model-colored pixels stay untouched.
+    #[serde(default = "default_palette_harmony_strength")]
+    pub palette_harmony_strength: f32,
+    /// How strongly the guaranteed face paint replaces model skin chroma
+    /// (1.0 = full peach injection; lower = keep real model skin).
+    #[serde(default = "default_face_paint_strength")]
+    pub face_paint_strength: f32,
+    /// Directional ink ambient occlusion strength: ink casts a soft shadow
+    /// away from the estimated light direction (0.0 = off; ~0.5-0.9 adds
+    /// the readable cel "ink shadow" look without photoreal relighting).
+    #[serde(default)]
+    pub ambient_occlusion_strength: f32,
+    /// Smart color governor: measures the page's own saturation and
+    /// colorfulness, then applies a bounded chroma gain toward these
+    /// targets (hue/luma preserved). The model's chroma signal scales the
+    /// target, so the color budget follows the model's own judgment.
+    #[serde(default)]
+    pub smart_governor: bool,
+    #[serde(default = "default_governor_target_saturation")]
+    pub governor_target_saturation: f32,
+    #[serde(default = "default_governor_target_colorfulness")]
+    pub governor_target_colorfulness: f32,
+    #[serde(default = "default_governor_min_gain")]
+    pub governor_min_gain: f32,
+    #[serde(default = "default_governor_max_gain")]
+    pub governor_max_gain: f32,
+    /// Warmth target for the smart governor: mean (R-B) over midtone
+    /// pixels, 0-255 units. The model's palette leans golden; when the
+    /// measured warmth exceeds the target, warm pixels are compressed
+    /// toward neutral (bounded, hue-preserving for cool colors).
+    #[serde(default = "default_governor_target_warmth")]
+    pub governor_target_warmth: f32,
 }
 
 fn default_muted_dark_sat() -> f32 {
@@ -170,6 +261,58 @@ fn default_muted_bright_sat() -> f32 {
 
 fn default_muted_paper_sat() -> f32 {
     0.034
+}
+
+fn default_muted_vivid_preserve() -> f32 {
+    0.0
+}
+
+fn default_seed_chroma_bar_bright() -> f32 {
+    48.0
+}
+
+fn default_seed_chroma_bar_mid() -> f32 {
+    24.0
+}
+
+fn default_model_chroma_bar_bright() -> f32 {
+    40.0
+}
+
+fn default_model_chroma_bar_mid() -> f32 {
+    20.0
+}
+
+fn default_model_chroma_gain() -> f32 {
+    1.3
+}
+
+fn default_palette_harmony_strength() -> f32 {
+    0.16
+}
+
+fn default_face_paint_strength() -> f32 {
+    0.92
+}
+
+fn default_governor_target_saturation() -> f32 {
+    0.20
+}
+
+fn default_governor_target_colorfulness() -> f32 {
+    36.0
+}
+
+fn default_governor_min_gain() -> f32 {
+    0.8
+}
+
+fn default_governor_max_gain() -> f32 {
+    1.25
+}
+
+fn default_governor_target_warmth() -> f32 {
+    45.0
 }
 
 fn default_soft_coverage() -> bool {
@@ -345,6 +488,9 @@ impl Default for EngineConfig {
                 parallel_jobs: 0,
                 pyramid_enabled: false,
                 hint_propagation_enabled: false,
+                skip_already_colored: default_skip_already_colored(),
+                already_colored_sat_threshold: default_already_colored_sat_threshold(),
+                already_colored_colored_fraction: default_already_colored_colored_fraction(),
             },
             preprocess: PreprocessSection {
                 grayscale_mode: "luma".to_string(),
@@ -411,6 +557,23 @@ impl Default for EngineConfig {
                 muted_mid_sat: default_muted_mid_sat(),
                 muted_bright_sat: default_muted_bright_sat(),
                 muted_paper_sat: default_muted_paper_sat(),
+                muted_vivid_preserve: default_muted_vivid_preserve(),
+                muted_yellow_shift_deg: 0.0,
+                model_first: false,
+                seed_chroma_bar_bright: default_seed_chroma_bar_bright(),
+                seed_chroma_bar_mid: default_seed_chroma_bar_mid(),
+                model_chroma_bar_bright: default_model_chroma_bar_bright(),
+                model_chroma_bar_mid: default_model_chroma_bar_mid(),
+                model_chroma_gain: default_model_chroma_gain(),
+                palette_harmony_strength: default_palette_harmony_strength(),
+                face_paint_strength: default_face_paint_strength(),
+                ambient_occlusion_strength: 0.0,
+                smart_governor: false,
+                governor_target_saturation: default_governor_target_saturation(),
+                governor_target_colorfulness: default_governor_target_colorfulness(),
+                governor_min_gain: default_governor_min_gain(),
+                governor_max_gain: default_governor_max_gain(),
+                governor_target_warmth: default_governor_target_warmth(),
             },
             output: OutputSection {
                 format: "png".to_string(),

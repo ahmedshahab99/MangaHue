@@ -31,6 +31,9 @@ web/gpu/dev_server_err.log
 /test_*.py
 /*.png
 /*.jpg
+/*.report*.json
+/bench_local/
+/allporncomic_test/
 /web/app/.next/
 /web/app/out/
 /web/app/node_modules/

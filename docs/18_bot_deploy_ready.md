@@ -13,11 +13,15 @@ Repo on the host: `/opt/MangaHue-release` (25-crate Cargo workspace).
 
 **Inference is 100 % native Rust** (ONNX Runtime via the `ort` crate,
 `load-dynamic`). No `MANGAHUE_PYTHON`, no ensemble workers, no Python in the
-main path. The service uses the hint-U-Net model
-`/opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx` with preset
-`configs/engine.telegram-cpu.yaml` and style `configs/styles/studio_anime.yaml`
-(everything below verified against `configs/systemd/mangahue-pro.service` and
-the workspace source).
+main path. The service uses the DDColor-FULL model
+`/opt/MangaHue/models/ddcolor-full-fp16.onnx` (~435 MB FP16, native 512×512
+transformer color decoder) with preset
+`configs/engine.telegram-hq.yaml` (vibrant-natural grade: `target_colorfulness
+1.55`, `muted_mid_sat 0.35`, `region_chroma_separation 50`) and style
+`configs/styles/realistic_natural.yaml` (saturation 1.08, contrast 1.06).
+Everything below verified against `configs/systemd/mangahue-pro.service` and
+the workspace source. Rollback tier (manga-colorize + telegram-cpu + studio_anime)
+is documented in the unit file's comments.
 
 ---
 
@@ -97,17 +101,21 @@ rsync -av --delete \
 ### 1.5 Verify model, config and env files
 
 ```sh
+ls -lh /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp16.onnx
 ls -lh /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx
-ls -lh /opt/MangaHue/models/ddcolor-tiny-fp16.onnx
-ls -lh /opt/MangaHue-release/configs/engine.telegram-cpu.yaml
-ls -lh /opt/MangaHue-release/configs/styles/studio_anime.yaml
+ls -lh /opt/MangaHue/models/ddcolor-tiny/ddcolor-tiny-fp16.onnx
+ls -lh /opt/MangaHue-release/configs/engine.telegram-hq.yaml
+ls -lh /opt/MangaHue-release/configs/styles/realistic_natural.yaml
 ls -lh /opt/MangaHue-release/configs/model-contracts/manga-colorization-v2-onnx.json
 ls -ld /opt/MangaHue-release/bin /opt/MangaHue-release/runtime
 test -s /opt/MangaHue-release/runtime/telegram.env && echo "telegram.env OK" || echo "telegram.env MISSING"
 ```
 
-- `manga-colorize-fp16.onnx` — the hint-U-Net used by the service (~59 MB per
-  the repo copy; verify the on-VPS size, don't panic if it differs).
+- `ddcolor-full-fp16.onnx` — the **primary** model used by the service
+  (~435 MB; verify the on-VPS size and that `ddcolor-full.metadata.json`
+  sits next to it). If it is missing, ship it before starting the service.
+- `manga-colorize-fp16.onnx` (~59 MB) — the rollback hint-U-Net used by the
+  previous tier; keep it around for A/B benchmarks.
 - `ddcolor-tiny-fp16.onnx` (~130 MB) also exists under `/opt/MangaHue/models/`
   — it is used by other presets/benchmarks, **not** by this service.
 - `telegram.env` must exist and contain `TELEGRAM_BOT_TOKEN=...` (the unit
@@ -249,6 +257,16 @@ sudo ldconfig
 ldconfig -p | grep libonnxruntime
 ```
 
+> **Trap (caused a production outage 2026-08-08):** never put the library in
+> `/tmp` and symlink it into `/usr/local/lib`. The unit runs with
+> `PrivateTmp=true`, which mounts a private empty `/tmp` — dlopen then fails
+> (ENOENT on the symlink target) and ort 2.0.0-rc.12's `load-dynamic` error
+> path deadlocks the process (pykeio/ort#560/#604). The real file must live
+> in a permanent path (e.g. `/usr/local/lib`). The bot now pre-loads the
+> library at startup (`pre-loaded ONNX Runtime` in the journal) and fails
+> fast instead of hanging, but keep the library out of `/tmp` regardless —
+> `/tmp` is also cleared on reboot.
+
 If you use Fallback B, update the unit so it stops relying on the venv path:
 
 ```sh
@@ -267,9 +285,12 @@ this service. Torch lives separately at `/opt/MangaHue-reference-runtime`
 
 - Runs `mangahue-telegram` with: `--work-dir /var/lib/mangahue-pro/telegram`,
   `--scratch-dir /run/mangahue-pro/jobs`, `--scratch-limit-bytes 805306368`,
-  `--delivery-format jpeg --jpeg-quality 95`, `--max-pages 2016`,
-  `--max-concurrent-jobs 1`, `--batch-size 1`, `--daily-limit 0`, plus
-  `--model` / `--preset` / `--style` as listed at the top of this document.
+  `--delivery-format jpeg --jpeg-quality 95`, `--max-pages 100`,
+  `--max-concurrent-jobs 1`, `--batch-size 1`, `--daily-limit 300`, plus
+  `--model /opt/MangaHue/models/ddcolor-full-fp16.onnx`,
+  `--preset /opt/MangaHue-release/configs/engine.telegram-hq.yaml` and
+  `--style /opt/MangaHue-release/configs/styles/realistic_natural.yaml`
+  (rollback flags are in the unit file's comments).
 - Threads pinned to 2 (`MANGAHUE_MODEL_THREADS=2`, `OMP_NUM_THREADS=2`,
   `MKL_NUM_THREADS=2`, `MALLOC_ARENA_MAX=2`).
 - `Restart=on-failure` / `RestartSec=15`; cgroup memory backstop
@@ -324,15 +345,17 @@ free -m
 ```
 
 Record `free`/`available`. After the tests below, run `free -m` again and note
-the delta. Expect the idle bot at **~1 GB RSS** (no torch loaded). While a job
+ the delta. Expect the idle bot at **~1–2 GB RSS** with DDColor-FULL loaded (no
+torch); the previous manga-colorize tier idled near ~1 GB. While a job
 runs, scratch staging adds up to ~768 MiB (tmpfs under `/run/mangahue-pro`).
+The unit's `MemoryHigh=4G / MemoryMax=5G` backstop covers this.
 
 **4. One real chapter colorize (timing)**
 
 Send a real chapter URL (or a multi-page link the bot accepts). Expect
-**20–70 s/page on 2 cores**, depending on page size and system load — the
-older fp16 benchmark measured ~133 s/page worst case, so record whatever you
-actually see in the §6 baseline table. Watch live:
+**20–70 s/page on 2 cores** for the previous manga-colorize tier; DDColor-FULL
+runs at its native 512×512 so it is typically comparable or faster per page —
+record whatever you actually see in the §6 baseline table. Watch live:
 
 ```sh
 journalctl -u mangahue-pro -f
@@ -370,7 +393,9 @@ mkdir -p /root/bench/pages /root/bench/out
 ```
 
 **Run.** From `/opt/MangaHue-release` (preset-relative paths resolve against
-CWD), with the same model/preset/style and thread settings the service uses:
+CWD), with the same model/preset/style and thread settings the service uses.
+
+**A. Production tier — DDColor-FULL + HQ preset (this is what the service runs):**
 
 ```sh
 export ORT_DYLIB_PATH=/opt/MangaHue/.venv/lib/python3.11/site-packages/onnxruntime/capi/libonnxruntime.so
@@ -380,17 +405,35 @@ rm -rf /root/bench/out && mkdir -p /root/bench/out
 cd /opt/MangaHue-release
 time /opt/MangaHue-release/bin/mangahue benchmark /root/bench/pages \
   -o /root/bench/out \
+  --model /opt/MangaHue/models/ddcolor-full-fp16.onnx \
+  --preset /opt/MangaHue-release/configs/engine.telegram-hq.yaml \
+  --style /opt/MangaHue-release/configs/styles/realistic_natural.yaml \
+  --jobs 1 \
+  --report /root/bench/report-full.json
+cat /root/bench/report-full.json
+```
+
+**B. Rollback tier — manga-colorize + CPU preset (same pages):**
+
+```sh
+rm -rf /root/bench/out && mkdir -p /root/bench/out
+cd /opt/MangaHue-release
+time /opt/MangaHue-release/bin/mangahue benchmark /root/bench/pages \
+  -o /root/bench/out \
   --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx \
   --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml \
   --style /opt/MangaHue-release/configs/styles/studio_anime.yaml \
   --jobs 1 \
-  --report /root/bench/report.json
-cat /root/bench/report.json
+  --report /root/bench/report-small.json
+cat /root/bench/report-small.json
 ```
 
 - Run exactly **3 pages**, serial (`--jobs 1`), like the service
   (`--max-concurrent-jobs 1`).
-- `time` gives total wall time; `report.json` has the per-page breakdown.
+- `time` gives total wall time; each `report.json` has the per-page breakdown
+  plus the quality report (mean chroma / vivid pixels) — the A/B verdict
+  (DDColor-FULL wins on color quality) comes from comparing those numbers and
+  the rendered pages side by side.
 - Do not run benchmarks while the bot is processing a job — 2 cores.
 - The `export ORT_DYLIB_PATH=...` is only needed if you did not install the
   library system-wide (§4.2 Fallback B); the systemd service sets it itself.
@@ -399,7 +442,8 @@ cat /root/bench/report.json
 
 | Date | Page set | Model | s/page (mean) | RAM peak (free -m delta) | Change being measured |
 |---|---|---|---|---|---|
-| (deploy 1) | 3 fixed pages | manga-colorize-fp16.onnx | **record me (expect 20–70)** | **record me (~1 GB idle)** | native Rust baseline |
+| 2026-08-08 | 3 fixed pages (test_images) | manga-colorize-fp16.onnx + telegram-cpu | **12.5** (37.6 s total) | **1.36 GB RSS** | native Rust baseline (rollback tier) |
+| 2026-08-08 | 3 fixed pages (test_images) | ddcolor-full-fp16.onnx + telegram-hq | **17.4** (52.1 s total) | **3.45 GB RSS** | DDColor-FULL + HQ preset (production) |
 |  |  |  |  |  |  |
 |  |  |  |  |  |  |
 

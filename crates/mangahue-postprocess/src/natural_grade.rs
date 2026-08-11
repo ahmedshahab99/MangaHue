@@ -100,6 +100,155 @@ pub(crate) fn natural_grade(
 
 const PEACH_HUE: f32 = 0.055;
 
+/// Smart color governor: a per-page, measured adaptation pass that runs
+/// LAST of the color passes. Instead of a fixed grade, it measures the
+/// page's own average HSV saturation and Hasler-Suestrunk colorfulness,
+/// then applies a bounded chroma gain that moves those metrics toward the
+/// preset targets. The model's own chroma signal (mean opponent magnitude
+/// right after inference) scales the target so the color budget follows
+/// what the model judged this page to be — a muted page stays muted, a
+/// colorful page keeps its life. Hue and luma are preserved; ink and paper
+/// are untouched.
+pub(crate) fn smart_color_governor(
+    image: &mut RgbImage,
+    line_mask: &GrayImage,
+    target_saturation: f32,
+    target_colorfulness: f32,
+    min_gain: f32,
+    max_gain: f32,
+    target_warmth: f32,
+    chroma_signal: Option<f32>,
+) {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 || line_mask.dimensions() != (width, height) {
+        return;
+    }
+    // Measure (sampled, <= ~120k px): saturation, colorfulness and warmth
+    // (mean R-B over midtones, 0-255 units).
+    let total = width as usize * height as usize;
+    let step = (total / 120_000).max(1);
+    let mut sat_sum = 0.0f64;
+    let mut rg_sum = 0.0f64;
+    let mut rg_sq = 0.0f64;
+    let mut yb_sum = 0.0f64;
+    let mut yb_sq = 0.0f64;
+    let mut warm_sum = 0.0f64;
+    let mut warm_n = 0u64;
+    let mut n = 0u64;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let index = y as usize * width as usize + x as usize;
+        if index % step != 0 {
+            continue;
+        }
+        let r = pixel[0] as f64;
+        let g = pixel[1] as f64;
+        let b = pixel[2] as f64;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        sat_sum += if max > 0.0 { (max - min) / max } else { 0.0 };
+        let rg = r - g;
+        let yb = 0.5 * (r + g) - b;
+        rg_sum += rg;
+        rg_sq += rg * rg;
+        yb_sum += yb;
+        yb_sq += yb * yb;
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (61.0..199.0).contains(&luma) {
+            warm_sum += r - b;
+            warm_n += 1;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return;
+    }
+    let nf = n as f64;
+    let measured_sat = (sat_sum / nf) as f32;
+    let rg_mean = rg_sum / nf;
+    let rg_var = (rg_sq / nf - rg_mean * rg_mean).max(0.0);
+    let yb_mean = yb_sum / nf;
+    let yb_var = (yb_sq / nf - yb_mean * yb_mean).max(0.0);
+    let measured_cf = ((rg_var.sqrt() + yb_var.sqrt())
+        + 0.3 * (rg_mean * rg_mean + yb_mean * yb_mean).sqrt()) as f32;
+    let measured_warmth = if warm_n > 0 {
+        (warm_sum / warm_n as f64) as f32
+    } else {
+        0.0
+    };
+    if measured_sat <= 0.001 {
+        return;
+    }
+    let sat_err = target_saturation / measured_sat;
+    let cf_err = target_colorfulness / measured_cf.max(0.01);
+    let mut gain = (0.5 * sat_err + 0.5 * cf_err).clamp(min_gain, max_gain);
+    // Model budget: a page the model judged muted stays muted; a colorful
+    // page keeps its life (bounded so the governor never fights the model).
+    if let Some(signal) = chroma_signal {
+        gain *= (signal / 50.0).clamp(0.85, 1.15);
+    }
+    if (gain - 1.0).abs() < 0.01 {
+        return;
+    }
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if line_mask.get_pixel(x, y)[0] > 184 {
+            continue;
+        }
+        let r = pixel[0] as f32;
+        let g = pixel[1] as f32;
+        let b = pixel[2] as f32;
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let chroma = (r - luma).abs() + (b - luma).abs();
+        if luma > 235.0 && chroma < 12.0 {
+            continue; // paper
+        }
+        let new_r = (luma + (r - luma) * gain).clamp(0.0, 255.0);
+        let new_b = (luma + (b - luma) * gain).clamp(0.0, 255.0);
+        let new_g = ((luma - 0.2126 * new_r - 0.0722 * new_b) / 0.7152).clamp(0.0, 255.0);
+        *pixel = Rgb([
+            new_r.round() as u8,
+            new_g.round() as u8,
+            new_b.round() as u8,
+        ]);
+    }
+
+    // Warmth compression: the model over-produces warm/yellow casts on
+    // manga pages, and the muted grade's target_warmth (mean R-B over
+    // midtones) is what presets tune to kill it. The measured warmth is
+    // pushed toward the target on midtones only (the same 61..199 luma band
+    // the measurement uses), preserving luma and paper/ink. Bounded to +-10
+    // Lab-ish units per pass so a wrong target can never invert a page.
+    if target_warmth > 0.0 {
+        let warmth_err = (target_warmth - measured_warmth).clamp(-30.0, 30.0);
+        if warmth_err.abs() >= 2.0 {
+            let shift = warmth_err * 0.35;
+            for (x, y, pixel) in image.enumerate_pixels_mut() {
+                if line_mask.get_pixel(x, y)[0] > 184 {
+                    continue;
+                }
+                let r = pixel[0] as f32;
+                let g = pixel[1] as f32;
+                let b = pixel[2] as f32;
+                let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                let chroma = (r - luma).abs() + (b - luma).abs();
+                if luma > 235.0 && chroma < 12.0 {
+                    continue; // paper
+                }
+                if !(61.0..199.0).contains(&luma) {
+                    continue; // midtones only, same band as the measurement
+                }
+                let new_r = (r + shift).clamp(0.0, 255.0);
+                let new_b = (b - shift).clamp(0.0, 255.0);
+                let new_g = ((luma - 0.2126 * new_r - 0.0722 * new_b) / 0.7152).clamp(0.0, 255.0);
+                *pixel = Rgb([
+                    new_r.round() as u8,
+                    new_g.round() as u8,
+                    new_b.round() as u8,
+                ]);
+            }
+        }
+    }
+}
+
 /// Muted target grade: reshapes each pixel's saturation toward the measured
 /// per-luma saturation profile of the reference style (low-key, muted warm:
 /// deep shadows ~0.21, midtones ~0.28, brights ~0.22, paper ~0.035). Hue
@@ -113,11 +262,13 @@ pub(crate) fn muted_target_grade(
     bubble_mask: &GrayImage,
     strength: f32,
     hue_shift_deg: f32,
+    yellow_shift_deg: f32,
     dark_pull: f32,
     dark_sat: f32,
     mid_sat: f32,
     bright_sat: f32,
     paper_sat: f32,
+    vivid_preserve: f32,
 ) {
     let (width, height) = image.dimensions();
     if width == 0
@@ -156,22 +307,33 @@ pub(crate) fn muted_target_grade(
             }
             // Soft knee: genuinely strong colors (the reference has 22%
             // vivid punch) keep a reduced share; washed midtones are
-            // pulled down to the muted band target.
+            // pulled down to the muted band target. muted_vivid_preserve
+            // scales how much of the vivid share survives (0.0 = halve,
+            // 1.0 = keep) so presets can aim for "moderate" saturation.
             if s > 0.55 {
-                s *= 0.5;
+                s *= 0.5 + 0.5 * vivid_preserve.clamp(0.0, 1.0);
             } else {
                 s = s + (target - s) * strength * band_strength;
             }
             // The reference leans deep RED-ORANGE (68% of hue mass in the
             // 0-30 deg band): shift yellows gently toward red-orange.
             let hue_deg = h * 360.0;
-            if (20.0..75.0).contains(&hue_deg) {
+            if (20.0..85.0).contains(&hue_deg) {
                 h = ((hue_deg - hue_shift_deg) / 360.0).rem_euclid(1.0);
             }
+            // Yellow-band-only shift: the model over-produces yellow (40-85
+            // deg) on manga pages; the soft-cel reference is orange/skin
+            // with almost no yellow. Skin (0-20 deg) is untouched, so faces
+            // never turn red-orange.
+            if yellow_shift_deg > 0.0 && (40.0..85.0).contains(&hue_deg) {
+                h = ((hue_deg - yellow_shift_deg) / 360.0).rem_euclid(1.0);
+            }
             // The reference's dark-mid range is deeper than ours: pull
-            // dark-mid values down for the low-key look.
+            // dark-mid values down for the low-key look. The clamp is a
+            // sanity bound only — presets like muted_dark_pull 0.5 must be
+            // honored (the old 0.7 floor silently ignored every preset).
             if (60.0..120.0).contains(&gray) {
-                v *= dark_pull.clamp(0.7, 1.0);
+                v *= dark_pull.clamp(0.2, 1.0);
             }
             let (r, g, b) = hsv_to_rgb(h, s.clamp(0.0, 1.0), v);
             image.put_pixel(
@@ -281,7 +443,7 @@ mod tests {
         let lines = GrayImage::from_pixel(16, 16, Luma([0]));
         let bubbles = GrayImage::from_pixel(16, 16, Luma([0]));
         muted_target_grade(
-            &mut image, &gray, &lines, &bubbles, 1.0, 0.0, 1.0, 0.19, 0.27, 0.22, 0.034,
+            &mut image, &gray, &lines, &bubbles, 1.0, 0.0, 0.0, 1.0, 0.19, 0.27, 0.22, 0.034, 0.0,
         );
         let p = image.get_pixel(8, 8);
         let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
@@ -302,7 +464,8 @@ mod tests {
         let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
         let before = *image.get_pixel(4, 4);
         muted_target_grade(
-            &mut image, &gray, &lines, &bubbles, 1.0, 20.0, 0.85, 0.19, 0.27, 0.22, 0.034,
+            &mut image, &gray, &lines, &bubbles, 1.0, 20.0, 15.0, 0.85, 0.19, 0.27, 0.22, 0.034,
+            0.0,
         );
         assert_eq!(*image.get_pixel(4, 4), before);
     }

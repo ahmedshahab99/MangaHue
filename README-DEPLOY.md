@@ -1,5 +1,63 @@
 # MangaHue - Production Deployment Guide
 
+## Live Deployment (current, 2026)
+
+The production bot runs as a **systemd service on the VPS** (no Docker):
+
+```
+VPS (153.75.251.215, 2-core / 5.4GB RAM)
+  mangahue-pro.service  →  /opt/MangaHue-release/bin/mangahue-telegram
+     --model  .../models/ddcolor-full/ddcolor-full-fp32.onnx
+     --preset .../configs/engine.telegram-pure-model-v2.yaml
+     --style  .../configs/styles/soft_cel_anime_v2.yaml
+     --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
+     --max-concurrent-jobs 2
+```
+
+**Deploy a change (one command):**
+
+```bash
+python scripts/vps_build.py
+```
+
+This uploads `main.rs` (+ watermark, inference) to `/opt/mangahue` and
+`/opt/MangaHue-release`, runs `cargo test` + `cargo build --release` on the
+VPS, and on success copies the fresh binary into `/opt/MangaHue-release/bin/`
+and restarts the service. A failed build leaves the running bot untouched.
+
+### Telegram delivery resilience
+
+- Every Telegram API call (getUpdates, sendMessage, sendDocument, ...) retries
+  **3 times with exponential backoff (2s, 4s)** on transient failures: 5xx,
+  429, timeouts, connection resets, gateway HTML bodies. Permanent errors
+  (4xx, "message is not modified", blocked users) fail immediately.
+- Startup no longer dies when Telegram is unreachable: `getMe` is retried
+  every 30s instead of crash-looping under systemd. `setMyCommands` is
+  best-effort.
+- If Telegram blocks the datacenter IP again (the 16h 502 storm), point the
+  bot at a proxy without a rebuild:
+
+```bash
+# in /etc/systemd/system/mangahue-pro.service, under [Service]
+Environment=MANGAHUE_TELEGRAM_API=https://your-worker.example.workers.dev
+```
+
+  The worker only needs to forward `https://api.telegram.org/bot<token>/...`
+  (methods and file downloads). An HTTP(S) proxy also works via standard
+  `HTTPS_PROXY` env. Verify with:
+
+```bash
+journalctl -u mangahue-pro.service -n 30 --no-pager | grep -E 'retrying|Telegram'
+```
+
+### GPU flip
+
+The engine honors `MANGAHUE_CUDA=1` to register the CUDA execution provider
+(CPU fallback for unsupported ops). On the current CPU-only VPS this is
+unset; enable it after migrating to a GPU host — no code change needed.
+
+---
+
 ## Architecture
 
 ```

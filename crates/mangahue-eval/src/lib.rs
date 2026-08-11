@@ -1,6 +1,106 @@
 use image::{GrayImage, RgbImage};
 use serde::{Deserialize, Serialize};
 
+/// Standard page color metrics (the ones color tools report): average RGB,
+/// brightness (mean luminance), average HSV saturation, Hasler-Suestrunk
+/// colorfulness, and luminance contrast (std dev). Computed on a bounded
+/// sample so full-resolution pages stay cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorMetrics {
+    pub avg_rgb: [u8; 3],
+    /// Mean luminance as a 0-1 fraction.
+    pub brightness: f32,
+    /// Mean HSV saturation as a 0-1 fraction.
+    pub avg_saturation: f32,
+    /// Hasler-Suestrunk colorfulness (0-255 units, typical 0-120).
+    pub colorfulness: f32,
+    /// Standard deviation of luminance as a 0-1 fraction.
+    pub contrast: f32,
+}
+
+/// Compute the standard page color metrics on a bounded pixel sample
+/// (<= ~200k pixels, uniformly strided).
+pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
+    let (width, height) = image.dimensions();
+    let total = (width as usize).saturating_mul(height as usize);
+    if total == 0 {
+        return ColorMetrics {
+            avg_rgb: [0, 0, 0],
+            brightness: 0.0,
+            avg_saturation: 0.0,
+            colorfulness: 0.0,
+            contrast: 0.0,
+        };
+    }
+    let step = (total / 200_000).max(1);
+    let mut r_sum = 0.0f64;
+    let mut g_sum = 0.0f64;
+    let mut b_sum = 0.0f64;
+    let mut sat_sum = 0.0f64;
+    let mut luma_sum = 0.0f64;
+    let mut luma_sq = 0.0f64;
+    let mut rg_sum = 0.0f64;
+    let mut rg_sq = 0.0f64;
+    let mut yb_sum = 0.0f64;
+    let mut yb_sq = 0.0f64;
+    let mut n = 0u64;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let index = y as usize * width as usize + x as usize;
+        if index % step != 0 {
+            continue;
+        }
+        let r = pixel[0] as f64;
+        let g = pixel[1] as f64;
+        let b = pixel[2] as f64;
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let sat = if max > 0.0 { (max - min) / max } else { 0.0 };
+        let rg = r - g;
+        let yb = 0.5 * (r + g) - b;
+        r_sum += r;
+        g_sum += g;
+        b_sum += b;
+        sat_sum += sat;
+        luma_sum += luma;
+        luma_sq += luma * luma;
+        rg_sum += rg;
+        rg_sq += rg * rg;
+        yb_sum += yb;
+        yb_sq += yb * yb;
+        n += 1;
+    }
+    if n == 0 {
+        return ColorMetrics {
+            avg_rgb: [0, 0, 0],
+            brightness: 0.0,
+            avg_saturation: 0.0,
+            colorfulness: 0.0,
+            contrast: 0.0,
+        };
+    }
+    let nf = n as f64;
+    let luma_mean = luma_sum / nf;
+    let luma_var = (luma_sq / nf - luma_mean * luma_mean).max(0.0);
+    let rg_mean = rg_sum / nf;
+    let rg_var = (rg_sq / nf - rg_mean * rg_mean).max(0.0);
+    let yb_mean = yb_sum / nf;
+    let yb_var = (yb_sq / nf - yb_mean * yb_mean).max(0.0);
+    let colorfulness =
+        (rg_var.sqrt() + yb_var.sqrt()) + 0.3 * (rg_mean * rg_mean + yb_mean * yb_mean).sqrt();
+    ColorMetrics {
+        avg_rgb: [
+            (r_sum / nf).round().clamp(0.0, 255.0) as u8,
+            (g_sum / nf).round().clamp(0.0, 255.0) as u8,
+            (b_sum / nf).round().clamp(0.0, 255.0) as u8,
+        ],
+        brightness: (luma_mean / 255.0) as f32,
+        avg_saturation: (sat_sum / nf) as f32,
+        colorfulness: colorfulness as f32,
+        contrast: (luma_var.sqrt() / 255.0) as f32,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QualityReport {
     pub line_preservation_score: f32,
