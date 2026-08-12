@@ -2043,6 +2043,11 @@ fn native_session_builder() -> Result<ort::session::builder::SessionBuilder> {
 /// the handle so it stays resident — makes ort's own `dlopen` find it already
 /// mapped: it returns the existing handle without re-running constructors and
 /// cannot fail. Idempotent; safe to call from every entry point.
+///
+/// The loaded library is also version-checked before ort ever initializes:
+/// Windows ships an old in-box onnxruntime (1.17) in System32 for Windows ML,
+/// and ort 2.0.0-rc.12 with `api-24` deadlocks on it instead of erroring.
+/// We fail fast with an actionable error instead.
 #[cfg(feature = "native-onnx")]
 pub fn preload_onnx_runtime() -> Result<()> {
     static PRELOADED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
@@ -2062,6 +2067,21 @@ pub fn preload_onnx_runtime() -> Result<()> {
                 });
             match unsafe { libloading::Library::new(&library) } {
                 Ok(handle) => {
+                    if let Err(reason) = check_onnx_runtime_version(&handle) {
+                        tracing::error!(
+                            library = %library,
+                            error = %reason,
+                            "rejected ONNX Runtime: {reason} (set ORT_DYLIB_PATH to a recent \
+                             onnxruntime.dll, e.g. .mangahue/python-runtime/Lib/site-packages/\
+                             onnxruntime/capi/onnxruntime.dll)"
+                        );
+                        return Err(format!(
+                            "incompatible ONNX Runtime ({library}): {reason}. \
+                             Set ORT_DYLIB_PATH to a recent onnxruntime (>= 1.23), e.g. \
+                             .mangahue/python-runtime/Lib/site-packages/onnxruntime/capi/\
+                             onnxruntime.dll"
+                        ));
+                    }
                     // Leak on purpose: the library must stay mapped for the
                     // whole process lifetime so ort's dlopen reuses it.
                     std::mem::forget(handle);
@@ -2082,6 +2102,92 @@ pub fn preload_onnx_runtime() -> Result<()> {
         })
         .clone()
         .map_err(anyhow::Error::msg)
+}
+
+/// The C API level this crate's `ort` build was compiled against
+/// (`api-24` feature): ort asks the runtime for exactly this version.
+#[cfg(feature = "native-onnx")]
+const ORT_API_LEVEL: u32 = 24;
+
+/// Verify the pre-loaded ONNX Runtime actually implements the C API level
+/// `ort` will request (`api-24`). ort 2.0.0-rc.12's error path deadlocks
+/// instead of reporting, so this check must run before ort initializes.
+///
+/// `OrtApiBase` member order changed across releases (1.19+ put the
+/// versioned `GetApi` first; older and Windows' in-box builds put
+/// `GetVersionString` first), so the members are probed layout-agnostically:
+/// each is called as `GetApi(ORT_API_LEVEL)`, and a member that returns a
+/// version STRING instead of a vtable is recognized and skipped.
+#[cfg(feature = "native-onnx")]
+fn check_onnx_runtime_version(handle: &libloading::Library) -> Result<(), String> {
+    unsafe {
+        let get_api_base: libloading::Symbol<unsafe extern "C" fn() -> *const std::ffi::c_void> =
+            handle
+                .get(b"OrtGetApiBase\0")
+                .map_err(|e| format!("OrtGetApiBase not exported: {e}"))?;
+        let base = get_api_base() as *const usize;
+        if base.is_null() {
+            return Err("OrtGetApiBase returned null".to_string());
+        }
+        let mut found_version: Option<String> = None;
+        // Probe the first two members; all known layouts place the relevant
+        // entry points there.
+        for idx in 0..2usize {
+            let member = *base.add(idx);
+            if member == 0 {
+                continue;
+            }
+            let probe: unsafe extern "C" fn(u32) -> *const std::ffi::c_void =
+                std::mem::transmute(member);
+            let result = probe(ORT_API_LEVEL);
+            if result.is_null() {
+                continue;
+            }
+            if looks_like_version_string(result) {
+                // This member is GetVersionString, not GetApi: remember the
+                // version for diagnostics and keep probing.
+                found_version = std::ffi::CStr::from_ptr(result as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned()
+                    .into();
+                continue;
+            }
+            tracing::info!(
+                version = %found_version.as_deref().unwrap_or("unknown"),
+                api_level = ORT_API_LEVEL,
+                "ONNX Runtime version check passed"
+            );
+            return Ok(());
+        }
+        let version = found_version
+            .map(|v| format!("onnxruntime {v} "))
+            .unwrap_or_default();
+        Err(format!(
+            "{version}does not implement C API level {ORT_API_LEVEL} (ort 2.0.0-rc.12 \
+             deadlocks on such runtimes; Windows' in-box System32 onnxruntime 1.17 is a \
+             common offender). Set ORT_DYLIB_PATH to a recent onnxruntime >= 1.23"
+        ))
+    }
+}
+
+/// A vtable pointer vs. a version string, for `OrtApiBase` member probing:
+/// version strings are printable digits/dots ending in a NUL within 16
+/// bytes; vtable pointers contain non-printable bytes (function addresses)
+/// almost immediately.
+#[cfg(feature = "native-onnx")]
+fn looks_like_version_string(ptr: *const std::ffi::c_void) -> bool {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, 16) };
+    let mut len = 0usize;
+    for byte in bytes {
+        if *byte == 0 {
+            break;
+        }
+        if !byte.is_ascii_digit() && *byte != b'.' {
+            return false;
+        }
+        len += 1;
+    }
+    len >= 3 // a bare "1." or "0." is not a real version
 }
 
 #[cfg(feature = "native-onnx")]
