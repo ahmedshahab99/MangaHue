@@ -1,7 +1,7 @@
 engine:
   mode: fast
   parallel_jobs: 1
-  pyramid_enabled: false
+  pyramid_enabled: true
   hint_propagation_enabled: true
   # Pages the publisher shipped in color pass through untouched (full-color
   # western comics are common): re-colorizing them wastes inference and
