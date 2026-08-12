@@ -2781,7 +2781,28 @@ fn handle_link(
                         break;
                     }
                 }
-                let caption = format!("MangaHue p.{} | {}{}", position + 1, verdict, metrics);
+                // Caption: the manga name and the page number (the same
+                // title is drawn into the image watermark). No detectable
+                // title falls back to the product name.
+                let caption = if job_title.is_empty() {
+                    format!("MangaHue · page {}/{}", position + 1, effective_total)
+                } else {
+                    format!(
+                        "{} · page {}/{}",
+                        job_title,
+                        position + 1,
+                        effective_total
+                    )
+                };
+                // Color metrics stay available for diagnostics (they used to
+                // ride in the caption; the caption is user-facing now).
+                tracing::info!(
+                    page = position + 1,
+                    total = effective_total,
+                    sat = metrics,
+                    verdict = %verdict,
+                    "chapter page delivered"
+                );
                 let delivery_path =
                     prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
                 // Page watermark: manga title + page number on the image.
