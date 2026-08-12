@@ -952,6 +952,11 @@ impl MangaHueEngine {
             style: &scene_style,
             config: &config.postprocess,
             reference_image: reference_image.as_ref(),
+            // Semantic region hints finally reach the output through the
+            // hint-guided chroma correction pass (DDColor never sees them
+            // itself).
+            hint_map: Some(&hints.hint_map),
+            hint_mask: Some(&hints.hint_mask),
             chroma_signal,
         })?;
         if check_cancel(&cancel) {

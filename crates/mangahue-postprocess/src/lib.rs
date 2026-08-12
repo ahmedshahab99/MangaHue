@@ -24,6 +24,11 @@ pub struct PostprocessInput<'a> {
     pub style: &'a StyleProfile,
     pub config: &'a PostprocessSection,
     pub reference_image: Option<&'a RgbImage>,
+    /// Semantic region hints (skin/hair/clothing/background painted with
+    /// palette colors): only consumed by the hint-guided chroma correction
+    /// pass — the DDColor backend itself never sees them.
+    pub hint_map: Option<&'a RgbImage>,
+    pub hint_mask: Option<&'a GrayImage>,
     /// The model's own mean chroma on this page (opponent magnitude
     /// |R-L|+|B-L|, 0-255 units), measured right after inference. The
     /// smart governor uses it as the page's color budget so grading
@@ -63,6 +68,10 @@ pub struct PostprocessReport {
     pub face_pixels_painted: u64,
     #[serde(default)]
     pub semantic_chroma_restored: u64,
+    /// Pixels whose hue was corrected toward the hint map (semantic region
+    /// hints reaching the DDColor output).
+    #[serde(default)]
+    pub hint_guided_pixels: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
     /// Purity metrics (model-first audit): how much of the model's own
@@ -80,6 +89,7 @@ pub struct PostprocessReport {
 pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessReport)> {
     let mut output = input.colorized;
     let semantic_evidence = output.clone();
+
     let mut report = PostprocessReport {
         bubble_pixels_restored: 0,
         protected_pixels_restored: 0,
@@ -98,6 +108,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         reference_shadow_pixels_shaped: 0,
         face_pixels_painted: 0,
         semantic_chroma_restored: 0,
+        hint_guided_pixels: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
         model_pixels_overridden: 0,
@@ -105,6 +116,25 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         model_chroma_retention: 1.0,
         mean_hue_shift_deg: 0.0,
     };
+
+    // Hint-guided chroma correction: the semantic region hints (skin, hair,
+    // clothing, background painted with palette colors) finally reach the
+    // DDColor output here. Where the hint map is confident and the model's
+    // chroma is weak (near-gray guess), the pixel's hue snaps toward the
+    // hint color while the model's value keeps the shading — the model stays
+    // the artist, the hints fix its blind spots. Runs FIRST so every
+    // downstream pass (region renderer, grading) sees corrected colors.
+    if input.config.hint_chroma_strength > 0.0 {
+        if let (Some(hint_map), Some(hint_mask)) = (input.hint_map, input.hint_mask) {
+            report.hint_guided_pixels = hint_guided_chroma_correction(
+                &mut output,
+                hint_map,
+                hint_mask,
+                input.line_mask,
+                input.config.hint_chroma_strength,
+            ) as u64;
+        }
+    }
 
     if input.config.bleeding_correction && !input.config.palette_correction {
         // When the region graph renders, it re-paints the ink-adjacent band
@@ -1415,6 +1445,98 @@ pub fn restore_lines_adaptive(image: &mut RgbImage, line_mask: &GrayImage, stren
     }
 }
 
+/// Hint-guided chroma correction: where the hint map is confident and the
+/// model's own chroma is weak, blend the pixel's color toward the hint
+/// hue while keeping the model's LUMA (shading) untouched. The hint color
+/// is first re-targeted onto the model's luma, then lerped in RGB — luma
+/// is linear, so the blend preserves shading exactly. The blend is
+/// proportional to the hint mask strength and inversely proportional to
+/// the model's saturation, so confident model colors are never overridden
+/// (model-first) and unpainted/paper regions are skipped.
+fn hint_guided_chroma_correction(
+    output: &mut RgbImage,
+    hint_map: &RgbImage,
+    hint_mask: &GrayImage,
+    line_mask: &GrayImage,
+    strength: f32,
+) -> usize {
+    let (w, h) = output.dimensions();
+    if hint_map.dimensions() != (w, h)
+        || hint_mask.dimensions() != (w, h)
+        || line_mask.dimensions() != (w, h)
+    {
+        return 0;
+    }
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return 0;
+    }
+    // Model saturation above which the model's guess is treated as
+    // confident and left alone.
+    const CONFIDENT_SAT: f32 = 0.30;
+    // Rec. 709 luma weights (the perceptually fair "shading" measure).
+    const LUM_W: [f32; 3] = [0.2126, 0.7152, 0.0722];
+    let luma = |p: &Rgb<u8>| -> f32 {
+        LUM_W[0] * p[0] as f32 + LUM_W[1] * p[1] as f32 + LUM_W[2] * p[2] as f32
+    };
+    let mut changed = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if line_mask.get_pixel(x, y)[0] > 184 {
+                continue; // ink
+            }
+            let mask = hint_mask.get_pixel(x, y)[0] as f32 / 255.0;
+            if mask <= 0.15 {
+                continue;
+            }
+            let model = *output.get_pixel(x, y);
+            let hint = *hint_map.get_pixel(x, y);
+            // Model saturation: near-gray guesses are the blind spots the
+            // hints may correct; confident colors stay untouched.
+            let m_max = model[0].max(model[1]).max(model[2]) as f32;
+            let m_min = model[0].min(model[1]).min(model[2]) as f32;
+            if m_max <= 0.0 {
+                continue;
+            }
+            let ms = (m_max - m_min) / m_max;
+            if ms >= CONFIDENT_SAT {
+                continue; // model is confident: keep its color
+            }
+            // The hint must carry real chroma: unpainted/paper/black hints
+            // have nothing to guide with.
+            let h_max = hint[0].max(hint[1]).max(hint[2]) as f32;
+            let h_min = hint[0].min(hint[1]).min(hint[2]) as f32;
+            let hs = (h_max - h_min) / h_max.max(1.0);
+            if hs < 0.08 {
+                continue;
+            }
+            let model_luma = luma(&model);
+            let hint_luma = luma(&hint);
+            if hint_luma < 1.0 {
+                continue; // near-black hint: nothing to guide with
+            }
+            let blend = mask * strength * (1.0 - ms / CONFIDENT_SAT);
+            if blend <= 0.02 {
+                continue;
+            }
+            // Re-target the hint color onto the model's luma, then lerp in
+            // RGB: luma stays exactly the model's, hue moves toward the
+            // hint, and the blend carries the hint's saturation.
+            let scale = model_luma / hint_luma;
+            let mut out = [0u8; 3];
+            for c in 0..3 {
+                let target = hint[c] as f32 * scale;
+                out[c] = (model[c] as f32 + (target - model[c] as f32) * blend)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+            *output.get_pixel_mut(x, y) = Rgb(out);
+            changed += 1;
+        }
+    }
+    changed
+}
+
 pub fn sharpen_lightly(image: &mut RgbImage, amount: f32) {
     if amount <= 0.0 {
         return;
@@ -1586,6 +1708,7 @@ mod tests {
             governor_min_gain: 0.8,
             governor_max_gain: 1.25,
             governor_target_warmth: 45.0,
+            hint_chroma_strength: 0.0,
         };
 
         let (output, report) = finalize(PostprocessInput {
@@ -1599,12 +1722,44 @@ mod tests {
             style: &style,
             config: &config,
             reference_image: None,
+            hint_map: None,
+            hint_mask: None,
             chroma_signal: None,
         })
         .unwrap();
 
         assert_eq!(output.get_pixel(1, 1).0, [210, 132, 104]);
         assert_eq!(report.protected_pixels_restored, 0);
+    }
+
+    #[test]
+    fn hint_guided_correction_snaps_weak_model_color_to_hint_hue() {
+        // Model output is a weak gray-green; the hint says skin (warm hue).
+        let mut output = RgbImage::from_pixel(2, 1, Rgb([150, 152, 148]));
+        output.put_pixel(1, 0, Rgb([140, 60, 50])); // confident model color
+        let hint_map = RgbImage::from_pixel(2, 1, Rgb([242, 208, 182]));
+        let hint_mask = GrayImage::from_pixel(2, 1, Luma([255]));
+        let lines = GrayImage::from_pixel(2, 1, Luma([0]));
+
+        let changed =
+            hint_guided_chroma_correction(&mut output, &hint_map, &hint_mask, &lines, 1.0);
+
+        assert_eq!(changed, 1, "only the weak-chroma pixel is corrected");
+        let corrected = output.get_pixel(0, 0);
+        // Warm skin hue: R must clearly dominate B, and the model's value
+        // (shading) must be preserved (luma stays close to the original).
+        assert!(
+            corrected[0] as i32 - corrected[2] as i32 > 25,
+            "hue snapped toward warm skin, got {:?}",
+            corrected
+        );
+        let luma = |p: &Rgb<u8>| 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+        assert!(
+            (luma(corrected) - luma(&Rgb([150, 152, 148]))).abs() < 3.0,
+            "shading preserved"
+        );
+        // The confident model color is untouched.
+        assert_eq!(output.get_pixel(1, 0).0, [140, 60, 50]);
     }
 
     #[test]

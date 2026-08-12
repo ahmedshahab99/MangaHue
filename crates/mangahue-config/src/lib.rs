@@ -153,6 +153,14 @@ pub struct PostprocessSection {
     /// and ink remain protected.
     #[serde(default = "default_soft_coverage")]
     pub soft_coverage: bool,
+    /// Hint-guided chroma correction strength (0 = off): where the hint map
+    /// is confident and the model's own chroma is weak (near-gray output),
+    /// the pixel's hue snaps toward the hint color while the model's value
+    /// (shading) is preserved. This is how the semantic region hints reach
+    /// the DDColor output: the model stays the artist, the hints fix its
+    /// blind spots.
+    #[serde(default)]
+    pub hint_chroma_strength: f32,
     /// Muted target grade: reshapes every pixel's saturation toward the
     /// measured profile of the reference style (low-key warm look) instead
     /// of the default saturation boost.
@@ -574,6 +582,7 @@ impl Default for EngineConfig {
                 governor_min_gain: default_governor_min_gain(),
                 governor_max_gain: default_governor_max_gain(),
                 governor_target_warmth: default_governor_target_warmth(),
+                hint_chroma_strength: 0.0,
             },
             output: OutputSection {
                 format: "png".to_string(),

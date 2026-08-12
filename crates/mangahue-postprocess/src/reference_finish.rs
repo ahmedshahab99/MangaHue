@@ -616,6 +616,7 @@ mod tests {
             governor_min_gain: 0.8,
             governor_max_gain: 1.25,
             governor_target_warmth: 45.0,
+            hint_chroma_strength: 0.0,
         }
     }
 

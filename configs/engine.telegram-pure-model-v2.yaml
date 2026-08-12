@@ -98,6 +98,11 @@ postprocess:
   # Warmth governor: the model's palette leans golden; compress warm pixels
   # toward neutral until the page's midtone R-B matches this target.
   governor_target_warmth: 40.0
+  # Hint-guided chroma correction: semantic region hints (skin/hair/clothing/
+  # background painted with palette colors) reach the DDColor output where
+  # the model's chroma is weak — hue snaps to the known material color while
+  # the model's shading is preserved. 0 disables.
+  hint_chroma_strength: 0.35
 
 output:
   format: png
