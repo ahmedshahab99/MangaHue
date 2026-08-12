@@ -2,7 +2,7 @@ engine:
   mode: fast
   parallel_jobs: 1
   pyramid_enabled: false
-  hint_propagation_enabled: false
+  hint_propagation_enabled: true
   # Pages the publisher shipped in color pass through untouched (full-color
   # western comics are common): re-colorizing them wastes inference and
   # distorts the artist's palette. Mean HSV saturation over non-paper pixels
@@ -81,7 +81,7 @@ postprocess:
   model_chroma_bar_mid: 10.0
   model_chroma_gain: 1.0
   palette_harmony_strength: 0.12
-  face_paint_strength: 0.45
+  face_paint_strength: 0.7
   # Soft cel depth: ink-cast directional shadows (AO) at their own strength,
   # with the page's own estimated light direction. No photoreal relighting
   # (relighting_strength stays 0) — just readable cel shading.
@@ -101,8 +101,12 @@ postprocess:
   # Hint-guided chroma correction: semantic region hints (skin/hair/clothing/
   # background painted with palette colors) reach the DDColor output where
   # the model's chroma is weak — hue snaps to the known material color while
-  # the model's shading is preserved. 0 disables.
-  hint_chroma_strength: 0.35
+  # the model's shading is preserved. 0 disables. Raised from 0.35 after
+  # measuring: at 0.35 the model's weak-chroma blind spots (the very pixels
+  # the hints exist for) only moved ~12-23% toward the hint hue. The muted
+  # grade and smart governor now skip hint-corrected pixels (ground truth),
+  # so this strength survives grading intact.
+  hint_chroma_strength: 0.85
 
 output:
   format: png

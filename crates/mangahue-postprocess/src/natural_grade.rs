@@ -118,11 +118,21 @@ pub(crate) fn smart_color_governor(
     max_gain: f32,
     target_warmth: f32,
     chroma_signal: Option<f32>,
+    hint_mask: Option<&GrayImage>,
 ) {
     let (width, height) = image.dimensions();
     if width == 0 || height == 0 || line_mask.dimensions() != (width, height) {
         return;
     }
+    // Hint-corrected pixels are ground truth (palette-accurate material
+    // hues): the governor's chroma gain and warmth compression are tuned
+    // for the model's golden cast and would crush them (measured: face
+    // saturation 0.136 -> 0.076 through grading).
+    let is_hint_pixel = |x: u32, y: u32| -> bool {
+        hint_mask.is_some_and(|mask| {
+            mask.dimensions() == (width, height) && mask.get_pixel(x, y)[0] > 127
+        })
+    };
     // Measure (sampled, <= ~120k px): saturation, colorfulness and warmth
     // (mean R-B over midtones, 0-255 units).
     let total = width as usize * height as usize;
@@ -190,6 +200,9 @@ pub(crate) fn smart_color_governor(
         return;
     }
     for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if is_hint_pixel(x, y) {
+            continue;
+        }
         if line_mask.get_pixel(x, y)[0] > 184 {
             continue;
         }
@@ -222,6 +235,9 @@ pub(crate) fn smart_color_governor(
         if warmth_err.abs() >= 2.0 {
             let shift = warmth_err * 0.35;
             for (x, y, pixel) in image.enumerate_pixels_mut() {
+                if is_hint_pixel(x, y) {
+                    continue;
+                }
                 if line_mask.get_pixel(x, y)[0] > 184 {
                     continue;
                 }
@@ -260,6 +276,7 @@ pub(crate) fn muted_target_grade(
     original_gray: &GrayImage,
     line_mask: &GrayImage,
     bubble_mask: &GrayImage,
+    hint_mask: Option<&GrayImage>,
     strength: f32,
     hue_shift_deg: f32,
     yellow_shift_deg: f32,
@@ -282,6 +299,15 @@ pub(crate) fn muted_target_grade(
     let strength = strength.clamp(0.0, 1.0);
     for y in 0..height {
         for x in 0..width {
+            // Hint-corrected pixels carry palette-accurate ground truth:
+            // the grade was tuned to reshape the MODEL's colors and would
+            // otherwise crush/re-hue exactly the blind spots the hints
+            // just fixed (measured: face saturation 0.136 -> 0.076).
+            if let Some(mask) = hint_mask {
+                if mask.dimensions() == (width, height) && mask.get_pixel(x, y)[0] > 127 {
+                    continue;
+                }
+            }
             let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
             let bubble = bubble_mask.get_pixel(x, y)[0] as f32 / 255.0;
             if ink > 0.72 || bubble > 0.38 {
@@ -443,7 +469,8 @@ mod tests {
         let lines = GrayImage::from_pixel(16, 16, Luma([0]));
         let bubbles = GrayImage::from_pixel(16, 16, Luma([0]));
         muted_target_grade(
-            &mut image, &gray, &lines, &bubbles, 1.0, 0.0, 0.0, 1.0, 0.19, 0.27, 0.22, 0.034, 0.0,
+            &mut image, &gray, &lines, &bubbles, None, 1.0, 0.0, 0.0, 1.0, 0.19, 0.27, 0.22, 0.034,
+            0.0,
         );
         let p = image.get_pixel(8, 8);
         let (h, s, v) = rgb_to_hsv(p[0], p[1], p[2]);
@@ -464,9 +491,55 @@ mod tests {
         let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
         let before = *image.get_pixel(4, 4);
         muted_target_grade(
-            &mut image, &gray, &lines, &bubbles, 1.0, 20.0, 15.0, 0.85, 0.19, 0.27, 0.22, 0.034,
-            0.0,
+            &mut image, &gray, &lines, &bubbles, None, 1.0, 20.0, 15.0, 0.85, 0.19, 0.27, 0.22,
+            0.034, 0.0,
         );
         assert_eq!(*image.get_pixel(4, 4), before);
+    }
+
+    #[test]
+    fn muted_grade_leaves_hint_corrected_pixels_untouched() {
+        // A saturated skin pixel carrying a strong hint must survive the
+        // grade intact (hints are ground truth; grading is for the model's
+        // own colors). Without the hint mask the grade would pull it toward
+        // the muted mid target.
+        let mut image = RgbImage::from_pixel(8, 8, Rgb([235, 165, 130]));
+        let gray = GrayImage::from_pixel(8, 8, Luma([150]));
+        let lines = GrayImage::from_pixel(8, 8, Luma([0]));
+        let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
+        let hints = GrayImage::from_pixel(8, 8, Luma([200]));
+        let before = *image.get_pixel(4, 4);
+        muted_target_grade(
+            &mut image,
+            &gray,
+            &lines,
+            &bubbles,
+            Some(&hints),
+            1.0,
+            16.0,
+            18.0,
+            0.55,
+            0.24,
+            0.35,
+            0.33,
+            0.02,
+            0.9,
+        );
+        assert_eq!(
+            *image.get_pixel(4, 4),
+            before,
+            "hint-corrected pixel regraded"
+        );
+        // Sanity: the same grade WITHOUT the hint mask does change the pixel.
+        let mut plain = RgbImage::from_pixel(8, 8, Rgb([235, 165, 130]));
+        muted_target_grade(
+            &mut plain, &gray, &lines, &bubbles, None, 1.0, 16.0, 18.0, 0.55, 0.24, 0.35, 0.33,
+            0.02, 0.9,
+        );
+        assert_ne!(
+            *plain.get_pixel(4, 4),
+            before,
+            "grade without hint mask is inert"
+        );
     }
 }

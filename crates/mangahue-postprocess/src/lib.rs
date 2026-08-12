@@ -260,6 +260,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.original_grayscale,
             input.line_mask,
             input.bubble_mask,
+            input.hint_mask,
             input.config.muted_strength,
             input.config.muted_hue_shift_deg,
             input.config.muted_yellow_shift_deg,
@@ -285,6 +286,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.config.governor_max_gain,
             input.config.governor_target_warmth,
             input.chroma_signal,
+            input.hint_mask,
         );
     }
 

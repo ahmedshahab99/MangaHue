@@ -2152,6 +2152,26 @@ fn check_onnx_runtime_version(handle: &libloading::Library) -> Result<(), String
                     .into();
                 continue;
             }
+            // The runtime implements the API level: report its version too
+            // (best effort — newer layouts put GetVersionString later).
+            if found_version.is_none() {
+                for extra in idx + 1..=3usize {
+                    let member = *base.add(extra);
+                    if member == 0 {
+                        continue;
+                    }
+                    let version_probe: unsafe extern "C" fn() -> *const std::ffi::c_char =
+                        std::mem::transmute(member);
+                    let vp = version_probe();
+                    if !vp.is_null() && looks_like_version_string(vp as *const std::ffi::c_void) {
+                        found_version = std::ffi::CStr::from_ptr(vp)
+                            .to_string_lossy()
+                            .into_owned()
+                            .into();
+                        break;
+                    }
+                }
+            }
             tracing::info!(
                 version = %found_version.as_deref().unwrap_or("unknown"),
                 api_level = ORT_API_LEVEL,

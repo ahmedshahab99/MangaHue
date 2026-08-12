@@ -1017,6 +1017,10 @@ impl MangaHueEngine {
                     postprocess_report.semantic_chroma_restored as f64,
                 )
                 .metric(
+                    "hint_guided_pixels",
+                    postprocess_report.hint_guided_pixels as f64,
+                )
+                .metric(
                     "bubble_pixels_restored",
                     postprocess_report.bubble_pixels_restored as f64,
                 )
