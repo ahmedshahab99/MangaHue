@@ -296,6 +296,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.original_grayscale,
             tone_mask,
             input.config.line_strength * 0.55,
+            input.config.tone_chroma_cap,
             &mut report.tone_pixels_preserved,
         );
     }
@@ -1391,6 +1392,7 @@ pub fn preserve_screentones(
     original_gray: &GrayImage,
     tone_mask: &GrayImage,
     strength: f32,
+    chroma_cap: f32,
     count: &mut u64,
 ) {
     let blend = strength.clamp(0.2, 1.0);
@@ -1404,11 +1406,27 @@ pub fn preserve_screentones(
         let tone_strength = blend * (0.52 + 0.16 * (1.0 - original_luma / 255.0));
         let target_luma =
             colored_luma + (original_luma - colored_luma) * tone_strength.clamp(0.0, 0.72);
-        let chroma = [
+        let mut chroma = [
             pixel[0] as f32 - colored_luma,
             pixel[1] as f32 - colored_luma,
             pixel[2] as f32 - colored_luma,
         ];
+        // Tone chroma is invented (the source page is grayscale): the
+        // DDColor-family models paint gray dot patterns loud red/warm hues,
+        // which shows up as "red dots" on the page. Cap the saturation so
+        // the dot pattern keeps only a gentle tint (hue direction intact).
+        if chroma_cap > 0.0 {
+            let mag = (chroma[0] * chroma[0] + chroma[1] * chroma[1] + chroma[2] * chroma[2])
+                .sqrt()
+                .max(1e-6);
+            let cap_mag = chroma_cap * target_luma.max(1.0);
+            if mag > cap_mag {
+                let scale = cap_mag / mag;
+                for value in &mut chroma {
+                    *value *= scale;
+                }
+            }
+        }
         let mut gamut_scale = 1.0f32;
         for value in chroma {
             if value > 0.0 {
@@ -1670,6 +1688,7 @@ mod tests {
             restore_lines: false,
             line_strength: 1.0,
             bubble_cleanup: true,
+            tone_chroma_cap: 0.18,
             bleeding_correction: false,
             palette_correction: false,
             final_sharpening: 0.0,
@@ -1880,14 +1899,17 @@ mod tests {
     }
 
     #[test]
-    fn screentone_restoration_preserves_chroma_while_recovering_luma() {
+    fn screentone_restoration_recovers_luma_and_caps_invented_chroma() {
+        // The source page is grayscale, so tone chroma is the model's
+        // invention — the pass restores the dot pattern's luma and caps
+        // the chroma ("red dots" fix) while keeping the hue direction.
         let mut image = RgbImage::from_pixel(1, 1, Rgb([180, 80, 60]));
         let original = GrayImage::from_pixel(1, 1, Luma([180]));
         let tone_mask = GrayImage::from_pixel(1, 1, Luma([255]));
         let before_luma: f32 = 0.2126 * 180.0 + 0.7152 * 80.0 + 0.0722 * 60.0;
         let mut restored = 0;
 
-        preserve_screentones(&mut image, &original, &tone_mask, 1.0, &mut restored);
+        preserve_screentones(&mut image, &original, &tone_mask, 1.0, 0.18, &mut restored);
 
         let pixel = image.get_pixel(0, 0);
         let after_luma =
@@ -1895,7 +1917,24 @@ mod tests {
         let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
         assert_eq!(restored, 1);
         assert!((180.0f32 - after_luma).abs() < (180.0f32 - before_luma).abs());
-        assert!(chroma >= 100);
+        // Loud invented red is capped to a gentle tint...
+        assert!(chroma <= 55, "tone chroma capped, got {chroma}");
+        // ...but the warm hue direction survives (r > g > b).
+        assert!(pixel[0] > pixel[1] && pixel[1] > pixel[2], "warm tint kept");
+    }
+
+    #[test]
+    fn screentone_cap_zero_keeps_full_chroma() {
+        let mut image = RgbImage::from_pixel(1, 1, Rgb([180, 80, 60]));
+        let original = GrayImage::from_pixel(1, 1, Luma([180]));
+        let tone_mask = GrayImage::from_pixel(1, 1, Luma([255]));
+        let mut restored = 0;
+
+        preserve_screentones(&mut image, &original, &tone_mask, 1.0, 0.0, &mut restored);
+
+        let pixel = image.get_pixel(0, 0);
+        let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
+        assert!(chroma >= 100, "cap 0 keeps the model's chroma, got {chroma}");
     }
 
     #[test]

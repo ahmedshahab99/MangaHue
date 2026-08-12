@@ -83,6 +83,13 @@ postprocess:
   governor_target_warmth: 42.0
   # Vivid variant: full hint authority.
   hint_chroma_strength: 1.0
+  # Screentones are grayscale in the source: the model invents their chroma,
+
+  # and DDColor-family models paint gray dot patterns loud red (the "red dots"
+
+  # complaint). Cap tone saturation to a gentle tint; 0 keeps full chroma.
+
+  tone_chroma_cap: 0.18
 
 output:
   format: png

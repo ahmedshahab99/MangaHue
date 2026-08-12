@@ -161,6 +161,14 @@ pub struct PostprocessSection {
     /// blind spots.
     #[serde(default)]
     pub hint_chroma_strength: f32,
+    /// Maximum saturation allowed on screentone pixels (0-1; the source
+    /// page is grayscale, so tone chroma is always the model's invention —
+    /// the DDColor-family models paint gray dot patterns red/warm, which
+    /// reads as "red dots" on the page). The tone pass preserves the dot
+    /// pattern's luma and caps its chroma at this value, keeping a gentle
+    /// tint instead of loud invented color. 0 keeps full chroma.
+    #[serde(default = "default_tone_chroma_cap")]
+    pub tone_chroma_cap: f32,
     /// Muted target grade: reshapes every pixel's saturation toward the
     /// measured profile of the reference style (low-key warm look) instead
     /// of the default saturation boost.
@@ -329,6 +337,10 @@ fn default_soft_coverage() -> bool {
 
 fn default_region_chroma_separation() -> f32 {
     34.0
+}
+
+fn default_tone_chroma_cap() -> f32 {
+    0.18
 }
 
 fn default_muted_strength() -> f32 {
@@ -583,6 +595,7 @@ impl Default for EngineConfig {
                 governor_max_gain: default_governor_max_gain(),
                 governor_target_warmth: default_governor_target_warmth(),
                 hint_chroma_strength: 0.0,
+                tone_chroma_cap: default_tone_chroma_cap(),
             },
             output: OutputSection {
                 format: "png".to_string(),
