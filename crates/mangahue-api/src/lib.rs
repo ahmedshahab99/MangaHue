@@ -49,7 +49,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::io::ReaderStream;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -241,7 +241,6 @@ pub struct ApiState {
     jobs: Arc<RwLock<HashMap<String, ApiJob>>>,
     pub jobs_dir: PathBuf,
     pub styles_dir: PathBuf,
-    pub studio_dir: PathBuf,
     pub cancel_tokens: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     pub event_channels: Arc<RwLock<HashMap<String, broadcast::Sender<String>>>>,
     pub job_slots: Arc<Semaphore>,
@@ -264,7 +263,6 @@ pub struct ApiServerConfig {
     pub addr: SocketAddr,
     pub jobs_dir: PathBuf,
     pub styles_dir: PathBuf,
-    pub studio_dir: PathBuf,
     pub production_db: PathBuf,
     pub public_api: bool,
     /// Root directory that /api/file and sandboxed job paths resolve under.
@@ -430,8 +428,6 @@ pub struct DoctorRequest {
     pub metadata_path: PathBuf,
     #[serde(default = "default_jobs_dir")]
     pub jobs_dir: PathBuf,
-    #[serde(default = "default_studio_dir")]
-    pub studio_dir: PathBuf,
     #[serde(default = "default_sample_input_path")]
     pub sample_input: PathBuf,
     #[serde(default = "default_python_command")]
@@ -445,7 +441,6 @@ impl Default for DoctorRequest {
             styles_dir: default_styles_dir(),
             metadata_path: default_model_metadata_path(),
             jobs_dir: default_jobs_dir(),
-            studio_dir: default_studio_dir(),
             sample_input: default_sample_input_path(),
             python: default_python_command(),
         }
@@ -590,7 +585,6 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         jobs: Arc::new(RwLock::new(recovered_jobs)),
         jobs_dir: config.jobs_dir,
         styles_dir: config.styles_dir,
-        studio_dir: config.studio_dir,
         cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
         event_channels: Arc::new(RwLock::new(HashMap::new())),
         job_slots: Arc::new(Semaphore::new(config.max_concurrent_jobs.max(1))),
@@ -620,7 +614,6 @@ pub fn router(state: ApiState) -> Router {
 }
 
 pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
-    let studio_dir = state.studio_dir.clone();
     let public_routes = Router::new()
         .route("/health", get(health))
         .route(
@@ -655,10 +648,6 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
     // corrections take host paths by design and are trusted-admin tools.
     let admin_routes = Router::new()
         .route("/metrics", get(metrics))
-        .route(
-            "/api/gpu/colorize",
-            post(gpu_colorize).layer(DefaultBodyLimit::max(96 * 1024 * 1024)),
-        )
         .route("/api/batch", post(create_batch_job))
         .route("/api/link/ingest", post(ingest_link))
         .route("/api/chapter/import", post(import_chapter))
@@ -699,24 +688,10 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
         )
         .route("/api/corrections", post(add_project_correction));
 
-    // Public static assets: the user webapp, operator Studio, WebGPU studio,
-    // and locally installed models. The configured Studio directory now
-    // points at the exported Next.js application.
-    let web_index = studio_dir.join("index.html");
-    let static_routes = Router::new()
-        .nest_service(
-            "/app",
-            ServeDir::new(&studio_dir).not_found_service(ServeFile::new(&web_index)),
-        )
-        .nest_service(
-            "/operator",
-            ServeDir::new("web/studio").not_found_service(ServeFile::new("web/studio/index.html")),
-        )
-        .nest_service(
-            "/gpu",
-            ServeDir::new("web/gpu").not_found_service(ServeFile::new("web/gpu/index.html")),
-        )
-        .nest_service("/models", ServeDir::new("models"));
+    // Public static assets: locally installed models. The webapp and
+    // operator Studio were removed with the web/ tree; the API is a
+    // headless engine service now.
+    let static_routes = Router::new().nest_service("/models", ServeDir::new("models"));
 
     let app = if public_api {
         // Public mode: everything except /health and static assets requires
@@ -734,31 +709,18 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
             .merge(static_routes)
             .merge(user_authed)
             .merge(admin_authed)
-            .fallback_service(
-                ServeDir::new(&studio_dir)
-                    .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
-            )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 loopback_cors,
             ))
     } else {
-        // Local operator mode. The Studio is served from the same origin and
-        // automatically attaches the guard header to every API call; foreign
-        // web pages cannot send it (a custom header forces a CORS preflight,
-        // which the loopback-only CORS policy rejects). This closes the
-        // "any website you browse can drive the local API" and DNS-rebinding
-        // windows while keeping the operator UX unchanged.
+        // Local operator mode: same-origin API with the loopback guard.
         let guarded_user = user_routes.route_layer(axum::middleware::from_fn(local_guard));
         let guarded_admin = admin_routes.route_layer(axum::middleware::from_fn(local_guard));
         public_routes
             .merge(guarded_user)
             .merge(guarded_admin)
             .merge(static_routes)
-            .fallback_service(
-                ServeDir::new(&studio_dir)
-                    .not_found_service(ServeFile::new(studio_dir.join("index.html"))),
-            )
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 loopback_cors,
@@ -1400,7 +1362,6 @@ async fn run_doctor_default(State(state): State<ApiState>) -> Json<DoctorReport>
     let request = DoctorRequest {
         styles_dir: state.styles_dir,
         jobs_dir: state.jobs_dir,
-        studio_dir: state.studio_dir,
         ..DoctorRequest::default()
     };
     Json(run_doctor_report(request))
@@ -1436,7 +1397,6 @@ pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
         check_model_metadata(&request.metadata_path),
         check_python_sidecar(&request.python),
         check_jobs_dir(&request.jobs_dir),
-        check_studio_dir(&request.studio_dir),
         check_sample_input(&request.sample_input),
     ];
     let status = aggregate_doctor_status(&checks);
@@ -1456,115 +1416,6 @@ pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
 /// uploads the colorized draft + the original page. The server finishes the
 /// draft with the full protected-layer, region director and grading
 /// postprocess, then returns the result file.
-async fn gpu_colorize(
-    State(state): State<ApiState>,
-    mut multipart: axum::extract::Multipart,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let id = Uuid::new_v4().to_string();
-    let dir = state.jobs_dir.join(format!("gpu_{id}"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let mut page_path: Option<PathBuf> = None;
-    let mut draft_path: Option<PathBuf> = None;
-    let mut preset_path: Option<PathBuf> = None;
-    let mut style_path: Option<PathBuf> = None;
-    let mut palette_path: Option<PathBuf> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?
-    {
-        match field.name() {
-            Some("page") => {
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
-                if data.len() > 50 * 1024 * 1024 {
-                    return Err(ApiError::with_status(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        anyhow!("page upload exceeds 50 MB"),
-                    ));
-                }
-                let path = dir.join("page.jpg");
-                std::fs::write(&path, &data)
-                    .with_context(|| format!("failed to write {}", path.display()))?;
-                page_path = Some(path);
-            }
-            Some("draft") => {
-                let data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
-                if data.len() > 50 * 1024 * 1024 {
-                    return Err(ApiError::with_status(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        anyhow!("draft upload exceeds 50 MB"),
-                    ));
-                }
-                let path = dir.join("draft.png");
-                std::fs::write(&path, &data)
-                    .with_context(|| format!("failed to write {}", path.display()))?;
-                draft_path = Some(path);
-            }
-            Some("preset") => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
-                if !text.trim().is_empty() {
-                    preset_path = Some(PathBuf::from(text.trim()));
-                }
-            }
-            Some("style") => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
-                if !text.trim().is_empty() {
-                    style_path = Some(PathBuf::from(text.trim()));
-                }
-            }
-            Some("palette") => {
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|e| ApiError::with_status(StatusCode::BAD_REQUEST, anyhow!(e)))?;
-                if !text.trim().is_empty() {
-                    palette_path = Some(PathBuf::from(text.trim()));
-                }
-            }
-            _ => {}
-        }
-    }
-    let (Some(page_path), Some(draft_path)) = (page_path, draft_path) else {
-        return Err(ApiError::with_status(
-            StatusCode::BAD_REQUEST,
-            anyhow!("multipart requires 'page' and 'draft' image fields"),
-        ));
-    };
-    let output_path = dir.join("result.png");
-    let request = ColorizeRequest {
-        input_path: page_path,
-        output_path: output_path.clone(),
-        draft_path: Some(draft_path),
-        preset_path,
-        style_path,
-        palette_path,
-        cache_dir: Some(state.jobs_dir.clone()),
-        ..ColorizeRequest::default()
-    };
-    let result = MangaHueEngine::new().colorize(request)?;
-    let file_root = state.file_root.clone();
-    let relative = |path: &Path| path.strip_prefix(&file_root).unwrap_or(path).to_path_buf();
-    let report_path = mangahue_image::sibling_with_suffix(&output_path, ".report", "json");
-    Ok(Json(serde_json::json!({
-        "id": id,
-        "result_url": format!("/api/file?path={}", relative(&output_path).display()),
-        "report_url": format!("/api/file?path={}", relative(&report_path).display()),
-        "verdict": result.report.director_verdict,
-    })))
-}
-
 async fn create_colorize_job(
     State(state): State<ApiState>,
     user: Option<Extension<RequestUser>>,
@@ -3260,25 +3111,6 @@ fn default_server_config_path() -> PathBuf {
 }
 
 fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
-    if mangahue_inference::is_openvino_studio_model_dir(model_path) {
-        let python = std::env::var("MANGAHUE_STUDIO_PYTHON")
-            .or_else(|_| std::env::var("MANGAHUE_PYTHON"))
-            .unwrap_or_else(|_| "python".to_string());
-        let output = Command::new(&python)
-            .args([
-                "-c",
-                "import openvino, openvino_genai, PIL, mangahue_train.studio_openvino_worker",
-            ])
-            .output()
-            .with_context(|| format!("failed to start Studio Python runtime '{python}'"))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "Studio Python runtime is incomplete: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        return Ok(());
-    }
     if !mangahue_inference::is_ddcolor_onnx_model(model_path) {
         return Ok(());
     }
@@ -3370,10 +3202,6 @@ fn default_model_metadata_path() -> PathBuf {
 
 fn default_jobs_dir() -> PathBuf {
     PathBuf::from(".mangahue/jobs")
-}
-
-fn default_studio_dir() -> PathBuf {
-    PathBuf::from("web/app/out")
 }
 
 fn default_sample_input_path() -> PathBuf {
@@ -3545,25 +3373,6 @@ fn check_jobs_dir(dir: &Path) -> DoctorCheck {
             format!("failed to create {}: {error}", dir.display()),
             None,
         ),
-    }
-}
-
-fn check_studio_dir(dir: &Path) -> DoctorCheck {
-    let index = dir.join("index.html");
-    if index.exists() {
-        doctor_check(
-            "studio",
-            DoctorStatus::Pass,
-            format!("Studio entrypoint found at {}", index.display()),
-            None,
-        )
-    } else {
-        doctor_check(
-            "studio",
-            DoctorStatus::Warn,
-            format!("Studio entrypoint missing: {}", index.display()),
-            None,
-        )
     }
 }
 
@@ -3928,7 +3737,6 @@ mod tests {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             jobs_dir: dir.path().join("jobs"),
             styles_dir,
-            studio_dir: dir.path().join("studio"),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             job_slots: Arc::new(Semaphore::new(1)),
@@ -4018,7 +3826,6 @@ mod tests {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             jobs_dir: dir.path().join("jobs"),
             styles_dir: dir.path().join("styles"),
-            studio_dir: dir.path().join("studio"),
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             job_slots: Arc::new(Semaphore::new(1)),

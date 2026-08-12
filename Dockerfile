@@ -1,11 +1,4 @@
 # syntax=docker/dockerfile:1
-FROM node:22-bookworm-slim AS web-builder
-WORKDIR /web
-COPY web/app/package.json web/app/package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm npm ci
-COPY web/app .
-RUN npm run build
-
 # ── Rust build stage ──────────────────────────────────────────────────────
 FROM rust:1.96-bookworm AS rust-builder
 WORKDIR /src
@@ -16,10 +9,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
         -p mangahue-api \
         -p mangahue-worker \
         -p mangahue-cli \
+        -p mangahue-telegram \
     && mkdir -p /out \
     && cp /src/target/release/mangahue-api /out/ \
     && cp /src/target/release/mangahue-worker /out/ \
-    && cp /src/target/release/mangahue /out/
+    && cp /src/target/release/mangahue /out/ \
+    && cp /src/target/release/mangahue-telegram /out/
 
 # ── Full runtime (PyTorch + training/eval scripts) ───────────────────────
 FROM python:3.12-slim-bookworm AS runtime
@@ -39,6 +34,7 @@ WORKDIR /app
 COPY --from=rust-builder /out/mangahue-api /usr/local/bin/mangahue-api
 COPY --from=rust-builder /out/mangahue-worker /usr/local/bin/mangahue-worker
 COPY --from=rust-builder /out/mangahue /usr/local/bin/mangahue
+COPY --from=rust-builder /out/mangahue-telegram /usr/local/bin/mangahue-telegram
 
 COPY python /app/python
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
@@ -46,9 +42,6 @@ RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu 
 
 COPY configs /app/configs
 COPY models /app/models
-COPY web/studio /app/web/studio
-COPY web/gpu /app/web/gpu
-COPY --from=web-builder /web/out /app/web/app/out
 
 RUN mkdir -p /data/jobs /data/objects \
     && chown -R mangahue:mangahue /app /data \
@@ -62,7 +55,7 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/app/out", "--styles-dir", "/app/configs/styles", "--public-api"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--styles-dir", "/app/configs/styles", "--public-api"]
 
 # ── Compact ONNX CPU runtime (models mounted at runtime) ─────────────────
 FROM python:3.12-slim-bookworm AS runtime-small
@@ -83,14 +76,12 @@ WORKDIR /app
 COPY --from=rust-builder /out/mangahue-api /usr/local/bin/mangahue-api
 COPY --from=rust-builder /out/mangahue-worker /usr/local/bin/mangahue-worker
 COPY --from=rust-builder /out/mangahue /usr/local/bin/mangahue
+COPY --from=rust-builder /out/mangahue-telegram /usr/local/bin/mangahue-telegram
 
 COPY python /app/python
 RUN pip install --no-cache-dir numpy pillow onnxruntime
 
 COPY configs /app/configs
-COPY web/studio /app/web/studio
-COPY web/gpu /app/web/gpu
-COPY --from=web-builder /web/out /app/web/app/out
 
 RUN mkdir -p /data/jobs /data/objects \
     && chown -R mangahue:mangahue /app /data \
@@ -104,4 +95,4 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=5 --start-period=20s \
     CMD curl -fsS http://127.0.0.1:7878/health || exit 1
 
 ENTRYPOINT ["mangahue-api"]
-CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--studio-dir", "/app/web/app/out", "--styles-dir", "/app/configs/styles", "--public-api"]
+CMD ["--addr", "0.0.0.0:7878", "--jobs-dir", "/data/jobs", "--production-db", "/data/production.db", "--styles-dir", "/app/configs/styles", "--public-api"]

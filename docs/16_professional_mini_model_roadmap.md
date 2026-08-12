@@ -143,15 +143,10 @@ quality, all three export variants validated, WebGPU demo runs in-browser.
 
 The professional finish is in how the model meets users:
 
-1. **Webapp (`web/app`)**: model is served from `/models` (browser-cacheable);
-   quality tiers become *model tiers* — "Fast (mini int8)", "Studio
-   (mini fp16 + engine finishing)", "Reference (reference-CGAN, premium)".
-   The existing fast/studio/masterpiece toggle already maps 1:1.
-2. **WebGPU mode (reactivate `web/gpu`)**: mini model first-class citizen —
-   it is the one model small enough to download in seconds. Draft on GPU,
-   finishing on the VPS (already built, parked; flip it back on with the mini
-   model as default and ddcolor-full as optional).
-3. **Memory loop (the moat)**: webapp corrections → `/api/corrections` →
+1. **Telegram bot (mangahue-telegram)**: the production surface — chapters,
+   references, per-chat color memory, daily quotas, cache. The Rust engine
+   runs in-process; face hints and the hint-aware grading chain are pure Rust.
+2. **Memory loop (the moat)**: bot corrections → `/api/corrections` →
    export-training-manifest → monthly fine-tune → new mini model. Show users
    "this model remembers your series" once consistency is measurable
    (same character hair across pages: within ΔE < 8).

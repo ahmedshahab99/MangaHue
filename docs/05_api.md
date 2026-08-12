@@ -57,7 +57,6 @@ Doctor payload:
   "styles_dir": "configs/styles",
   "metadata_path": "models/model.mangahue.json",
   "jobs_dir": ".mangahue/jobs",
-  "studio_dir": "web/studio",
   "sample_input": "examples/input/smoke_page.png",
   "python": "python"
 }

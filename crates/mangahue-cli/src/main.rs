@@ -300,8 +300,6 @@ struct DoctorArgs {
     metadata: PathBuf,
     #[arg(long, default_value = ".mangahue/jobs")]
     jobs_dir: PathBuf,
-    #[arg(long, default_value = "web/app/out")]
-    studio_dir: PathBuf,
     #[arg(long, default_value = "examples/input/smoke_page.png")]
     sample_input: PathBuf,
     #[arg(long)]
@@ -629,8 +627,6 @@ struct ServeArgs {
     jobs_dir: PathBuf,
     #[arg(long, default_value = "configs/styles")]
     styles_dir: PathBuf,
-    #[arg(long, default_value = "web/app/out")]
-    studio_dir: PathBuf,
     #[arg(long, default_value = ".mangahue/production.db")]
     production_db: PathBuf,
     #[arg(
@@ -660,7 +656,7 @@ struct ServeArgs {
     default_model: PathBuf,
     #[arg(
         long,
-        default_value = "configs/engine.studio.yaml",
+        default_value = "configs/engine.default.yaml",
         env = "MANGAHUE_DEFAULT_CONFIG"
     )]
     default_config: PathBuf,
@@ -1296,7 +1292,6 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         styles_dir: args.styles_dir,
         metadata_path: args.metadata,
         jobs_dir: args.jobs_dir,
-        studio_dir: args.studio_dir,
         sample_input: args.sample_input,
         python: args
             .python
@@ -1897,7 +1892,6 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         addr: args.addr,
         jobs_dir: args.jobs_dir,
         styles_dir: args.styles_dir,
-        studio_dir: args.studio_dir,
         production_db: args.production_db,
         public_api: args.public_api,
         file_root,

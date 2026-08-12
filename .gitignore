@@ -45,3 +45,4 @@ web/gpu/dev_server_err.log
 /docs/MIRACLE_PLAN.md
 /docs/MODEL_STUDY.md
 /docs/TRANSFORMATION_STUDY.md
+crates/mangahue-telegram/settings/

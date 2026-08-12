@@ -1334,12 +1334,6 @@ fn select_backend_for_model(
     config: &EngineConfig,
     reference_image_path: Option<&Path>,
 ) -> Result<Box<dyn ColorizationBackend>> {
-    if mangahue_inference::is_openvino_studio_model_dir(model_path) {
-        return Ok(Box::new(mangahue_inference::OpenVinoStudioBackend::shared(
-            model_path,
-            config.inference.input_size,
-        )?));
-    }
     if mangahue_inference::is_anime_face_model_dir(model_path) {
         return Ok(Box::new(mangahue_inference::AnimeFaceBackend::shared(
             model_path,
