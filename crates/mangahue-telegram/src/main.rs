@@ -317,13 +317,12 @@ impl BotState {
         self.active_jobs.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Add a job to the FIFO queue. Returns its 1-based position, or
-    /// usize::MAX when this chat already has a queued/running job.
+    /// Add a job to the FIFO queue. Returns its 1-based position. Multiple
+    /// jobs per chat are allowed: a chat's next queued job starts only after
+    /// its current one finishes (the dispatch deferral handles that), so
+    /// users can queue a whole chapter list without being rejected.
     fn enqueue(&self, chat_id: i64, job: QueuedJob) -> usize {
         let mut queue = lock_or_recover(&self.queue);
-        if queue.iter().any(|(cid, _)| *cid == chat_id) {
-            return usize::MAX;
-        }
         queue.push_back((chat_id, job));
         self.persist_queue_locked(&queue);
         queue.len()
@@ -380,8 +379,12 @@ impl BotState {
             return;
         };
         let Some(cancel_token) = self.try_start(chat_id, args.max_concurrent_jobs) else {
-            // Pool still full (a race) — put the job back at the front.
-            lock_or_recover(&self.queue).push_front((chat_id, job));
+            // Pool still full (a race) — put the job back at the front and
+            // keep the on-disk queue in sync (a crash between the pop and
+            // this push_back would otherwise resurrect or drop the job).
+            let mut queue = lock_or_recover(&self.queue);
+            queue.push_front((chat_id, job));
+            self.persist_queue_locked(&queue);
             return;
         };
         spawn_job(
@@ -586,13 +589,14 @@ impl BotState {
         }
     }
 
-    /// Remove a chat's queued job (used by /cancel for queued work).
-    fn dequeue(&self, chat_id: i64) -> bool {
+    /// Remove a chat's queued jobs (used by /cancel when nothing is
+    /// running). Returns how many were removed.
+    fn dequeue(&self, chat_id: i64) -> usize {
         let mut queue = lock_or_recover(&self.queue);
         let before = queue.len();
         queue.retain(|(cid, _)| *cid != chat_id);
-        let removed = queue.len() != before;
-        if removed {
+        let removed = before - queue.len();
+        if removed > 0 {
             self.persist_queue_locked(&queue);
         }
         removed
@@ -1070,25 +1074,15 @@ fn process_update(
                     file_id: file_id.clone(),
                 },
             );
-            if position == usize::MAX {
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    "You already have a job queued or running. Wait for it to finish, or use /cancel.",
-                    None,
-                )?;
-            } else {
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    &format!(
-                        "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                    ),
-                    None,
-                )?;
-            }
+            send_message(
+                client,
+                token,
+                chat_id,
+                &format!(
+                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                ),
+                None,
+            )?;
             return Ok(());
         }
         let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
@@ -1100,25 +1094,15 @@ fn process_update(
                     file_id: file_id.clone(),
                 },
             );
-            if position == usize::MAX {
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    "You already have a job queued or running. Wait for it to finish, or use /cancel.",
-                    None,
-                )?;
-            } else {
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    &format!(
-                        "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                    ),
-                    None,
-                )?;
-            }
+            send_message(
+                client,
+                token,
+                chat_id,
+                &format!(
+                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+                ),
+                None,
+            )?;
             return Ok(());
         };
         let client = client.clone();
@@ -1212,49 +1196,29 @@ fn process_update(
     // the bot once all slots are gone).
     if state.queue_len() > 0 {
         let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
-        if position == usize::MAX {
-            send_message(
-                client,
-                token,
-                chat_id,
-                "You already have a job queued or running. Wait for it to finish, or use /cancel.",
-                None,
-            )?;
-        } else {
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!(
-                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                ),
-                None,
-            )?;
-        }
+        send_message(
+            client,
+            token,
+            chat_id,
+            &format!(
+                "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+            ),
+            None,
+        )?;
         return Ok(());
     }
     let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
         // A slot was taken between the queue check and now — queue instead.
         let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
-        if position == usize::MAX {
-            send_message(
-                client,
-                token,
-                chat_id,
-                "You already have a job queued or running. Wait for it to finish, or use /cancel.",
-                None,
-            )?;
-        } else {
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!(
-                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                ),
-                None,
-            )?;
-        }
+        send_message(
+            client,
+            token,
+            chat_id,
+            &format!(
+                "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+            ),
+            None,
+        )?;
         return Ok(());
     };
 
@@ -1907,9 +1871,20 @@ fn cmd_cancel(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64)
     let cancelled_active = state.cancel(chat_id);
     let removed_queued = state.dequeue(chat_id);
     let status = match (cancelled_active, removed_queued) {
-        (true, _) => "Cancellation requested. MangaHue will stop at the next safe checkpoint.",
-        (false, true) => "Queued job cancelled — nothing was running.",
-        (false, false) => "No active or queued MangaHue job to cancel.",
+        (true, 0) => {
+            "Cancelling the running job — it stops at the next safe checkpoint. \
+             The queue keeps moving: your other queued jobs still run."
+        }
+        (false, 0) => "No active or queued MangaHue job to cancel.",
+        (true, n) => &format!(
+            "Cancelling the running job — it stops at the next safe checkpoint. \
+                 Also removed your {n} queued job(s) for this chat. \
+                 The bot keeps processing the queue."
+        ),
+        (false, n) => &format!(
+            "Removed your {n} queued job(s) — nothing was running. \
+                 Send another link or photo any time."
+        ),
     };
     send_message(client, token, chat_id, status, None)?;
     Ok(())
@@ -3500,11 +3475,10 @@ fn restore_persisted_queue(state: &BotState) -> usize {
     }
     {
         let mut current = lock_or_recover(&state.queue);
+        // Restore EVERY persisted item: with multiple jobs per chat allowed,
+        // deduplicating by chat would silently drop legitimate queued work.
         for (chat_id, job) in queue {
-            // Never double-queue a chat that is already represented.
-            if !current.iter().any(|(cid, _)| *cid == chat_id) {
-                current.push_back((chat_id, job));
-            }
+            current.push_back((chat_id, job));
         }
         let restored = current.len();
         drop(current);
@@ -3997,7 +3971,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_is_fifo_and_dedups_per_chat() {
+    fn queue_is_fifo_and_allows_multiple_jobs_per_chat() {
         let state = BotState {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
@@ -4012,14 +3986,17 @@ mod tests {
         };
         assert_eq!(state.enqueue(1, QueuedJob::Link { url: "a".into() }), 1);
         assert_eq!(state.enqueue(2, QueuedJob::Link { url: "b".into() }), 2);
-        // Duplicate chat must not enqueue twice.
-        assert_eq!(
-            state.enqueue(1, QueuedJob::Link { url: "c".into() }),
-            usize::MAX
-        );
-        assert_eq!(state.queue_len(), 2);
+        // The same chat may queue several links; each starts after the
+        // previous one finishes (dispatch defers jobs of active chats).
+        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "c".into() }), 3);
+        assert_eq!(state.queue_len(), 3);
+        // FIFO order: chat 1's second job sits behind chat 2's job.
         assert_eq!(state.queue_position(2), Some(1));
         assert_eq!(state.queue_position(9), None);
+        // /cancel semantics: clearing a chat's jobs removes all of them.
+        assert_eq!(state.dequeue(1), 2);
+        assert_eq!(state.queue_len(), 1);
+        assert_eq!(state.dequeue(1), 0);
     }
 
     #[test]
@@ -4224,8 +4201,8 @@ mod tests {
         ));
         drop(queue);
 
-        assert!(state.dequeue(1));
-        assert!(!state.dequeue(1));
+        assert_eq!(state.dequeue(1), 1);
+        assert_eq!(state.dequeue(1), 0);
         assert_eq!(state.queue_len(), 1);
         assert_eq!(state.queue_position(2), Some(0));
     }
