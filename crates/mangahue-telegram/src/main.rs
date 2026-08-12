@@ -170,6 +170,11 @@ struct Args {
         help = "Allow standalone photo colorization (off by default: the launch product is chapter links; references via a photo captioned 'ref' always work)"
     )]
     photos_enabled: bool,
+    #[arg(
+        long,
+        help = "Rotate creative mood styles per job (off by default: every chapter gets the stable professional look; users can still pick any style with /style)"
+    )]
+    creative_rotation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -651,6 +656,7 @@ impl BotState {
         chat_id: i64,
         default_style: &Option<PathBuf>,
         job_override: Option<PathBuf>,
+        creative_rotation: bool,
     ) -> Option<PathBuf> {
         let settings = lock_or_recover(&self.per_chat_settings);
         let explicit = settings.get(&chat_id).and_then(|s| s.style_path.clone());
@@ -658,19 +664,28 @@ impl BotState {
         if explicit.is_some() {
             return explicit;
         }
-        // Content-aware override (source tags / page mood) wins over the
-        // creative rotation for THIS job only.
+        // Content-aware override (source tags / page mood) wins for THIS job
+        // only — but only when it is a professional style, or when creative
+        // rotation is explicitly enabled. Without the gate, genre tags like
+        // "fantasy" inject violet-dusk palettes into every other chapter.
         if let Some(override_path) = job_override {
             if override_path.is_file() {
-                return Some(override_path);
+                let creative = override_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|id| id.starts_with("creative_"));
+                if creative_rotation || !creative {
+                    return Some(override_path);
+                }
             }
         }
-        // Creative rotation: no explicit /style choice, so vary the mood
-        // palette per job. A channel then never shows the same look twice
-        // in a row while skin stays natural (all creative styles share the
-        // same skin hues and natural grading).
-        if let Some(creative) = self.next_creative_style(chat_id) {
-            return Some(creative);
+        // Creative rotation: only when explicitly enabled (--creative-rotation).
+        // A channel then varies moods while skin stays natural; off by
+        // default so the output is predictably professional.
+        if creative_rotation {
+            if let Some(creative) = self.next_creative_style(chat_id) {
+                return Some(creative);
+            }
         }
         default_style.clone().or_else(|| {
             self.styles_dir.as_ref().and_then(|dir| {
@@ -1676,7 +1691,8 @@ fn handle_photo(
     // (dark ink-heavy pages -> dark styles, bright airy pages -> pastels).
     let mood_override = mood::select_style_for_scene(&image.to_luma8())
         .and_then(|id| resolve_style_file(&state, id));
-    let style_path = state.resolve_style_path(chat_id, &args.style, mood_override);
+    let style_path =
+        state.resolve_style_path(chat_id, &args.style, mood_override, args.creative_rotation);
     let reference_image = settings
         .reference_image
         .clone()
@@ -2432,6 +2448,36 @@ fn is_direct_image_url(url: &url::Url) -> bool {
         .any(|ext| path.ends_with(&format!(".{ext}")))
 }
 
+/// Madara sites (allporncomic.com, ilikecomix.com) offer a "paged" reader
+/// via `?style=paged` that embeds only one page of the chapter. Drop that
+/// parameter (and any other Madara reader params) so the continuous reader
+/// — which embeds every page — is fetched instead.
+fn normalize_madara_url(url: &url::Url) -> String {
+    let is_madara = url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host.contains("allporncomic.com") || host.contains("ilikecomix.com")
+    });
+    if !is_madara || url.query().is_none() {
+        return url.to_string();
+    }
+    let mut cleaned = url.clone();
+    let mut pairs: Vec<(String, String)> = cleaned
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .filter(|(k, _)| k != "style")
+        .collect();
+    cleaned.set_query(None);
+    if !pairs.is_empty() {
+        let query = pairs
+            .drain(..)
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        cleaned.set_query(Some(&query));
+    }
+    cleaned.to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_link(
     client: &Client,
@@ -2451,9 +2497,14 @@ fn handle_link(
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create {}", output_dir.display()))?;
+    let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
+    // Madara sites offer a "paged" reader (?style=paged) that embeds only
+    // ONE page of the chapter: normalize to the continuous reader, which
+    // embeds every page, before fetching anything.
+    let fetch_url = normalize_madara_url(&source_url);
     // Chapter title for the page watermark (best-effort; failures just mean
     // the watermark shows page numbers only).
-    let job_title = fetch_page_title(fetch_client, url).unwrap_or_default();
+    let job_title = fetch_page_title(fetch_client, &fetch_url).unwrap_or_default();
     if !job_title.is_empty() {
         tracing::info!(title = %job_title, "chapter title detected for watermark");
     }
@@ -2483,15 +2534,14 @@ fn handle_link(
         Some(&cancel_markup),
     )?;
 
-    let source_url = url::Url::parse(url).with_context(|| format!("invalid URL: {url}"))?;
     // The site may be Cloudflare-fronted (allporncomic.com challenges the
     // rustls TLS fingerprint): the challenge-safe fetch falls back to the
-    // system curl, which passes.
+    // system curl, which passes. Uses the paged-reader-normalized URL.
     let page_html: Option<String> =
-        mangahue_ingest::fetch_html_cloudflare_safe(fetch_client, url, 16 * 1024 * 1024);
+        mangahue_ingest::fetch_html_cloudflare_safe(fetch_client, &fetch_url, 16 * 1024 * 1024);
 
     let all_image_urls: Vec<String> = match &page_html {
-        None => vec![url.to_string()],
+        None => vec![fetch_url.clone()],
         Some(html) => {
             extract_manga_urls(fetch_client, &source_url, html, &source_url, args.max_pages)?
         }
@@ -2510,7 +2560,20 @@ fn handle_link(
         .as_deref()
         .and_then(load_style_name)
         .unwrap_or_default();
-    let style_path = state.resolve_style_path(chat_id, &args.style, mood_style);
+    let style_path =
+        state.resolve_style_path(chat_id, &args.style, mood_style, args.creative_rotation);
+
+    // Job diagnostics: URL, extracted page count and chosen style are logged
+    // so "the output was rubbish" cases can be traced to extraction or
+    // grading without asking the user for logs.
+    tracing::info!(
+        url = %url,
+        pages = all_image_urls.len(),
+        style = %style_path.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "default".into()),
+        mood = %mood_name,
+        tags = tags.len(),
+        "chapter scan complete"
+    );
 
     // SSRF guard: drop any extracted image URL that resolves to a private
     // or reserved host (attacker-controlled pages can point at internal
@@ -4112,6 +4175,24 @@ mod tests {
             "Natural Manga \\(default\\)"
         );
         assert_eq!(md2_escape("x~y.z!"), "x\\~y\\.z\\!");
+    }
+
+    #[test]
+    fn madara_paged_url_is_normalized_to_continuous_reader() {
+        let paged =
+            url::Url::parse("https://ilikecomix.com/manga/c/some-comic/chapter-1/?style=paged&x=1")
+                .unwrap();
+        let normalized = normalize_madara_url(&paged);
+        assert_eq!(
+            normalized,
+            "https://ilikecomix.com/manga/c/some-comic/chapter-1/?x=1"
+        );
+        // Non-Madara URLs are untouched.
+        let other = url::Url::parse("https://nhentai.net/g/1/?style=paged").unwrap();
+        assert_eq!(normalize_madara_url(&other), other.to_string());
+        // No query at all: untouched.
+        let plain = url::Url::parse("https://allporncomic.com/porncomic/x/y/").unwrap();
+        assert_eq!(normalize_madara_url(&plain), plain.to_string());
     }
 
     #[test]
