@@ -1588,7 +1588,7 @@ fn handle_photo(
     let job_id = Uuid::new_v4().to_string();
     let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
-    let _workspace = JobWorkspace::new(job_dir.clone());
+    let _workspace = JobWorkspace::new(job_dir.clone(), args.work_dir.clone());
     let downloads_dir = job_dir.join("downloads");
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
@@ -1851,8 +1851,10 @@ fn cmd_status(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64)
 /// /queue — report this chat's position in the FIFO job queue.
 fn cmd_queue(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -> Result<()> {
     let message = match state.queue_position(chat_id) {
+        // queue_position is 0-based; users count from 1.
         Some(position) => format!(
-            "You are #{position} in the queue ({} job(s) waiting total).",
+            "You are #{} in the queue ({} job(s) waiting total).",
+            position + 1,
             state.queue_len()
         ),
         None => {
@@ -2467,7 +2469,7 @@ fn handle_link(
     let job_id = Uuid::new_v4().to_string();
     let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
-    let _workspace = JobWorkspace::new(job_dir.clone());
+    let _workspace = JobWorkspace::new(job_dir.clone(), args.work_dir.clone());
     let downloads_dir = job_dir.join("downloads");
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
@@ -3089,6 +3091,55 @@ fn estimate_eta(times: &[f32], done: usize, total: usize) -> Option<f32> {
     Some(avg * remaining)
 }
 
+/// Append every `*.quality.json` report the engine wrote into `job_dir` to
+/// `<work_dir>/quality/<YYYY-MM>/telemetry.jsonl` before the scratch space is
+/// wiped. Keeps per-page quality data (line preservation, bubble cleanliness,
+/// sharpness…) so tuning decisions are grounded in real telemetry instead of
+/// anecdote.
+fn retain_quality_telemetry(job_dir: &Path, work_dir: &Path) {
+    let mut files = Vec::new();
+    let mut pending = vec![job_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".quality.json"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    let month = Utc::now().format("%Y-%m");
+    let dir = work_dir.join("quality").join(month.to_string());
+    let Ok(_) = std::fs::create_dir_all(&dir) else {
+        return;
+    };
+    let log_path = dir.join("telemetry.jsonl");
+    let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    else {
+        return;
+    };
+    use std::io::Write;
+    for file in files {
+        if let Ok(json) = std::fs::read_to_string(&file) {
+            let _ = writeln!(log, "{json}");
+        }
+    }
+}
+
 fn cleanup_dir(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_dir_all(path);
@@ -3097,16 +3148,18 @@ fn cleanup_dir(path: &Path) {
 
 struct JobWorkspace {
     path: PathBuf,
+    work_dir: PathBuf,
 }
 
 impl JobWorkspace {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+    fn new(path: PathBuf, work_dir: PathBuf) -> Self {
+        Self { path, work_dir }
     }
 }
 
 impl Drop for JobWorkspace {
     fn drop(&mut self) {
+        retain_quality_telemetry(&self.path, &self.work_dir);
         cleanup_dir(&self.path);
         if let Some(chat_dir) = self.path.parent() {
             let _ = std::fs::remove_dir(chat_dir);

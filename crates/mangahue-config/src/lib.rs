@@ -678,6 +678,11 @@ impl EngineConfig {
         if !(0.0..=0.6).contains(&self.postprocess.local_contrast) {
             return Err(anyhow!("postprocess.local_contrast must be in 0.0..=0.6"));
         }
+        if self.postprocess.governor_min_gain > self.postprocess.governor_max_gain {
+            return Err(anyhow!(
+                "postprocess.governor_min_gain must be <= governor_max_gain"
+            ));
+        }
         if self.engine.parallel_jobs > 256 {
             return Err(anyhow!("engine.parallel_jobs must be <= 256"));
         }
