@@ -161,6 +161,11 @@ pub struct PostprocessSection {
     /// blind spots.
     #[serde(default)]
     pub hint_chroma_strength: f32,
+    /// Remove isolated strong-color specks (the model's dot noise):
+    /// DDColor-family models scatter small warm dots on textures; this pass
+    /// blends such pixels toward their neighborhood.
+    #[serde(default = "default_despeckle_color_specks")]
+    pub despeckle_color_specks: bool,
     /// Maximum saturation allowed on screentone pixels (0-1; the source
     /// page is grayscale, so tone chroma is always the model's invention —
     /// the DDColor-family models paint gray dot patterns red/warm, which
@@ -340,7 +345,11 @@ fn default_region_chroma_separation() -> f32 {
 }
 
 fn default_tone_chroma_cap() -> f32 {
-    0.18
+    0.0
+}
+
+fn default_despeckle_color_specks() -> bool {
+    true
 }
 
 fn default_muted_strength() -> f32 {
@@ -596,6 +605,7 @@ impl Default for EngineConfig {
                 governor_target_warmth: default_governor_target_warmth(),
                 hint_chroma_strength: 0.0,
                 tone_chroma_cap: default_tone_chroma_cap(),
+                despeckle_color_specks: default_despeckle_color_specks(),
             },
             output: OutputSection {
                 format: "png".to_string(),

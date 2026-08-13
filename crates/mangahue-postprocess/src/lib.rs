@@ -320,6 +320,14 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         );
     }
 
+    // Model speckle cleanup: DDColor-family models scatter isolated
+    // strong-color pixels (measured ~11.5k per page, mostly warm) on
+    // textures and midtones — the "colored dots" complaint. Runs after
+    // every color-producing stage so nothing re-creates them.
+    if input.config.despeckle_color_specks {
+        remove_color_specks(&mut output, input.line_mask);
+    }
+
     if input.config.final_sharpening > 0.0 {
         sharpen_lightly(&mut output, input.config.final_sharpening);
     }
@@ -1445,6 +1453,209 @@ pub fn preserve_screentones(
     }
 }
 
+/// Remove color speckle noise (the model's dot artifacts): small connected
+/// components of strong color in sparse neighborhoods are blended into their
+/// surroundings. Dense patterns (halftone/screentone fields, real colored
+/// regions) are left untouched — the dot TEXTURE and its warm tint survive.
+pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
+    let (w, h) = image.dimensions();
+    if w < 3 || h < 3 || line_mask.dimensions() != (w, h) {
+        return;
+    }
+    const MAX_SPECKSIZE: u32 = 6;
+    const DENSITY_WINDOW: u32 = 15;
+    const MAX_DENSITY: f32 = 0.18;
+    let idx = |x: u32, y: u32| (y * w + x) as usize;
+
+    // Strong-color mask (saturation > 0.35).
+    let mut strong = vec![false; (w * h) as usize];
+    for (i, pixel) in image.pixels().enumerate() {
+        let mx = pixel[0].max(pixel[1]).max(pixel[2]) as u16;
+        let mn = pixel[0].min(pixel[1]).min(pixel[2]) as u16;
+        strong[i] = mx > 0 && (mx - mn) as f32 / mx as f32 > 0.35;
+    }
+    // Ink never participates: colored pixels on ink are art, not noise.
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 {
+            continue;
+        }
+        if line_mask.get_pixel(x, y)[0] > 184 {
+            strong[idx(x, y)] = false;
+        }
+    }
+    // Label strong-color components (8-connectivity, BFS).
+    let mut labels = vec![0u32; (w * h) as usize];
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut next_label = 1u32;
+    for start in 0..(w * h) as usize {
+        if !strong[start] || labels[start] != 0 {
+            continue;
+        }
+        let mut queue = vec![start];
+        labels[start] = next_label;
+        let mut size = 0u32;
+        while let Some(cur) = queue.pop() {
+            size += 1;
+            let (cx, cy) = (cur % w as usize, cur / w as usize);
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let nidx = idx(nx as u32, ny as u32);
+                    if strong[nidx] && labels[nidx] == 0 {
+                        labels[nidx] = next_label;
+                        queue.push(nidx);
+                    }
+                }
+            }
+        }
+        sizes.push(size);
+        next_label += 1;
+    }
+    // Mean color and luma of each component.
+    let mut component_mean: Vec<[f32; 3]> = vec![[0.0; 3]; sizes.len()];
+    for (i, &label) in labels.iter().enumerate() {
+        if label == 0 {
+            continue;
+        }
+        let p = image.get_pixel((i % w as usize) as u32, (i / w as usize) as u32);
+        let mean = &mut component_mean[(label - 1) as usize];
+        mean[0] += p[0] as f32;
+        mean[1] += p[1] as f32;
+        mean[2] += p[2] as f32;
+    }
+    for (label, mean) in component_mean.iter_mut().enumerate() {
+        let n = sizes[label].max(1) as f32;
+        mean[0] /= n;
+        mean[1] /= n;
+        mean[2] /= n;
+    }
+    let component_luma = |label: usize| -> f32 {
+        let m = component_mean[label];
+        0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]
+    };
+    // A component is "small" when it is tiny, or when it lives in the dark
+    // range where the model's chroma noise forms short chains (dark shading
+    // specks); real dark features (hair, shadows) are far larger. Halftone
+    // fields are mid-tone and always fail the density gate anyway.
+    let small = |label: u32| -> bool {
+        let size = sizes[(label - 1) as usize];
+        size <= MAX_SPECKSIZE || (size <= 16 && component_luma((label - 1) as usize) < 90.0)
+    };
+
+    // A speck component is removed when it does not belong to its
+    // neighborhood: either the strong-color density around it is low
+    // (sparse noise on paper), or its mean color differs strongly from the
+    // local background (a foreign dot inside a colored region). Halftone
+    // fields are dense AND match their surroundings — they survive intact.
+    let mut speck = vec![false; (w * h) as usize];
+    let mut speck_bg = vec![[0.0f32; 3]; (w * h) as usize];
+    for (i, &label) in labels.iter().enumerate() {
+        if label == 0 || !small(label) {
+            continue;
+        }
+        let (cx, cy) = (i % w as usize, i / w as usize);
+        let half = (DENSITY_WINDOW / 2) as i32;
+        let (x0, x1) = (
+            (cx as i32 - half).max(0),
+            (cx as i32 + half).min(w as i32 - 1),
+        );
+        let (y0, y1) = (
+            (cy as i32 - half).max(0),
+            (cy as i32 + half).min(h as i32 - 1),
+        );
+        let mut colored = 0u32;
+        let mut total = 0u32;
+        let mut bg = [0.0f32; 3];
+        let mut bg_n = 0u32;
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                total += 1;
+                if strong[idx(xx as u32, yy as u32)] {
+                    colored += 1;
+                } else {
+                    let p = image.get_pixel(xx as u32, yy as u32);
+                    bg[0] += p[0] as f32;
+                    bg[1] += p[1] as f32;
+                    bg[2] += p[2] as f32;
+                    bg_n += 1;
+                }
+            }
+        }
+        if total == 0 {
+            continue;
+        }
+        let density = colored as f32 / (total as f32);
+        let mean = component_mean[(label - 1) as usize];
+        let mut foreign = false;
+        if bg_n > 0 {
+            let dist = ((mean[0] - bg[0] / bg_n as f32).powi(2)
+                + (mean[1] - bg[1] / bg_n as f32).powi(2)
+                + (mean[2] - bg[2] / bg_n as f32).powi(2))
+            .sqrt();
+            foreign = dist > 55.0;
+        }
+        if density < MAX_DENSITY || foreign {
+            speck[i] = true;
+            speck_bg[i] = if bg_n > 0 {
+                [
+                    bg[0] / bg_n as f32,
+                    bg[1] / bg_n as f32,
+                    bg[2] / bg_n as f32,
+                ]
+            } else {
+                mean
+            };
+        }
+    }
+    // Replace speck pixels with the local background mean (computed in the
+    // density window; ink excluded already, same-speck pixels skipped).
+    let mut work = image.clone();
+    for (i, &is_speck) in speck.iter().enumerate() {
+        if !is_speck {
+            continue;
+        }
+        let (cx, cy) = (i % w as usize, i / w as usize);
+        let mut sum = [0.0f32; 3];
+        let mut n = 0u32;
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                    continue;
+                }
+                let nidx = idx(nx as u32, ny as u32);
+                if strong[nidx] && labels[nidx] == labels[i] {
+                    continue; // same speck: no self-averaging
+                }
+                let neighbor = image.get_pixel(nx as u32, ny as u32);
+                sum[0] += neighbor[0] as f32;
+                sum[1] += neighbor[1] as f32;
+                sum[2] += neighbor[2] as f32;
+                n += 1;
+            }
+        }
+        let target = if n > 0 {
+            [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32]
+        } else {
+            speck_bg[i]
+        };
+        let p = work.get_pixel_mut(cx as u32, cy as u32);
+        for channel in 0..3 {
+            p[channel] = target[channel].round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    *image = work;
+}
+
 /// Adaptive line restoration: stronger in dark ink areas, gentler near edges,
 /// preserving colored details in thin-line regions.
 pub fn restore_lines_adaptive(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {
@@ -1677,6 +1888,50 @@ mod tests {
     }
 
     #[test]
+    fn color_speckle_removal_kills_isolated_dots_keeps_blobs() {
+        // A single strong-red pixel on a gray field is model dot noise.
+        let mut image = RgbImage::from_pixel(41, 41, Rgb([150, 150, 150]));
+        image.put_pixel(35, 35, Rgb([230, 40, 30]));
+        // A coherent 4x4 red blob (a real colored region, > speck size)
+        // placed far from the dot must stay.
+        for y in 4..8 {
+            for x in 4..8 {
+                image.put_pixel(x, y, Rgb([220, 60, 50]));
+            }
+        }
+        let lines = GrayImage::from_pixel(41, 41, Luma([0]));
+
+        remove_color_specks(&mut image, &lines);
+
+        let dot = image.get_pixel(35, 35);
+        let blob = image.get_pixel(5, 5);
+        // The isolated dot is blended toward the gray field...
+        assert!(
+            (dot[0] as i32 - dot[2] as i32) < 40,
+            "isolated dot desaturated, got {:?}",
+            dot
+        );
+        // ...while the coherent blob keeps its color.
+        assert!(blob[0] as i32 - blob[2] as i32 > 80, "blob preserved");
+    }
+
+    #[test]
+    fn color_speckle_removal_never_touches_ink() {
+        let mut image = RgbImage::from_pixel(9, 9, Rgb([150, 150, 150]));
+        image.put_pixel(4, 4, Rgb([230, 40, 30]));
+        let mut lines = GrayImage::from_pixel(9, 9, Luma([0]));
+        lines.put_pixel(4, 4, Luma([255]));
+
+        remove_color_specks(&mut image, &lines);
+
+        assert_eq!(
+            image.get_pixel(4, 4).0,
+            [230, 40, 30],
+            "ink pixel untouched"
+        );
+    }
+
+    #[test]
     fn broad_protected_mask_does_not_erase_generated_color() {
         let colorized = RgbImage::from_pixel(3, 3, Rgb([210, 132, 104]));
         let original = GrayImage::from_pixel(3, 3, Luma([180]));
@@ -1688,7 +1943,8 @@ mod tests {
             restore_lines: false,
             line_strength: 1.0,
             bubble_cleanup: true,
-            tone_chroma_cap: 0.18,
+            tone_chroma_cap: 0.0,
+            despeckle_color_specks: true,
             bleeding_correction: false,
             palette_correction: false,
             final_sharpening: 0.0,
@@ -1934,7 +2190,10 @@ mod tests {
 
         let pixel = image.get_pixel(0, 0);
         let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
-        assert!(chroma >= 100, "cap 0 keeps the model's chroma, got {chroma}");
+        assert!(
+            chroma >= 100,
+            "cap 0 keeps the model's chroma, got {chroma}"
+        );
     }
 
     #[test]

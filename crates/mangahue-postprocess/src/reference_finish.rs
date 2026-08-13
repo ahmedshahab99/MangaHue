@@ -617,7 +617,8 @@ mod tests {
             governor_max_gain: 1.25,
             governor_target_warmth: 45.0,
             hint_chroma_strength: 0.0,
-            tone_chroma_cap: 0.18,
+            tone_chroma_cap: 0.0,
+            despeckle_color_specks: true,
         }
     }
 

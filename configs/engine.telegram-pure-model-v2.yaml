@@ -113,7 +113,8 @@ postprocess:
 
   # complaint). Cap tone saturation to a gentle tint; 0 keeps full chroma.
 
-  tone_chroma_cap: 0.18
+  tone_chroma_cap: 0.0
+  despeckle_color_specks: true
 
 output:
   format: png
