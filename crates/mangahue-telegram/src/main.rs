@@ -2787,12 +2787,7 @@ fn handle_link(
                 let caption = if job_title.is_empty() {
                     format!("MangaHue · page {}/{}", position + 1, effective_total)
                 } else {
-                    format!(
-                        "{} · page {}/{}",
-                        job_title,
-                        position + 1,
-                        effective_total
-                    )
+                    format!("{} · page {}/{}", job_title, position + 1, effective_total)
                 };
                 // Color metrics stay available for diagnostics (they used to
                 // ride in the caption; the caption is user-facing now).
@@ -2803,10 +2798,10 @@ fn handle_link(
                     verdict = %verdict,
                     "chapter page delivered"
                 );
-                let delivery_path =
-                    prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
                 // Page watermark: manga title + page number on the image.
-                if let Ok(mut page_image) = image::open(&delivery_path) {
+                // Drawn on the engine's PNG before the single delivery
+                // encode, so each page is JPEG-encoded exactly once.
+                if let Ok(page_image) = image::open(&output_path) {
                     let mut rgb = page_image.to_rgb8();
                     watermark::draw_page_watermark(
                         &mut rgb,
@@ -2814,24 +2809,13 @@ fn handle_link(
                         position + 1,
                         effective_total,
                     );
-                    // Re-encode with the configured quality: plain save()
-                    // would silently drop JPEG quality to the crate default
-                    // (80) and soften every delivered page.
-                    if matches!(args.delivery_format, DeliveryFormat::Jpeg) {
-                        use image::codecs::jpeg::JpegEncoder;
-                        let mut file = std::fs::File::create(&delivery_path)?;
-                        let mut encoder =
-                            JpegEncoder::new_with_quality(&mut file, args.jpeg_quality);
-                        encoder.encode(
-                            rgb.as_raw(),
-                            rgb.width(),
-                            rgb.height(),
-                            image::ExtendedColorType::Rgb8,
-                        )?;
-                    } else {
-                        let _ = rgb.save(&delivery_path);
-                    }
+                    // PNG round-trip is lossless; prepare_delivery below
+                    // performs the single PNG->JPEG encode with the
+                    // configured quality.
+                    rgb.save(&output_path)?;
                 }
+                let delivery_path =
+                    prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
                 ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
                 // Cosmetic typing indicator: never abort the chapter on this.
                 let _ = send_chat_action(client, token, chat_id, "upload_document");

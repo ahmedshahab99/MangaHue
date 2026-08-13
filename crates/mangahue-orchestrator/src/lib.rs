@@ -19,7 +19,8 @@ use mangahue_inference::{ColorizationBackend, MockColorizationBackend, ModelInpu
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
 use mangahue_postprocess::{
-    cross_tile_coherence, finalize, reconstruct_full_resolution, PostprocessInput,
+    cross_tile_coherence, finalize, reconstruct_full_resolution, remove_color_specks,
+    PostprocessInput,
 };
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
@@ -1102,6 +1103,20 @@ impl MangaHueEngine {
                 final_image.width(),
                 final_image.height()
             ));
+            if config.postprocess.despeckle_color_specks {
+                // Reconstruction (Lanczos upscale + chroma boost + joint-
+                // bilateral chroma spread) re-creates isolated strong-color
+                // specks AFTER the working-res despeckle inside finalize(),
+                // so despeckle once more at full resolution. The all-zero
+                // line mask is fine: ink pixels are dark/low-saturation and
+                // never match the pass's strong-color mask.
+                let full_line_mask = image::GrayImage::from_pixel(
+                    final_image.width(),
+                    final_image.height(),
+                    image::Luma([0]),
+                );
+                remove_color_specks(&mut final_image, &full_line_mask);
+            }
         }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 

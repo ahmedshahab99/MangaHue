@@ -320,16 +320,17 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         );
     }
 
+    if input.config.final_sharpening > 0.0 {
+        sharpen_lightly(&mut output, input.config.final_sharpening);
+    }
+
     // Model speckle cleanup: DDColor-family models scatter isolated
     // strong-color pixels (measured ~11.5k per page, mostly warm) on
     // textures and midtones — the "colored dots" complaint. Runs after
-    // every color-producing stage so nothing re-creates them.
+    // every color-producing stage so nothing re-creates them, and after
+    // the sharpener so its chroma ringing around dots is cleaned too.
     if input.config.despeckle_color_specks {
         remove_color_specks(&mut output, input.line_mask);
-    }
-
-    if input.config.final_sharpening > 0.0 {
-        sharpen_lightly(&mut output, input.config.final_sharpening);
     }
     measure_purity(
         &output,
@@ -1545,7 +1546,7 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     // fields are mid-tone and always fail the density gate anyway.
     let small = |label: u32| -> bool {
         let size = sizes[(label - 1) as usize];
-        size <= MAX_SPECKSIZE || (size <= 16 && component_luma((label - 1) as usize) < 90.0)
+        size <= MAX_SPECKSIZE || (size <= 40 && component_luma((label - 1) as usize) < 90.0)
     };
 
     // A speck component is removed when it does not belong to its
@@ -1555,6 +1556,7 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     // fields are dense AND match their surroundings — they survive intact.
     let mut speck = vec![false; (w * h) as usize];
     let mut speck_bg = vec![[0.0f32; 3]; (w * h) as usize];
+    let mut speck_bg_n = vec![0u32; (w * h) as usize];
     for (i, &label) in labels.iter().enumerate() {
         if label == 0 || !small(label) {
             continue;
@@ -1592,62 +1594,75 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
         }
         let density = colored as f32 / (total as f32);
         let mean = component_mean[(label - 1) as usize];
+        // Dark components tolerate denser speck fields; midtone keeps the
+        // strict gate.
+        let dark = component_luma((label - 1) as usize) < 90.0;
+        let max_density = if dark { 0.30 } else { MAX_DENSITY };
+        let bg_mean = if bg_n > 0 {
+            [
+                bg[0] / bg_n as f32,
+                bg[1] / bg_n as f32,
+                bg[2] / bg_n as f32,
+            ]
+        } else {
+            mean
+        };
         let mut foreign = false;
         if bg_n > 0 {
-            let dist = ((mean[0] - bg[0] / bg_n as f32).powi(2)
-                + (mean[1] - bg[1] / bg_n as f32).powi(2)
-                + (mean[2] - bg[2] / bg_n as f32).powi(2))
+            let dist = ((mean[0] - bg_mean[0]).powi(2)
+                + (mean[1] - bg_mean[1]).powi(2)
+                + (mean[2] - bg_mean[2]).powi(2))
             .sqrt();
-            foreign = dist > 55.0;
+            // Foreign threshold scales with background luma (dark fields
+            // need less distance to count as foreign).
+            let bg_luma = 0.2126 * bg_mean[0] + 0.7152 * bg_mean[1] + 0.0722 * bg_mean[2];
+            let threshold = 55.0 * ((bg_luma + 30.0) / 120.0).clamp(0.4, 1.3);
+            foreign = dist > threshold;
         }
-        if density < MAX_DENSITY || foreign {
+        if density < max_density || foreign {
             speck[i] = true;
-            speck_bg[i] = if bg_n > 0 {
-                [
-                    bg[0] / bg_n as f32,
-                    bg[1] / bg_n as f32,
-                    bg[2] / bg_n as f32,
-                ]
-            } else {
-                mean
-            };
+            speck_bg[i] = bg_mean;
+            speck_bg_n[i] = bg_n;
         }
     }
-    // Replace speck pixels with the local background mean (computed in the
-    // density window; ink excluded already, same-speck pixels skipped).
+    // Replace speck pixels with the window background mean (the same value
+    // used for the foreign check, so the replacement cannot re-create a
+    // strong pixel). The 3x3 non-strong mean is only a fallback when the
+    // window had no background at all.
     let mut work = image.clone();
     for (i, &is_speck) in speck.iter().enumerate() {
         if !is_speck {
             continue;
         }
         let (cx, cy) = (i % w as usize, i / w as usize);
-        let mut sum = [0.0f32; 3];
-        let mut n = 0u32;
-        for dy in -1i32..=1 {
-            for dx in -1i32..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
+        let mut target = speck_bg[i];
+        if speck_bg_n[i] == 0 {
+            let mut sum = [0.0f32; 3];
+            let mut n = 0u32;
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let nidx = idx(nx as u32, ny as u32);
+                    if strong[nidx] {
+                        continue; // non-strong neighbors only
+                    }
+                    let neighbor = image.get_pixel(nx as u32, ny as u32);
+                    sum[0] += neighbor[0] as f32;
+                    sum[1] += neighbor[1] as f32;
+                    sum[2] += neighbor[2] as f32;
+                    n += 1;
                 }
-                let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
-                if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
-                    continue;
-                }
-                let nidx = idx(nx as u32, ny as u32);
-                if strong[nidx] && labels[nidx] == labels[i] {
-                    continue; // same speck: no self-averaging
-                }
-                let neighbor = image.get_pixel(nx as u32, ny as u32);
-                sum[0] += neighbor[0] as f32;
-                sum[1] += neighbor[1] as f32;
-                sum[2] += neighbor[2] as f32;
-                n += 1;
+            }
+            if n > 0 {
+                target = [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32];
             }
         }
-        let target = if n > 0 {
-            [sum[0] / n as f32, sum[1] / n as f32, sum[2] / n as f32]
-        } else {
-            speck_bg[i]
-        };
         let p = work.get_pixel_mut(cx as u32, cy as u32);
         for channel in 0..3 {
             p[channel] = target[channel].round().clamp(0.0, 255.0) as u8;

@@ -2537,7 +2537,17 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
                 let l = rgb_to_lab_l(g, g, g);
                 let a = a_resized[y as usize * w as usize + x as usize];
                 let b = b_resized[y as usize * w as usize + x as usize];
-                let (r, g2, bl) = lab_to_rgb(l, a, b);
+                // Dark-area chroma attenuation: the a/b planes are raw model
+                // output (never smoothed), and the Lab merge geometrically
+                // amplifies their small chroma noise into fully saturated
+                // red near black (gray <= 0.10 => L* ~2-9). Scale chroma
+                // down smoothly with darkness so near-black ink stays
+                // neutral (kills the page-dependent "red dots") while dark
+                // hair/clothing at L* 15-35 keeps most of its hue.
+                // rgb_to_lab_l returns L* in 0..100, so l_star == l.
+                let dark = ((1.0 - (l - 8.0) / 32.0).clamp(0.0, 1.0)).powi(2);
+                let chroma_scale = 1.0 - 0.8 * dark;
+                let (r, g2, bl) = lab_to_rgb(l, a * chroma_scale, b * chroma_scale);
                 out.put_pixel(
                     x,
                     y,
