@@ -1626,6 +1626,9 @@ fn handle_photo(
     }
     let local_path = downloads_dir.join("image.jpg");
     std::fs::write(&local_path, &bytes).context("failed to save uploaded image")?;
+    // Keep the INPUT image too (the exact bytes the user sent), so quality
+    // complaints can be traced back to the source.
+    let _ = retain_input_copy(&local_path, &args.work_dir);
     // Header-only dimension validation BEFORE decode: a small file with a
     // huge IHDR would otherwise allocate gigabytes at decode time.
     let (img_width, img_height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -3224,6 +3227,19 @@ fn ensure_scratch_budget(root: &Path, limit: u64) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Copy the exact input image the user sent into `<work_dir>/delivered/`
+/// (same folder as the delivered outputs) for source-side diagnosis.
+fn retain_input_copy(input: &Path, work_dir: &Path) -> Option<PathBuf> {
+    let day = Utc::now().format("%Y-%m-%d");
+    let dir = work_dir.join("delivered").join(day.to_string());
+    let Ok(_) = std::fs::create_dir_all(&dir) else {
+        return None;
+    };
+    let target = dir.join(format!("input_{}.jpg", Utc::now().format("%H%M%S%3f")));
+    std::fs::copy(input, &target).ok()?;
+    Some(target)
 }
 
 /// Copy the exact delivery file (PNG or JPEG) into
