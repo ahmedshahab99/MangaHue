@@ -123,7 +123,7 @@ pub struct InferenceSection {
     pub resize_policy: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PostprocessSection {
     pub restore_lines: bool,
     pub line_strength: f32,
@@ -166,14 +166,6 @@ pub struct PostprocessSection {
     /// blends such pixels toward their neighborhood.
     #[serde(default = "default_despeckle_color_specks")]
     pub despeckle_color_specks: bool,
-    /// Maximum saturation allowed on screentone pixels (0-1; the source
-    /// page is grayscale, so tone chroma is always the model's invention —
-    /// the DDColor-family models paint gray dot patterns red/warm, which
-    /// reads as "red dots" on the page). The tone pass preserves the dot
-    /// pattern's luma and caps its chroma at this value, keeping a gentle
-    /// tint instead of loud invented color. 0 keeps full chroma.
-    #[serde(default = "default_tone_chroma_cap")]
-    pub tone_chroma_cap: f32,
     /// Muted target grade: reshapes every pixel's saturation toward the
     /// measured profile of the reference style (low-key warm look) instead
     /// of the default saturation boost.
@@ -266,6 +258,13 @@ pub struct PostprocessSection {
     /// toward neutral (bounded, hue-preserving for cool colors).
     #[serde(default = "default_governor_target_warmth")]
     pub governor_target_warmth: f32,
+    /// Two-stage grading architecture: color authoring (hints, palette,
+    /// region renderer, reference) runs first, then ONE measured, bounded
+    /// grade pass replaces the legacy natural→muted→governor cascade that
+    /// re-shaped the same chroma signal with four overlapping curves.
+    /// False restores the legacy cascade exactly as it was.
+    #[serde(default = "default_unified_grade")]
+    pub unified_grade: bool,
 }
 
 fn default_muted_dark_sat() -> f32 {
@@ -336,16 +335,16 @@ fn default_governor_target_warmth() -> f32 {
     45.0
 }
 
+fn default_unified_grade() -> bool {
+    true
+}
+
 fn default_soft_coverage() -> bool {
     true
 }
 
 fn default_region_chroma_separation() -> f32 {
     34.0
-}
-
-fn default_tone_chroma_cap() -> f32 {
-    0.0
 }
 
 fn default_despeckle_color_specks() -> bool {
@@ -604,8 +603,8 @@ impl Default for EngineConfig {
                 governor_max_gain: default_governor_max_gain(),
                 governor_target_warmth: default_governor_target_warmth(),
                 hint_chroma_strength: 0.0,
-                tone_chroma_cap: default_tone_chroma_cap(),
                 despeckle_color_specks: default_despeckle_color_specks(),
+                unified_grade: default_unified_grade(),
             },
             output: OutputSection {
                 format: "png".to_string(),

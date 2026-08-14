@@ -65,6 +65,11 @@ pub struct ColorizeRequest {
     pub pyramid_enabled: bool,
     #[serde(default)]
     pub hint_propagation_enabled: bool,
+    /// Force the legacy four-pass grading cascade (unified_grade: false)
+    /// regardless of the config. Used by the benchmark harness to A/B the
+    /// two-stage architecture against the old one.
+    #[serde(default)]
+    pub legacy_grade: bool,
     /// Artist palette override (configs/palettes/*.yaml). Overrides
     /// style.palette before scene re-weighting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,10 +216,16 @@ impl MangaHueEngine {
         }
 
         let total_start = Instant::now();
-        let config = load_config(
+        let mut config = load_config(
             request.config_path.as_deref(),
             request.preset_path.as_deref(),
         )?;
+        // Explicit legacy-grade override (the benchmark harness uses this to
+        // A/B the unified grade against the old cascade without editing
+        // config files).
+        if request.legacy_grade {
+            config.postprocess.unified_grade = false;
+        }
         let style = load_style(request.style_path.as_deref())?;
 
         // Resolve pyramid / hint propagation flags. Request explicit opt-in
@@ -761,11 +772,21 @@ impl MangaHueEngine {
                         ..PyramidConfig::default()
                     }
                 };
+                // The pyramid runs one extra inference per level per tile:
+                // report the real stack cost so a config can't silently
+                // claim a pyramid that isn't running (or vice versa).
+                info!(
+                    levels = ?config.levels,
+                    weights = ?config.blend_weights,
+                    extra_inferences = config.levels.len(),
+                    "pyramid pipeline active"
+                );
                 Arc::new(
                     PyramidColorizer::new(raw_backend, config)
                         .with_cancel(request.cancel_token.clone()),
                 )
             } else {
+                info!("single-pass pipeline active");
                 raw_backend
             };
             backend_name = backend.name().to_string();
@@ -1048,6 +1069,35 @@ impl MangaHueEngine {
                 .metric(
                     "mean_hue_shift_deg",
                     postprocess_report.mean_hue_shift_deg as f64,
+                )
+                .metric(
+                    "grade_stage",
+                    if postprocess_report.grade_stage == "unified" {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                )
+                .metric("unified_gain", postprocess_report.unified_gain as f64)
+                .metric(
+                    "unified_measured_saturation",
+                    postprocess_report.unified_measured_saturation as f64,
+                )
+                .metric(
+                    "unified_measured_colorfulness",
+                    postprocess_report.unified_measured_colorfulness as f64,
+                )
+                .metric(
+                    "unified_measured_warmth",
+                    postprocess_report.unified_measured_warmth as f64,
+                )
+                .metric(
+                    "unified_warmth_shift",
+                    postprocess_report.unified_warmth_shift as f64,
+                )
+                .metric(
+                    "unified_pixels_graded",
+                    postprocess_report.unified_pixels_graded as f64,
                 ),
         );
         // Standard page color metrics (avg RGB, brightness, saturation,

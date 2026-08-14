@@ -199,6 +199,11 @@ struct ColorizeArgs {
     #[arg(long, help = "Propagate user hints to similar line-art regions")]
     hint_propagate: bool,
     #[arg(
+        long,
+        help = "Force the legacy four-pass grading cascade (A/B benchmark)"
+    )]
+    legacy: bool,
+    #[arg(
         long = "palette",
         help = "Artist palette file (configs/palettes/*.yaml) overriding the style palette"
     )]
@@ -809,6 +814,7 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         palette_path: args.palette,
         auto_palette: args.auto_palette,
         draft_path: args.from_draft,
+        legacy_grade: args.legacy,
         ..ColorizeRequest::default()
     })?;
 

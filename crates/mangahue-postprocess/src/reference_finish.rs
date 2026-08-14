@@ -15,6 +15,7 @@ pub(crate) struct ReferenceFinishReport {
     pub shadow_pixels_shaped: u64,
     pub relit_pixels: u64,
     pub face_pixels_painted: u64,
+    pub protected_pixels_skipped: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23,7 +24,7 @@ pub(crate) fn finish_reference_style(
     original_gray: &GrayImage,
     line_mask: &GrayImage,
     bubble_mask: &GrayImage,
-    _protected_mask: Option<&GrayImage>,
+    protected_mask: Option<&GrayImage>,
     face_mask: Option<&GrayImage>,
     style: &StyleProfile,
     config: &PostprocessSection,
@@ -85,7 +86,16 @@ pub(crate) fn finish_reference_style(
             let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
             let bubble = bubble_mask.get_pixel(x, y)[0] as f32 / 255.0;
             let exclusion = bubble;
-            if ink > 0.72 || exclusion > 0.38 {
+            // Protected regions (speech bubbles, text, user-locked areas)
+            // must survive finishing untouched — the pass only re-paints
+            // with palette/style color and would recolor protected text.
+            let protected = protected_mask.is_some_and(|mask| {
+                mask.dimensions() == (width, height) && mask.get_pixel(x, y)[0] > 127
+            });
+            if protected {
+                report.protected_pixels_skipped += 1;
+            }
+            if ink > 0.72 || exclusion > 0.38 || protected {
                 continue;
             }
 
@@ -617,8 +627,8 @@ mod tests {
             governor_max_gain: 1.25,
             governor_target_warmth: 45.0,
             hint_chroma_strength: 0.0,
-            tone_chroma_cap: 0.0,
             despeckle_color_specks: true,
+            unified_grade: true,
         }
     }
 

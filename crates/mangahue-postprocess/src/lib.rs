@@ -3,6 +3,7 @@ mod reference_finish;
 mod region_renderer;
 mod reinhard_transfer;
 pub mod scene;
+mod unified_grade;
 
 pub use scene::{analyze_scene, scene_palette, SceneLighting, SceneProfile};
 
@@ -84,6 +85,24 @@ pub struct PostprocessReport {
     pub model_chroma_retention: f32,
     #[serde(default)]
     pub mean_hue_shift_deg: f32,
+    /// Which grading architecture ran: "unified" (two-stage: authoring +
+    /// one measured grade) or "legacy" (the old four-pass cascade).
+    #[serde(default)]
+    pub grade_stage: String,
+    /// Unified grade telemetry (measured page statistics + the single
+    /// computed decision), so tuning has per-page ground truth.
+    #[serde(default)]
+    pub unified_gain: f32,
+    #[serde(default)]
+    pub unified_measured_saturation: f32,
+    #[serde(default)]
+    pub unified_measured_colorfulness: f32,
+    #[serde(default)]
+    pub unified_measured_warmth: f32,
+    #[serde(default)]
+    pub unified_warmth_shift: f32,
+    #[serde(default)]
+    pub unified_pixels_graded: u64,
 }
 
 pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessReport)> {
@@ -115,6 +134,13 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         palette_fill_pixels: 0,
         model_chroma_retention: 1.0,
         mean_hue_shift_deg: 0.0,
+        grade_stage: String::new(),
+        unified_gain: 1.0,
+        unified_measured_saturation: 0.0,
+        unified_measured_colorfulness: 0.0,
+        unified_measured_warmth: 0.0,
+        unified_warmth_shift: 0.0,
+        unified_pixels_graded: 0,
     };
 
     // Hint-guided chroma correction: the semantic region hints (skin, hair,
@@ -218,6 +244,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         report.reference_chroma_pixels_expanded = finish_report.chroma_pixels_expanded;
         report.reference_shadow_pixels_shaped = finish_report.shadow_pixels_shaped;
         report.face_pixels_painted = finish_report.face_pixels_painted;
+        report.protected_pixels_restored = finish_report.protected_pixels_skipped;
     }
 
     if input.config.reference_transfer {
@@ -231,63 +258,100 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         }
     }
 
-    // Natural grading AFTER reference transfer: the transfer re-normalizes
-    // the LAB stats toward the reference, which would otherwise wash out
-    // the saturation curve. Running grading last keeps the richer look.
-    if input.config.natural_grading {
-        natural_grade::natural_grade(
-            &mut output,
-            input.original_grayscale,
-            input.line_mask,
-            input.bubble_mask,
-        );
-    }
+    // ------------------------------------------------------------------
+    // Stage 2 — the grade. The two-stage architecture runs ONE measured,
+    // bounded pass (unified_grade) that merges the natural grade's value
+    // shaping and skin warm-up, the muted grade's per-luma saturation
+    // profile and hue shifts, and the smart governor's measured gain and
+    // warmth compression into a single coherent decision. The legacy
+    // cascade (unified_grade: false) keeps the old order exactly.
+    // ------------------------------------------------------------------
+    if input.config.unified_grade {
+        if input.config.muted_target_grade
+            || input.config.natural_grading
+            || input.config.smart_governor
+        {
+            let grade = unified_grade::unified_grade(
+                &mut output,
+                input.original_grayscale,
+                input.line_mask,
+                input.bubble_mask,
+                input.protected_mask,
+                input.hint_mask,
+                input.config,
+                input.chroma_signal,
+            );
+            report.grade_stage = "unified".to_string();
+            report.unified_gain = grade.gain;
+            report.unified_measured_saturation = grade.measured_saturation;
+            report.unified_measured_colorfulness = grade.measured_colorfulness;
+            report.unified_measured_warmth = grade.measured_warmth;
+            report.unified_warmth_shift = grade.warmth_shift;
+            report.unified_pixels_graded = grade.pixels_graded;
+        } else {
+            // No grading sub-behavior enabled: nothing to run.
+            report.grade_stage = "unified".to_string();
+        }
+    } else {
+        // Natural grading AFTER reference transfer: the transfer re-normalizes
+        // the LAB stats toward the reference, which would otherwise wash out
+        // the saturation curve. Running grading last keeps the richer look.
+        if input.config.natural_grading {
+            natural_grade::natural_grade(
+                &mut output,
+                input.original_grayscale,
+                input.line_mask,
+                input.bubble_mask,
+            );
+        }
 
-    restore_semantic_chroma(
-        &mut output,
-        &semantic_evidence,
-        input.line_mask,
-        input.face_mask,
-        &mut report.semantic_chroma_restored,
-    );
-
-    // The muted target grade runs LAST of the color passes: the semantic
-    // chroma restore would otherwise re-saturate what the grade just
-    // desaturated (its washed-out gate fires after any desaturation).
-    if input.config.muted_target_grade {
-        natural_grade::muted_target_grade(
+        restore_semantic_chroma(
             &mut output,
-            input.original_grayscale,
+            &semantic_evidence,
             input.line_mask,
-            input.bubble_mask,
-            input.hint_mask,
-            input.config.muted_strength,
-            input.config.muted_hue_shift_deg,
-            input.config.muted_yellow_shift_deg,
-            input.config.muted_dark_pull,
-            input.config.muted_dark_sat,
-            input.config.muted_mid_sat,
-            input.config.muted_bright_sat,
-            input.config.muted_paper_sat,
-            input.config.muted_vivid_preserve,
+            input.face_mask,
+            &mut report.semantic_chroma_restored,
         );
-    }
 
-    // Smart governor runs last of the color passes: measured page metrics
-    // drive a bounded chroma gain toward the preset targets, scaled by the
-    // model's own chroma signal (the page's color budget).
-    if input.config.smart_governor {
-        natural_grade::smart_color_governor(
-            &mut output,
-            input.line_mask,
-            input.config.governor_target_saturation,
-            input.config.governor_target_colorfulness,
-            input.config.governor_min_gain,
-            input.config.governor_max_gain,
-            input.config.governor_target_warmth,
-            input.chroma_signal,
-            input.hint_mask,
-        );
+        // The muted target grade runs LAST of the color passes: the semantic
+        // chroma restore would otherwise re-saturate what the grade just
+        // desaturated (its washed-out gate fires after any desaturation).
+        if input.config.muted_target_grade {
+            natural_grade::muted_target_grade(
+                &mut output,
+                input.original_grayscale,
+                input.line_mask,
+                input.bubble_mask,
+                input.hint_mask,
+                input.config.muted_strength,
+                input.config.muted_hue_shift_deg,
+                input.config.muted_yellow_shift_deg,
+                input.config.muted_dark_pull,
+                input.config.muted_dark_sat,
+                input.config.muted_mid_sat,
+                input.config.muted_bright_sat,
+                input.config.muted_paper_sat,
+                input.config.muted_vivid_preserve,
+            );
+        }
+
+        // Smart governor runs last of the color passes: measured page metrics
+        // drive a bounded chroma gain toward the preset targets, scaled by the
+        // model's own chroma signal (the page's color budget).
+        if input.config.smart_governor {
+            natural_grade::smart_color_governor(
+                &mut output,
+                input.line_mask,
+                input.config.governor_target_saturation,
+                input.config.governor_target_colorfulness,
+                input.config.governor_min_gain,
+                input.config.governor_max_gain,
+                input.config.governor_target_warmth,
+                input.chroma_signal,
+                input.hint_mask,
+            );
+        }
+        report.grade_stage = "legacy".to_string();
     }
 
     if let Some(tone_mask) = input.tone_mask {
@@ -296,7 +360,6 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.original_grayscale,
             tone_mask,
             input.config.line_strength * 0.55,
-            input.config.tone_chroma_cap,
             &mut report.tone_pixels_preserved,
         );
     }
@@ -867,22 +930,6 @@ pub fn reduce_color_near_ink(
     }
 }
 
-pub fn apply_palette_curve(image: &mut RgbImage, style: &StyleProfile) {
-    for pixel in image.pixels_mut() {
-        let gray = (0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32)
-            .round()
-            .clamp(0.0, 255.0);
-        let mut channels = [pixel[0], pixel[1], pixel[2]];
-        for channel in &mut channels {
-            let saturated = gray + (*channel as f32 - gray) * style.saturation;
-            let contrasted = (saturated - 128.0) * style.contrast + 128.0;
-            let brightened = contrasted + style.brightness * 255.0;
-            *channel = brightened.round().clamp(0.0, 255.0) as u8;
-        }
-        *pixel = Rgb(channels);
-    }
-}
-
 // ── 3D LUT Manga Color Grading ──────────────────────────────────────────
 const LUT_SIZE: usize = 17;
 
@@ -1396,12 +1443,13 @@ fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
 
 /// Blend original grayscale back into screentone regions so the dot/line
 /// patterns remain visible instead of being painted over with flat color.
+/// Dark-zone chroma control lives in the unified grade (per-luma targets),
+/// so this pass only restores the dot pattern's luma.
 pub fn preserve_screentones(
     image: &mut RgbImage,
     original_gray: &GrayImage,
     tone_mask: &GrayImage,
     strength: f32,
-    chroma_cap: f32,
     count: &mut u64,
 ) {
     let blend = strength.clamp(0.2, 1.0);
@@ -1420,22 +1468,6 @@ pub fn preserve_screentones(
             pixel[1] as f32 - colored_luma,
             pixel[2] as f32 - colored_luma,
         ];
-        // Tone chroma is invented (the source page is grayscale): the
-        // DDColor-family models paint gray dot patterns loud red/warm hues,
-        // which shows up as "red dots" on the page. Cap the saturation so
-        // the dot pattern keeps only a gentle tint (hue direction intact).
-        if chroma_cap > 0.0 {
-            let mag = (chroma[0] * chroma[0] + chroma[1] * chroma[1] + chroma[2] * chroma[2])
-                .sqrt()
-                .max(1e-6);
-            let cap_mag = chroma_cap * target_luma.max(1.0);
-            if mag > cap_mag {
-                let scale = cap_mag / mag;
-                for value in &mut chroma {
-                    *value *= scale;
-                }
-            }
-        }
         let mut gamut_scale = 1.0f32;
         for value in chroma {
             if value > 0.0 {
@@ -1958,7 +1990,6 @@ mod tests {
             restore_lines: false,
             line_strength: 1.0,
             bubble_cleanup: true,
-            tone_chroma_cap: 0.0,
             despeckle_color_specks: true,
             bleeding_correction: false,
             palette_correction: false,
@@ -2001,6 +2032,7 @@ mod tests {
             governor_max_gain: 1.25,
             governor_target_warmth: 45.0,
             hint_chroma_strength: 0.0,
+            unified_grade: true,
         };
 
         let (output, report) = finalize(PostprocessInput {
@@ -2170,45 +2202,25 @@ mod tests {
     }
 
     #[test]
-    fn screentone_restoration_recovers_luma_and_caps_invented_chroma() {
+    fn screentone_restoration_recovers_luma() {
         // The source page is grayscale, so tone chroma is the model's
-        // invention — the pass restores the dot pattern's luma and caps
-        // the chroma ("red dots" fix) while keeping the hue direction.
+        // invention — the pass restores the dot pattern's luma toward the
+        // original gray while keeping the hue direction.
         let mut image = RgbImage::from_pixel(1, 1, Rgb([180, 80, 60]));
         let original = GrayImage::from_pixel(1, 1, Luma([180]));
         let tone_mask = GrayImage::from_pixel(1, 1, Luma([255]));
         let before_luma: f32 = 0.2126 * 180.0 + 0.7152 * 80.0 + 0.0722 * 60.0;
         let mut restored = 0;
 
-        preserve_screentones(&mut image, &original, &tone_mask, 1.0, 0.18, &mut restored);
+        preserve_screentones(&mut image, &original, &tone_mask, 1.0, &mut restored);
 
         let pixel = image.get_pixel(0, 0);
         let after_luma =
             0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32;
-        let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
         assert_eq!(restored, 1);
         assert!((180.0f32 - after_luma).abs() < (180.0f32 - before_luma).abs());
-        // Loud invented red is capped to a gentle tint...
-        assert!(chroma <= 55, "tone chroma capped, got {chroma}");
-        // ...but the warm hue direction survives (r > g > b).
+        // The warm hue direction survives (r > g > b).
         assert!(pixel[0] > pixel[1] && pixel[1] > pixel[2], "warm tint kept");
-    }
-
-    #[test]
-    fn screentone_cap_zero_keeps_full_chroma() {
-        let mut image = RgbImage::from_pixel(1, 1, Rgb([180, 80, 60]));
-        let original = GrayImage::from_pixel(1, 1, Luma([180]));
-        let tone_mask = GrayImage::from_pixel(1, 1, Luma([255]));
-        let mut restored = 0;
-
-        preserve_screentones(&mut image, &original, &tone_mask, 1.0, 0.0, &mut restored);
-
-        let pixel = image.get_pixel(0, 0);
-        let chroma = pixel.0.iter().max().unwrap() - pixel.0.iter().min().unwrap();
-        assert!(
-            chroma >= 100,
-            "cap 0 keeps the model's chroma, got {chroma}"
-        );
     }
 
     #[test]

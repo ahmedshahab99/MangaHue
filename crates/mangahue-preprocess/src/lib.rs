@@ -914,7 +914,7 @@ fn circularity(perimeter: f64, area: f64) -> f64 {
 /// of similarly-stroked neighbours are labelled as text.
 pub fn detect_text_like_dark_strokes(
     line_mask: &GrayImage,
-    _bubble_mask: &GrayImage,
+    bubble_mask: &GrayImage,
     min_stroke_width: u32,
     max_stroke_width: u32,
 ) -> GrayImage {
@@ -949,7 +949,53 @@ pub fn detect_text_like_dark_strokes(
             }
         }
     }
-    text
+    // The stroke-width response accepts isolated specks: a 1px dot's
+    // surrounding background sits at distance 0 — within 1 of the dot's own
+    // distance — so every ink speck passes the uniformity test (measured:
+    // 94% of the response is components < 10px on textured pages). Once the
+    // protected mask dilates those specks they blanket half the page and
+    // silently freeze finishing/grading out of protected regions. Keep only
+    // components big enough to be real glyph strokes (16px is twice the
+    // largest speck class while small fonts still pass).
+    //
+    // The distance transform ALSO cannot tell a glyph stroke from a hatch
+    // line: on hatched pages, long thin strokes pass every text test. In
+    // manga, text lives inside speech bubbles, so gate the response by
+    // bubble proximity (24px): strokes far from any bubble are linework,
+    // not text, and must not bloat the protected mask.
+    let mut complement = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            complement.put_pixel(
+                x,
+                y,
+                Luma([if bubble_mask.get_pixel(x, y)[0] == 0 {
+                    255
+                } else {
+                    0
+                }]),
+            );
+        }
+    }
+    let bubble_dist = distance_transform(&complement);
+    let near_bubble = |px: u32, py: u32| bubble_dist[idx(px, py, w)] <= 24;
+    let mut visited = vec![false; (w * h) as usize];
+    let mut filtered = GrayImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let i = idx(x, y, w);
+            if visited[i] || text.get_pixel(x, y)[0] == 0 {
+                continue;
+            }
+            let points = flood_mask(&text, &mut visited, x, y);
+            if points.len() >= 16 && points.iter().any(|&(px, py)| near_bubble(px, py)) {
+                for &(px, py) in &points {
+                    filtered.put_pixel(px, py, Luma([255]));
+                }
+            }
+        }
+    }
+    filtered
 }
 
 /// Two-pass Manhattan distance transform.
@@ -1270,6 +1316,58 @@ mod tests {
         let mask = create_line_mask(&gray, &threshold);
         assert_eq!(mask.get_pixel(3, 3)[0], 255);
         assert_eq!(mask.get_pixel(0, 0)[0], 0);
+    }
+
+    #[test]
+    fn text_detection_drops_isolated_specks_but_keeps_glyph_strokes() {
+        // A line mask with a few isolated 1-2px specks (the model's ink
+        // noise) plus a small connected glyph stroke (~20px). The specks
+        // used to pass the stroke-width uniformity test and, once the
+        // protected mask dilated them, blanketed half the page.
+        let mut lines = GrayImage::new(64, 64);
+        let specks = [
+            (5, 5),
+            (50, 50),
+            (51, 50),
+            (50, 51),
+            (30, 8),
+            (8, 30),
+            (40, 40),
+        ];
+        for &(x, y) in &specks {
+            lines.put_pixel(x, y, Luma([255]));
+        }
+        // A thin glyph stroke: 24 wide x 2 tall (48 px, distance 1).
+        for y in 10..12 {
+            for x in 10..34 {
+                lines.put_pixel(x, y, Luma([255]));
+            }
+        }
+        let mut bubbles = GrayImage::new(64, 64);
+        // A speech bubble covering the stroke area (text lives in bubbles).
+        for y in 4..16 {
+            for x in 4..40 {
+                bubbles.put_pixel(x, y, Luma([255]));
+            }
+        }
+        let text = detect_text_like_dark_strokes(&lines, &bubbles, 1, 4);
+        let mut stroke_px = 0;
+        for &(x, y) in &specks {
+            assert_eq!(
+                text.get_pixel(x, y)[0],
+                0,
+                "isolated speck at ({x},{y}) kept"
+            );
+        }
+        for y in 10..12 {
+            for x in 10..34 {
+                stroke_px += (text.get_pixel(x, y)[0] > 0) as u32;
+            }
+        }
+        assert!(
+            stroke_px >= 40,
+            "glyph strokes must survive, got {stroke_px}"
+        );
     }
 
     #[test]

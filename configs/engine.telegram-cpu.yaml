@@ -89,7 +89,6 @@ postprocess:
   governor_min_gain: 0.8
   governor_max_gain: 1.3
   # Warmth governor: the model's palette leans golden; compress warm pixels
-  # toward neutral until the page's midtone R-B matches this target.
   governor_target_warmth: 40.0
   # Hint-guided chroma correction: semantic region hints (skin/hair/clothing/
   # background painted with palette colors) reach the DDColor output where
@@ -98,13 +97,14 @@ postprocess:
   # governor skip hint-corrected pixels (ground truth), so this strength
   # survives grading intact.
   hint_chroma_strength: 0.85
-  # Screentones are grayscale in the source: the model invents their chroma,
 
   # and DDColor-family models paint gray dot patterns loud red (the "red dots"
 
-  # complaint). Cap tone saturation to a gentle tint; 0 keeps full chroma.
 
-  tone_chroma_cap: 0.0
+  # Two-stage grading: color authoring (hints/palette/reference) runs
+  # first, then ONE measured, bounded grade (unified_grade). Set false
+  # to restore the legacy four-pass cascade (benchmark A/B).
+  unified_grade: true
   despeckle_color_specks: true
 
 output:

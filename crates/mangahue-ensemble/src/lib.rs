@@ -783,7 +783,12 @@ fn gamut_map_preserving_luma(mut rgb: [f32; 3], luma: f32) -> [u8; 3] {
 }
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    let t = ((value - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    // Never floor the denominator with .max(1e-6): that destroys the sign
+    // of (edge1 - edge0) and makes inverted ramps return 1.0 everywhere.
+    if (edge1 - edge0).abs() <= f32::EPSILON {
+        return f32::from(value >= edge1);
+    }
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 

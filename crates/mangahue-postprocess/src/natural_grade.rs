@@ -98,7 +98,7 @@ pub(crate) fn natural_grade(
     }
 }
 
-const PEACH_HUE: f32 = 0.055;
+pub(crate) const PEACH_HUE: f32 = 0.055;
 
 /// Smart color governor: a per-page, measured adaptation pass that runs
 /// LAST of the color passes. Instead of a fixed grade, it measures the
@@ -375,17 +375,23 @@ pub(crate) fn muted_target_grade(
     }
 }
 
-fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
-    let t = ((value - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+pub(crate) fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    // NOTE: never floor the denominator with .max(1e-6) — that destroys
+    // the sign of (edge1 - edge0) and turns every inverted ramp (edge1 <
+    // edge0, e.g. the dark gate) into a constant 1.0, skipping all pixels.
+    if (edge1 - edge0).abs() <= f32::EPSILON {
+        return f32::from(value >= edge1);
+    }
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
-fn skin_hue_range(h: f32) -> bool {
+pub(crate) fn skin_hue_range(h: f32) -> bool {
     // Warm skin hues: 0.0-0.12 (orange/peach) and 0.90-1.0 (pink/red).
     (0.90..=1.0).contains(&h) || (0.0..=0.12).contains(&h)
 }
 
-fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+pub(crate) fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let r = r as f32 / 255.0;
     let g = g as f32 / 255.0;
     let b = b as f32 / 255.0;
@@ -409,7 +415,7 @@ fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h / 360.0, s, max)
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+pub(crate) fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     let h = ((h % 1.0) + 1.0) % 1.0;
     let i = (h * 6.0).floor();
     let f = h * 6.0 - i;

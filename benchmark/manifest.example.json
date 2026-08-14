@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "samples": [
+    {
+      "id": "page_01",
+      "lineart": "pages/page_01.png",
+      "reference": "pages/reference/page_01.png",
+      "candidates": {
+        "mangahue": "outputs/run-vivid/page_01.png",
+        "legacy": "outputs/run-legacy/page_01.png"
+      }
+    },
+    {
+      "id": "page_02",
+      "lineart": "pages/page_02.png",
+      "reference": "pages/reference/page_02.png",
+      "candidates": {
+        "mangahue": "outputs/run-vivid/page_02.png",
+        "legacy": "outputs/run-legacy/page_02.png"
+      }
+    }
+  ]
+}

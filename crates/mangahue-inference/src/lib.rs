@@ -2314,9 +2314,27 @@ fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
     let x = inv(fx) * 0.95047;
     let y = inv(fy);
     let z = inv(fz) * 1.08883;
-    let r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
-    let g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
-    let bl = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
+    let mut r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
+    let mut g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+    let mut bl = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
+    // Gamut clamp toward the neutral axis, never per-channel: flooring a
+    // hugely negative channel to 0 while the positive channels survive is
+    // what bends out-of-gamut dark chroma into saturated red (the red-dot
+    // amplification). Shifting the floor to 0 preserves hue direction, then
+    // scaling the peak back to 1 preserves the channel ratios exactly.
+    if r < 0.0 || g < 0.0 || bl < 0.0 {
+        let floor = r.min(g).min(bl);
+        r -= floor;
+        g -= floor;
+        bl -= floor;
+    }
+    let peak = r.max(g).max(bl);
+    if peak > 1.0 {
+        let scale = 1.0 / peak;
+        r *= scale;
+        g *= scale;
+        bl *= scale;
+    }
     (linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(bl))
 }
 
