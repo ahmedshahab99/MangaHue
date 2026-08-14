@@ -155,9 +155,9 @@ struct Args {
     poll_timeout_seconds: u64,
     #[arg(long, default_value_t = DEFAULT_BATCH_SIZE, help = "Pages per media-group batch")]
     batch_size: usize,
-    #[arg(long, value_enum, default_value_t = DeliveryFormat::Jpeg)]
+    #[arg(long, value_enum, default_value_t = DeliveryFormat::Png)]
     delivery_format: DeliveryFormat,
-    #[arg(long, default_value_t = 95, value_parser = clap::value_parser!(u8).range(80..=100))]
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u8).range(80..=100))]
     jpeg_quality: u8,
     #[arg(
         long,
@@ -4166,7 +4166,7 @@ mod tests {
             .save(&source)
             .unwrap();
 
-        let delivery = prepare_delivery(&source, DeliveryFormat::Jpeg, 95).unwrap();
+        let delivery = prepare_delivery(&source, DeliveryFormat::Jpeg, 100).unwrap();
 
         assert!(source.exists());
         assert_eq!(
