@@ -235,7 +235,11 @@ pub(crate) fn unified_grade(
                     };
                     // Vivid knee: genuinely strong colors keep a reduced
                     // share; everything else is pulled toward its target.
-                    if s > 0.55 {
+                    // In the dark zone (<60) the knee does NOT apply — a
+                    // vivid pixel there is exactly the model's invented
+                    // chroma noise (real dark features rarely exceed 0.55
+                    // saturation), so the anti-dot floor always wins.
+                    if s > 0.55 && gray8 >= 60.0 {
                         s *= 0.5 + 0.5 * vivid_preserve;
                     } else {
                         s = s + (target - s) * strength * band_strength;

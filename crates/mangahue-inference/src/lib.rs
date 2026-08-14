@@ -2311,31 +2311,40 @@ fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
             3.0 * delta * delta * (t - 4.0 / 29.0)
         }
     };
+    // The XYZ -> linear RGB matrix is linear in (a, b) for a fixed L*, so
+    // the out-of-gamut color can be compressed toward the neutral axis by
+    // solving, per channel, the largest t in [0, 1] that keeps every
+    // channel inside [0, 1]. This keeps L* EXACTLY fixed (a near-black ink
+    // pixel stays near-black — per-channel clamping or an additive shift
+    // instead brightens it into a saturated colored dot on the line) and
+    // preserves the hue direction as chroma shrinks.
     let x = inv(fx) * 0.95047;
     let y = inv(fy);
     let z = inv(fz) * 1.08883;
-    let mut r = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
-    let mut g = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
-    let mut bl = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
-    // Gamut clamp toward the neutral axis, never per-channel: flooring a
-    // hugely negative channel to 0 while the positive channels survive is
-    // what bends out-of-gamut dark chroma into saturated red (the red-dot
-    // amplification). Shifting the floor to 0 preserves hue direction, then
-    // scaling the peak back to 1 preserves the channel ratios exactly.
-    if r < 0.0 || g < 0.0 || bl < 0.0 {
-        let floor = r.min(g).min(bl);
-        r -= floor;
-        g -= floor;
-        bl -= floor;
+    let r_full = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
+    let g_full = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+    let b_full = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
+    // The neutral (a=b=0) linear RGB at this L*: every channel equals the
+    // same gray, computed once with the same matrix.
+    let fy0 = fy;
+    let gray = inv(fy0);
+    let r0 = gray * 3.2404542 + gray * -1.5371385 + gray * -0.4985314;
+    let g0 = gray * -0.9692660 + gray * 1.8760108 + gray * 0.0415560;
+    let b0 = gray * 0.0556434 + gray * -0.2040259 + gray * 1.0572252;
+    let mut t = 1.0f32;
+    for (c0, c1) in [(r0, r_full), (g0, g_full), (b0, b_full)] {
+        let spread = c1 - c0;
+        if spread > 0.0 && c1 > 1.0 {
+            t = t.min((1.0 - c0) / spread);
+        } else if spread < 0.0 && c1 < 0.0 {
+            t = t.min(c0 / (c0 - c1));
+        }
     }
-    let peak = r.max(g).max(bl);
-    if peak > 1.0 {
-        let scale = 1.0 / peak;
-        r *= scale;
-        g *= scale;
-        bl *= scale;
-    }
-    (linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(bl))
+    let t = t.clamp(0.0, 1.0);
+    let r = r0 + t * (r_full - r0);
+    let g = g0 + t * (g_full - g0);
+    let b = b0 + t * (b_full - b0);
+    (linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(b))
 }
 
 /// Saturating warmup input: raw tanh graphs report |ab| <= ~1; graphs with
@@ -2563,8 +2572,24 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
                 // neutral (kills the page-dependent "red dots") while dark
                 // hair/clothing at L* 15-35 keeps most of its hue.
                 // rgb_to_lab_l returns L* in 0..100, so l_star == l.
-                let dark = ((1.0 - (l - 8.0) / 32.0).clamp(0.0, 1.0)).powi(2);
-                let chroma_scale = 1.0 - 0.8 * dark;
+                // Ink pixels (L* < ~14) must stay essentially neutral: the
+                // chroma there is the model's invention, and any residual
+                // chroma at all reads as colored dots ON the lines (the
+                // despeckle skips dense chains, and the grade never touches
+                // ink). The curve is steep below L* 14 (near-zero at pure
+                // ink) while dark hair/clothing at L* 20-40 keeps most of
+                // its hue.
+                let chroma_scale = if l < 4.0 {
+                    0.0
+                } else if l < 12.0 {
+                    0.15 * (l - 4.0) / 8.0
+                } else if l < 25.0 {
+                    0.15 + 0.4 * (l - 12.0) / 13.0
+                } else if l < 40.0 {
+                    0.55 + 0.45 * (l - 25.0) / 15.0
+                } else {
+                    1.0
+                };
                 let (r, g2, bl) = lab_to_rgb(l, a * chroma_scale, b * chroma_scale);
                 out.put_pixel(
                     x,

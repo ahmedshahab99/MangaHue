@@ -1500,25 +1500,23 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     const MAX_DENSITY: f32 = 0.18;
     let idx = |x: u32, y: u32| (y * w + x) as usize;
 
-    // Strong-color mask (saturation > 0.35).
+    // Strong-color mask (saturation > 0.35). Colored pixels ON ink are
+    // included on purpose: the source is grayscale manga, so any strong
+    // chroma sitting on an ink line is the model's invented noise — the
+    // "dots on the lines" — and must be cleaned like any other speck (the
+    // neutral ink around it becomes the replacement background). The old
+    // exemption ("colored pixels on ink are art") is what let colored
+    // specks survive ON every line.
     let mut strong = vec![false; (w * h) as usize];
     for (i, pixel) in image.pixels().enumerate() {
         let mx = pixel[0].max(pixel[1]).max(pixel[2]) as u16;
         let mn = pixel[0].min(pixel[1]).min(pixel[2]) as u16;
         strong[i] = mx > 0 && (mx - mn) as f32 / mx as f32 > 0.35;
     }
-    // Ink never participates: colored pixels on ink are art, not noise.
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0 {
-            continue;
-        }
-        if line_mask.get_pixel(x, y)[0] > 184 {
-            strong[idx(x, y)] = false;
-        }
-    }
     // Label strong-color components (8-connectivity, BFS).
     let mut labels = vec![0u32; (w * h) as usize];
     let mut sizes: Vec<u32> = Vec::new();
+    let mut comp_on_ink: Vec<bool> = Vec::new();
     let mut next_label = 1u32;
     for start in 0..(w * h) as usize {
         if !strong[start] || labels[start] != 0 {
@@ -1527,9 +1525,13 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
         let mut queue = vec![start];
         labels[start] = next_label;
         let mut size = 0u32;
+        let mut touches_ink = false;
         while let Some(cur) = queue.pop() {
             size += 1;
             let (cx, cy) = (cur % w as usize, cur / w as usize);
+            if line_mask.get_pixel(cx as u32, cy as u32)[0] > 184 {
+                touches_ink = true;
+            }
             for dy in -1i32..=1 {
                 for dx in -1i32..=1 {
                     if dx == 0 && dy == 0 {
@@ -1548,6 +1550,7 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
             }
         }
         sizes.push(size);
+        comp_on_ink.push(touches_ink);
         next_label += 1;
     }
     // Mean color and luma of each component.
@@ -1575,10 +1578,18 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     // A component is "small" when it is tiny, or when it lives in the dark
     // range where the model's chroma noise forms short chains (dark shading
     // specks); real dark features (hair, shadows) are far larger. Halftone
-    // fields are mid-tone and always fail the density gate anyway.
+    // fields are mid-tone and always fail the density gate anyway. Ink-bound
+    // components may form longer chains along a line (the dot trace), so
+    // they get a longer leash — their color is still checked against the
+    // (neutral) ink background.
     let small = |label: u32| -> bool {
         let size = sizes[(label - 1) as usize];
-        size <= MAX_SPECKSIZE || (size <= 40 && component_luma((label - 1) as usize) < 90.0)
+        let limit = if comp_on_ink[(label - 1) as usize] {
+            80
+        } else {
+            MAX_SPECKSIZE
+        };
+        size <= limit || (size <= 40 && component_luma((label - 1) as usize) < 90.0)
     };
 
     // A speck component is removed when it does not belong to its
@@ -1640,18 +1651,100 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
             mean
         };
         let mut foreign = false;
+        let mut dist = 0.0f32;
+        let mut threshold = 0.0f32;
         if bg_n > 0 {
-            let dist = ((mean[0] - bg_mean[0]).powi(2)
+            dist = ((mean[0] - bg_mean[0]).powi(2)
                 + (mean[1] - bg_mean[1]).powi(2)
                 + (mean[2] - bg_mean[2]).powi(2))
             .sqrt();
             // Foreign threshold scales with background luma (dark fields
             // need less distance to count as foreign).
             let bg_luma = 0.2126 * bg_mean[0] + 0.7152 * bg_mean[1] + 0.0722 * bg_mean[2];
-            let threshold = 55.0 * ((bg_luma + 30.0) / 120.0).clamp(0.4, 1.3);
+            threshold = 55.0 * ((bg_luma + 30.0) / 120.0).clamp(0.4, 1.3);
             foreign = dist > threshold;
         }
-        if density < max_density || foreign {
+        let (cx, cy) = (i % w as usize, i / w as usize);
+        let on_line = line_mask.get_pixel(cx as u32, cy as u32)[0] > 184;
+        let mut remove = false;
+        if on_line && bg_n > 0 {
+            // Chroma sitting ON an ink line is the model's invention (the
+            // source page is grayscale), so the density gate protects
+            // nothing — the neighbors are other specks on the same line.
+            // The only question is whether the color matches the line's
+            // own neutral color: a tight foreign threshold (40%% of the
+            // normal one, floored) removes the dim colored chains while
+            // legit colored regions keep their line-edge pixels.
+            remove = dist > (threshold * 0.4).max(18.0);
+        } else if density < max_density || foreign {
+            remove = true;
+        }
+        if remove {
+            speck[i] = true;
+            speck_bg[i] = bg_mean;
+            speck_bg_n[i] = bg_n;
+        }
+    }
+
+    // Pass 2 — ON-LINE pixels, independently of component size. A speck
+    // attached to a legit colored region (8-connected through the strong
+    // mask) rides the region's giant component past the small() gate
+    // above, so it is never examined. Chroma on an ink line is invented
+    // (grayscale source): examine every strong on-line pixel directly and
+    // remove it when it does not match the line's own neutral color.
+    for (i, &is_strong) in strong.iter().enumerate() {
+        if !is_strong || speck[i] {
+            continue;
+        }
+        let (cx, cy) = (i % w as usize, i / w as usize);
+        if line_mask.get_pixel(cx as u32, cy as u32)[0] <= 184 {
+            continue;
+        }
+        let half = (DENSITY_WINDOW / 2) as i32;
+        let (x0, x1) = (
+            (cx as i32 - half).max(0),
+            (cx as i32 + half).min(w as i32 - 1),
+        );
+        let (y0, y1) = (
+            (cy as i32 - half).max(0),
+            (cy as i32 + half).min(h as i32 - 1),
+        );
+        let mut bg = [0.0f32; 3];
+        let mut bg_n = 0u32;
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                let nidx = idx(xx as u32, yy as u32);
+                if strong[nidx] {
+                    continue;
+                }
+                let p = image.get_pixel(xx as u32, yy as u32);
+                bg[0] += p[0] as f32;
+                bg[1] += p[1] as f32;
+                bg[2] += p[2] as f32;
+                bg_n += 1;
+            }
+        }
+        if bg_n == 0 {
+            // Fully colored neighborhood on the line: the invented chroma
+            // is dense, so blend the pixel toward the line (the 3x3
+            // fallback in the replacement step resolves the target).
+            speck[i] = true;
+            speck_bg_n[i] = 0;
+            continue;
+        }
+        let bg_mean = [
+            bg[0] / bg_n as f32,
+            bg[1] / bg_n as f32,
+            bg[2] / bg_n as f32,
+        ];
+        let p = image.get_pixel(cx as u32, cy as u32);
+        let dist = ((p[0] as f32 - bg_mean[0]).powi(2)
+            + (p[1] as f32 - bg_mean[1]).powi(2)
+            + (p[2] as f32 - bg_mean[2]).powi(2))
+        .sqrt();
+        let bg_luma = 0.2126 * bg_mean[0] + 0.7152 * bg_mean[1] + 0.0722 * bg_mean[2];
+        let threshold = 55.0 * ((bg_luma + 30.0) / 120.0).clamp(0.4, 1.3);
+        if dist > (threshold * 0.4).max(12.0) {
             speck[i] = true;
             speck_bg[i] = bg_mean;
             speck_bg_n[i] = bg_n;
@@ -1963,19 +2056,26 @@ mod tests {
     }
 
     #[test]
-    fn color_speckle_removal_never_touches_ink() {
-        let mut image = RgbImage::from_pixel(9, 9, Rgb([150, 150, 150]));
+    fn color_speckle_removal_cleans_specks_on_ink() {
+        // A saturated red speck sitting ON an ink line: the source page is
+        // grayscale, so strong chroma on ink is the model's invented noise
+        // (the "dots on the lines" complaint) and must be blended into the
+        // dark neutral line instead of being exempted.
+        let mut image = RgbImage::from_pixel(9, 9, Rgb([40, 40, 40]));
         image.put_pixel(4, 4, Rgb([230, 40, 30]));
         let mut lines = GrayImage::from_pixel(9, 9, Luma([0]));
         lines.put_pixel(4, 4, Luma([255]));
 
         remove_color_specks(&mut image, &lines);
 
-        assert_eq!(
-            image.get_pixel(4, 4).0,
-            [230, 40, 30],
-            "ink pixel untouched"
+        let pixel = image.get_pixel(4, 4).0;
+        let chroma = pixel.iter().max().unwrap() - pixel.iter().min().unwrap();
+        assert!(
+            chroma < 40,
+            "on-ink speck desaturated toward the line, got {chroma} ({pixel:?})"
         );
+        // The line stays dark.
+        assert!(pixel.iter().all(|c| *c < 110), "line stays dark: {pixel:?}");
     }
 
     #[test]

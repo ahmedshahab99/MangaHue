@@ -1157,13 +1157,16 @@ impl MangaHueEngine {
                 // Reconstruction (Lanczos upscale + chroma boost + joint-
                 // bilateral chroma spread) re-creates isolated strong-color
                 // specks AFTER the working-res despeckle inside finalize(),
-                // so despeckle once more at full resolution. The all-zero
-                // line mask is fine: ink pixels are dark/low-saturation and
-                // never match the pass's strong-color mask.
-                let full_line_mask = image::GrayImage::from_pixel(
+                // so despeckle once more at full resolution — with the REAL
+                // line mask upscaled: chroma sitting on an ink line is the
+                // model's invented noise (the "dots on the lines") and the
+                // on-line branch of the despeckle removes it. An all-zero
+                // mask silently disabled that branch.
+                let full_line_mask = image::imageops::resize(
+                    &preprocess.line_mask,
                     final_image.width(),
                     final_image.height(),
-                    image::Luma([0]),
+                    image::imageops::FilterType::Nearest,
                 );
                 remove_color_specks(&mut final_image, &full_line_mask);
             }
