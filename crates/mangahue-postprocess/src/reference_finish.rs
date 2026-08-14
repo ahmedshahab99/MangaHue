@@ -628,6 +628,7 @@ mod tests {
             governor_target_warmth: 45.0,
             hint_chroma_strength: 0.0,
             despeckle_color_specks: true,
+            descreen_halftone: true,
             unified_grade: true,
         }
     }

@@ -1842,6 +1842,142 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     *image = work;
 }
 
+/// Remove printed halftone dot artifacts from already-colored pages: small
+/// saturated warm-color components (dark red/orange print dots on lighter
+/// paper, measured on the user's colored scan: 1-8px clusters, hue 0-60 /
+/// 250-360, strongly saturated) are replaced with the local background
+/// (median RGB of the 9x9 neighborhood). This is the pass-through path's
+/// dot cleanup: the engine's own despeckle handles model noise on grayscale
+/// pages, but already-colored pages ship untouched and carry their print
+/// dots to the user. Black ink carries no strong chroma so it is never in
+/// the mask; large colored regions (solid fills, gradients) are not small
+/// components and survive exactly. Returns the number of replaced pixels.
+pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
+    let (w, h) = image.dimensions();
+    if w < 3 || h < 3 {
+        return 0;
+    }
+    const MAX_DOT_SIZE: u32 = 8;
+    const SAT_THRESHOLD: f32 = 0.35;
+    const MIN_LUMA: f32 = 40.0;
+    const WINDOW: i32 = 4; // 9x9 median window
+    let idx = |x: u32, y: u32| (y * w + x) as usize;
+
+    // Strong warm/magenta chroma mask (red/orange/pink/purple specks).
+    let mut strong = vec![false; (w * h) as usize];
+    for (i, pixel) in image.pixels().enumerate() {
+        let (r, g, b) = (pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        if mx <= 0.0 {
+            continue;
+        }
+        if (mx - mn) / mx <= SAT_THRESHOLD {
+            continue;
+        }
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        if luma <= MIN_LUMA {
+            continue;
+        }
+        let delta = mx - mn;
+        let hue = if r == mx {
+            60.0 * (((g - b) / delta) % 6.0)
+        } else if g == mx {
+            60.0 * ((b - r) / delta + 2.0)
+        } else {
+            60.0 * ((r - g) / delta + 4.0)
+        };
+        let hue = hue.rem_euclid(360.0);
+        if hue < 60.0 || hue > 250.0 {
+            strong[i] = true;
+        }
+    }
+
+    // Label strong-color components (8-connectivity, BFS).
+    let mut labels = vec![0u32; (w * h) as usize];
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut next_label = 1u32;
+    for start in 0..(w * h) as usize {
+        if !strong[start] || labels[start] != 0 {
+            continue;
+        }
+        let mut queue = vec![start];
+        labels[start] = next_label;
+        let mut size = 0u32;
+        while let Some(cur) = queue.pop() {
+            size += 1;
+            let (cx, cy) = (cur % w as usize, cur / w as usize);
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (cx as i32 + dx, cy as i32 + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                        continue;
+                    }
+                    let nidx = idx(nx as u32, ny as u32);
+                    if strong[nidx] && labels[nidx] == 0 {
+                        labels[nidx] = next_label;
+                        queue.push(nidx);
+                    }
+                }
+            }
+        }
+        sizes.push(size);
+        next_label += 1;
+    }
+
+    // Small components are halftone dots: replace with the neighborhood
+    // median color (the local paper/background).
+    let mut speck = vec![false; (w * h) as usize];
+    let mut speck_count = 0u64;
+    for (i, &label) in labels.iter().enumerate() {
+        if label != 0 && sizes[(label - 1) as usize] <= MAX_DOT_SIZE {
+            speck[i] = true;
+            speck_count += 1;
+        }
+    }
+    if speck_count == 0 {
+        return 0;
+    }
+
+    // Median replacement per speck pixel (per-channel median of the
+    // 9x9 window; sorting a tiny u8 slice per dot is far cheaper than a
+    // full-image median filter).
+    let mut work = image.clone();
+    let mut window = Vec::with_capacity(81);
+    for (i, &is_speck) in speck.iter().enumerate() {
+        if !is_speck {
+            continue;
+        }
+        let (cx, cy) = (i % w as usize, i / w as usize);
+        let (x0, x1) = (
+            (cx as i32 - WINDOW).max(0),
+            (cx as i32 + WINDOW).min(w as i32 - 1),
+        );
+        let (y0, y1) = (
+            (cy as i32 - WINDOW).max(0),
+            (cy as i32 + WINDOW).min(h as i32 - 1),
+        );
+        let mut target = [0u8; 3];
+        for channel in 0..3 {
+            window.clear();
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    window.push(image.get_pixel(xx as u32, yy as u32)[channel]);
+                }
+            }
+            window.sort_unstable();
+            target[channel] = window[window.len() / 2];
+        }
+        let p = work.get_pixel_mut(cx as u32, cy as u32);
+        *p = Rgb(target);
+    }
+    *image = work;
+    speck_count
+}
+
 /// Adaptive line restoration: stronger in dark ink areas, gentler near edges,
 /// preserving colored details in thin-line regions.
 pub fn restore_lines_adaptive(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {
@@ -2152,6 +2288,7 @@ mod tests {
             line_strength: 1.0,
             bubble_cleanup: true,
             despeckle_color_specks: true,
+            descreen_halftone: true,
             bleeding_correction: false,
             palette_correction: false,
             final_sharpening: 0.0,

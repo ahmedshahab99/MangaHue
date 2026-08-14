@@ -271,7 +271,27 @@ impl MangaHueEngine {
                     mean_sat,
                     colored_fraction, "already-colored page passed through without inference"
                 );
-                save_rgb(&request.output_path, &manga_image.image.to_rgb8())?;
+                let mut output = manga_image.image.to_rgb8();
+                // Colored scans carry printed halftone dot artifacts (small
+                // dark red/orange clusters) that read as "red dots" to the
+                // user; clean them before delivery. Black line art and large
+                // colored regions are untouched.
+                let mut halftone_dots_removed = 0u64;
+                if config.postprocess.descreen_halftone {
+                    halftone_dots_removed = mangahue_postprocess::remove_halftone_dots(&mut output);
+                }
+                report.add_stage_report(
+                    StageReport::new("halftone_descreen")
+                        .metric("dot_pixels_removed", halftone_dots_removed as f64)
+                        .note(if halftone_dots_removed > 0 {
+                            format!(
+                                "removed {halftone_dots_removed} halftone dot pixels from colored page"
+                            )
+                        } else {
+                            "no halftone dot pixels found".to_string()
+                        }),
+                );
+                save_rgb(&request.output_path, &output)?;
                 emit_progress(&progress, "done", 6, 6, None);
                 report.total_ms = total_start.elapsed().as_millis();
                 report.director_verdict = Some("already colored".to_string());

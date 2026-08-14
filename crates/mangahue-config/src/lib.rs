@@ -166,6 +166,13 @@ pub struct PostprocessSection {
     /// blends such pixels toward their neighborhood.
     #[serde(default = "default_despeckle_color_specks")]
     pub despeckle_color_specks: bool,
+    /// Remove printed halftone dot artifacts on already-colored pages:
+    /// small saturated warm-color clusters (dark red/orange print dots on
+    /// lighter paper — the "red dots" on colored scans) are replaced with
+    /// the local background color. Black ink and large colored regions are
+    /// never touched.
+    #[serde(default = "default_descreen_halftone")]
+    pub descreen_halftone: bool,
     /// Muted target grade: reshapes every pixel's saturation toward the
     /// measured profile of the reference style (low-key warm look) instead
     /// of the default saturation boost.
@@ -348,6 +355,10 @@ fn default_region_chroma_separation() -> f32 {
 }
 
 fn default_despeckle_color_specks() -> bool {
+    true
+}
+
+fn default_descreen_halftone() -> bool {
     true
 }
 
@@ -604,6 +615,7 @@ impl Default for EngineConfig {
                 governor_target_warmth: default_governor_target_warmth(),
                 hint_chroma_strength: 0.0,
                 despeckle_color_specks: default_despeckle_color_specks(),
+                descreen_halftone: default_descreen_halftone(),
                 unified_grade: default_unified_grade(),
             },
             output: OutputSection {
