@@ -1191,6 +1191,24 @@ impl MangaHueEngine {
                 remove_color_specks(&mut final_image, &full_line_mask);
             }
         }
+        // Printed-halftone-style dot cleanup at final resolution: the
+        // despeckle's size/density gates skip specks riding large warm
+        // components (measured: short warm chains inside shaded fields),
+        // so sweep small strong-warm components once more — luma (line
+        // art, shading, screentones) is never touched.
+        if config.postprocess.descreen_halftone {
+            let halftone_dots_removed =
+                mangahue_postprocess::remove_halftone_dots(&mut final_image);
+            if halftone_dots_removed > 0 {
+                report.add_stage_report(
+                    StageReport::new("halftone_descreen")
+                        .metric("dot_pixels_removed", halftone_dots_removed as f64)
+                        .note(format!(
+                            "removed {halftone_dots_removed} halftone dot pixels at final resolution"
+                        )),
+                );
+            }
+        }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 
         save_rgb(&request.output_path, &final_image)?;
