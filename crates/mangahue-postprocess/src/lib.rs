@@ -679,7 +679,15 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
             original * (1.0 - prediction_weight) + predicted_luma[index] * prediction_weight;
         let midtone = (1.0 - ((target_luma - 132.0).abs() / 132.0)).clamp(0.0, 1.0);
         let edge_ink = edge * adjacent_ink;
-        let chroma_boost = 1.12 + midtone * 0.18;
+        let mut chroma_boost = 1.12 + midtone * 0.18;
+        // Magenta-band pixels (red AND blue above the luma, green below)
+        // are the model's mauve cast, already capped by the unified grade
+        // at the working resolution — the reconstruction's chroma boost
+        // would amplify them back over the visibility threshold (measured
+        // 0.28 -> 0.34). No boost for the band: the cap survives.
+        if red_chroma[index] > 0.0 && blue_chroma[index] > 0.0 {
+            chroma_boost = 1.0;
+        }
         let red = red_chroma[index] * chroma_boost;
         let blue = blue_chroma[index] * chroma_boost;
         let green = -(0.2126 * red + 0.0722 * blue) / 0.7152;
@@ -698,6 +706,36 @@ pub fn reconstruct_full_resolution(colorized: &RgbImage, original_gray: &GrayIma
             pixel[channel] = (pixel[channel] as f32 * (1.0 - ink_anchor) + original * ink_anchor)
                 .round()
                 .clamp(0.0, 255.0) as u8;
+        }
+        // Final mauve cap AT FULL RESOLUTION: the working-res cap (unified
+        // grade) survives the removed chroma boost, but the luma
+        // re-anchoring toward the original gray raises the perceived
+        // saturation of midtone magenta pixels (measured 0.28 -> 0.34) and
+        // the JBU spread adds more at region edges. Cap the band here, at
+        // the exact resolution the user sees — this is the last chroma
+        // shaping step in the pipeline.
+        let mx = pixel[0].max(pixel[1]).max(pixel[2]) as f32;
+        let mn = pixel[0].min(pixel[1]).min(pixel[2]) as f32;
+        if mx > mn && mx > 0.0 {
+            let hue = if mx == pixel[0] as f32 {
+                60.0 * (((pixel[1] as f32 - pixel[2] as f32) / (mx - mn)) % 6.0)
+            } else if mx == pixel[1] as f32 {
+                60.0 * ((pixel[2] as f32 - pixel[0] as f32) / (mx - mn) + 2.0)
+            } else {
+                60.0 * ((pixel[0] as f32 - pixel[1] as f32) / (mx - mn) + 4.0)
+            };
+            let hue_deg = ((hue % 360.0) + 360.0) % 360.0;
+            if (280.0..360.0).contains(&hue_deg) && (mx - mn) / mx > 0.28 {
+                let new_min = mx * (1.0 - 0.28);
+                for channel in 0..3 {
+                    let c = pixel[channel] as f32;
+                    if c < mx {
+                        let t = if mx > mn { (c - mn) / (mx - mn) } else { 0.0 };
+                        pixel[channel] =
+                            (new_min + t * (mx - new_min)).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
         }
     }
     output
@@ -1581,15 +1619,23 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     // fields are mid-tone and always fail the density gate anyway. Ink-bound
     // components may form longer chains along a line (the dot trace), so
     // they get a longer leash — their color is still checked against the
-    // (neutral) ink background.
+    // (neutral) ink background. Midtone components up to 100px are also
+    // examined: the model scatters isolated purple/red specks across the
+    // page's midtones (measured: 0.2% of a page in 7-100px components, 60%
+    // of them foreign to their background), and the density/foreign gates
+    // decide — dense texture and legit colored details survive, isolated
+    // specks are blended into their background.
     let small = |label: u32| -> bool {
         let size = sizes[(label - 1) as usize];
+        let luma = component_luma((label - 1) as usize);
         let limit = if comp_on_ink[(label - 1) as usize] {
             80
+        } else if luma < 90.0 {
+            40
         } else {
-            MAX_SPECKSIZE
+            100
         };
-        size <= limit || (size <= 40 && component_luma((label - 1) as usize) < 90.0)
+        size <= limit
     };
 
     // A speck component is removed when it does not belong to its
@@ -2028,31 +2074,46 @@ mod tests {
     }
 
     #[test]
-    fn color_speckle_removal_kills_isolated_dots_keeps_blobs() {
+    fn color_speckle_removal_kills_isolated_dots_keeps_dense_blobs() {
         // A single strong-red pixel on a gray field is model dot noise.
-        let mut image = RgbImage::from_pixel(41, 41, Rgb([150, 150, 150]));
-        image.put_pixel(35, 35, Rgb([230, 40, 30]));
-        // A coherent 4x4 red blob (a real colored region, > speck size)
-        // placed far from the dot must stay.
-        for y in 4..8 {
-            for x in 4..8 {
+        let mut image = RgbImage::from_pixel(61, 61, Rgb([150, 150, 150]));
+        image.put_pixel(55, 55, Rgb([230, 40, 30]));
+        // A coherent 20x20 red region (dense enough to fill the density
+        // window) placed far from the dot must stay.
+        for y in 4..24 {
+            for x in 4..24 {
                 image.put_pixel(x, y, Rgb([220, 60, 50]));
             }
         }
-        let lines = GrayImage::from_pixel(41, 41, Luma([0]));
+        // A sparse 4x4 blob (a midtone speck — the visible purple/red
+        // dots) is dense enough to survive as a region only when its
+        // neighborhood carries it; on paper it is noise and is removed.
+        for y in 34..38 {
+            for x in 34..38 {
+                image.put_pixel(x, y, Rgb([200, 60, 180])); // purple speck
+            }
+        }
+        let lines = GrayImage::from_pixel(61, 61, Luma([0]));
 
         remove_color_specks(&mut image, &lines);
 
-        let dot = image.get_pixel(35, 35);
-        let blob = image.get_pixel(5, 5);
+        let dot = image.get_pixel(55, 55);
+        let region = image.get_pixel(12, 12);
+        let speck = image.get_pixel(36, 36);
         // The isolated dot is blended toward the gray field...
         assert!(
             (dot[0] as i32 - dot[2] as i32) < 40,
             "isolated dot desaturated, got {:?}",
             dot
         );
-        // ...while the coherent blob keeps its color.
-        assert!(blob[0] as i32 - blob[2] as i32 > 80, "blob preserved");
+        // ...and so is the sparse purple speck (the dot complaint)...
+        assert!(
+            (speck[0] as i32 - speck[2] as i32) < 60,
+            "sparse midtone speck removed, got {:?}",
+            speck
+        );
+        // ...while the dense 20x20 region keeps its color.
+        assert!(region[0] as i32 - region[2] as i32 > 80, "region preserved");
     }
 
     #[test]

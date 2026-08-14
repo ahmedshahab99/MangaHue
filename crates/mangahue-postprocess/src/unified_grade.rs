@@ -68,96 +68,15 @@ pub(crate) fn unified_grade(
         return UnifiedGradeReport::default();
     }
 
-    // ---- Measure once (sampled, <= ~120k px) ---------------------------
-    // Same statistics as the legacy governor: HSV saturation,
-    // Hasler-Suestrunk colorfulness and mean R-B over midtones.
-    let total = width as usize * height as usize;
-    let step = (total / 120_000).max(1);
-    let mut sat_sum = 0.0f64;
-    let mut rg_sum = 0.0f64;
-    let mut rg_sq = 0.0f64;
-    let mut yb_sum = 0.0f64;
-    let mut yb_sq = 0.0f64;
-    let mut warm_sum = 0.0f64;
-    let mut warm_n = 0u64;
-    let mut n = 0u64;
-    for (x, y, pixel) in image.enumerate_pixels() {
-        let index = y as usize * width as usize + x as usize;
-        if index % step != 0 {
-            continue;
-        }
-        let r = pixel[0] as f64;
-        let g = pixel[1] as f64;
-        let b = pixel[2] as f64;
-        let max = r.max(g).max(b);
-        let min = r.min(g).min(b);
-        sat_sum += if max > 0.0 { (max - min) / max } else { 0.0 };
-        let rg = r - g;
-        let yb = 0.5 * (r + g) - b;
-        rg_sum += rg;
-        rg_sq += rg * rg;
-        yb_sum += yb;
-        yb_sq += yb * yb;
-        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-        if (61.0..199.0).contains(&luma) {
-            warm_sum += r - b;
-            warm_n += 1;
-        }
-        n += 1;
-    }
-    if n == 0 {
-        return UnifiedGradeReport::default();
-    }
-    let nf = n as f64;
-    let measured_sat = (sat_sum / nf) as f32;
-    let rg_mean = rg_sum / nf;
-    let rg_var = (rg_sq / nf - rg_mean * rg_mean).max(0.0);
-    let yb_mean = yb_sum / nf;
-    let yb_var = (yb_sq / nf - yb_mean * yb_mean).max(0.0);
-    let measured_cf = ((rg_var.sqrt() + yb_var.sqrt())
-        + 0.3 * (rg_mean * rg_mean + yb_mean * yb_mean).sqrt()) as f32;
-    let measured_warmth = if warm_n > 0 {
-        (warm_sum / warm_n as f64) as f32
-    } else {
-        0.0
-    };
-
-    // ---- Compute the page's decisions once ------------------------------
+    // ---- Compute the page's decisions on the SHAPED page -----------------
     let governor = config.smart_governor;
     let reshape = config.muted_target_grade || config.natural_grading;
-    let mut report = UnifiedGradeReport {
-        measured_saturation: measured_sat,
-        measured_colorfulness: measured_cf,
-        measured_warmth,
-        ..UnifiedGradeReport::default()
-    };
     if !governor && !reshape {
         // No grading sub-behavior is enabled: the stage is a no-op (the
         // legacy pipeline also ran nothing when all three flags were off).
-        return report;
+        return UnifiedGradeReport::default();
     }
-
-    // Bounded chroma gain toward the governor targets, scaled by the
-    // model's own chroma signal (identical math to the legacy governor).
-    // The gain is measured on the AUTHORED page (before shaping): it is the
-    // page's color budget, and the shaping below moves the page toward the
-    // targets.
-    let mut gain = 1.0f32;
-    if governor {
-        if measured_sat > 0.001 {
-            let sat_err = config.governor_target_saturation / measured_sat;
-            let cf_err = config.governor_target_colorfulness / measured_cf.max(0.01);
-            gain = (0.5 * sat_err + 0.5 * cf_err)
-                .clamp(config.governor_min_gain, config.governor_max_gain);
-            if let Some(signal) = chroma_signal {
-                gain *= (signal / 50.0).clamp(0.85, 1.15);
-            }
-        }
-        if (gain - 1.0).abs() < 0.01 {
-            gain = 1.0;
-        }
-    }
-    report.gain = gain;
+    let mut report = UnifiedGradeReport::default();
 
     let strength = config.muted_strength.clamp(0.0, 1.0);
     let hue_shift_deg = config.muted_hue_shift_deg;
@@ -169,6 +88,7 @@ pub(crate) fn unified_grade(
             mask.dimensions() == (width, height) && mask.get_pixel(x, y)[0] > 127
         })
     };
+    let total = width as usize * height as usize;
 
     // ---- Sub-pass A: saturation + hue + value shaping (no gain) --------
     // The governor's gain is applied in sub-pass B so the warmth measurement
@@ -178,14 +98,48 @@ pub(crate) fn unified_grade(
     let mut graded = 0u64;
     for y in 0..height {
         for x in 0..width {
+            let pixel = *image.get_pixel(x, y);
+            let (mut h, mut s, mut v) = rgb_to_hsv(pixel[0], pixel[1], pixel[2]);
+            // DDColor mauve suppression — FIRST, before every skip: the
+            // hint pass only corrects weak model chroma (sat < 0.30), so
+            // the model's CONFIDENT mauve regions (sat 0.5-0.75, measured
+            // 27% of a page) sit under the hint mask uncorrected, and the
+            // grade's hint skip would otherwise bypass them entirely. The
+            // reference profile has almost no magenta mass, so the
+            // purple-magenta band is desaturated harder — a saturated
+            // legit purple keeps 55% of its chroma.
+            let hue_deg = h * 360.0;
+            if (280.0..360.0).contains(&hue_deg) {
+                // Authoritative cap, not a factor: the gain (measured on
+                // the shaped page) would otherwise re-amplify the loudest
+                // mauve back over the visibility threshold. A saturated
+                // legit purple keeps a muted 0.28.
+                s = s.min(0.28);
+            }
+            if s <= 0.001 {
+                continue; // nothing to shape
+            }
             let gray8 = original_gray.get_pixel(x, y)[0] as f32;
             // Hint-corrected pixels are palette-accurate ground truth in
-            // midtones and brights and are skipped. In the DARK zone the
-            // hint mask also covers the model's most confident noise (the
-            // purple/red dots — measured at 1.1% of a dark page), so dark
-            // pixels get the authoritative floor below regardless of the
-            // hint mask.
+            // midtones and brights: they skip the full grade. BUT the hint
+            // pass only corrects weak model chroma (sat < 0.30) — the
+            // model's CONFIDENT mauve under the hint mask is uncorrected
+            // noise, so the suppression above must still reach the image:
+            // write the suppressed color and move on. In the DARK zone the
+            // hint mask also covers the model's most confident noise, so
+            // dark pixels get the authoritative floor below regardless of
+            // the hint mask.
             if is_hint_pixel(x, y) && gray8 >= 60.0 {
+                let (r, g, b) = hsv_to_rgb(h, s, v);
+                image.put_pixel(
+                    x,
+                    y,
+                    Rgb([
+                        r.round().clamp(0.0, 255.0) as u8,
+                        g.round().clamp(0.0, 255.0) as u8,
+                        b.round().clamp(0.0, 255.0) as u8,
+                    ]),
+                );
                 continue;
             }
             // Protected regions (speech bubbles, text, user-locked areas)
@@ -209,12 +163,6 @@ pub(crate) fn unified_grade(
             let dark = smoothstep(0.13, 0.05, gray);
             if bright > 0.97 || dark > 0.98 {
                 continue;
-            }
-
-            let pixel = *image.get_pixel(x, y);
-            let (mut h, mut s, mut v) = rgb_to_hsv(pixel[0], pixel[1], pixel[2]);
-            if s <= 0.001 {
-                continue; // nothing to shape
             }
 
             // 1. Saturation shaping, honoring the config's intent: the
@@ -269,6 +217,14 @@ pub(crate) fn unified_grade(
                 }
             }
             s = s.clamp(0.0, 1.0);
+            // Mauve cap AFTER the shaping: the pull toward the midtone
+            // target (0.35) would otherwise raise the capped band back over
+            // the visibility threshold (0.28 + pull ≈ 0.30). The top-of-loop
+            // cap stays for the hint write path.
+            let hue_deg = h * 360.0;
+            if (280.0..360.0).contains(&hue_deg) {
+                s = s.min(0.28);
+            }
 
             // 3. Hue + value: the merged shaping decisions, each gated by
             // its own legacy flag so a natural-only or muted-only config
@@ -328,7 +284,85 @@ pub(crate) fn unified_grade(
     }
     report.pixels_graded = graded;
 
-    // ---- Sub-pass 2: warmth compression --------------------------------
+    // ---- Measure the SHAPED page (sampled, <= ~120k px) -----------------
+    // Same statistics as the legacy governor (which measured after the
+    // muted grade): HSV saturation, Hasler-Suestrunk colorfulness and mean
+    // R-B over midtones. Measuring AFTER the shaping means the mauve
+    // suppression and zone pulls are reflected in the gain — a page whose
+    // saturation was mostly invented mauve is not punished, and skin keeps
+    // its life.
+    let step = (total / 120_000).max(1);
+    let mut sat_sum = 0.0f64;
+    let mut rg_sum = 0.0f64;
+    let mut rg_sq = 0.0f64;
+    let mut yb_sum = 0.0f64;
+    let mut yb_sq = 0.0f64;
+    let mut warm_sum = 0.0f64;
+    let mut warm_n = 0u64;
+    let mut n = 0u64;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let index = y as usize * width as usize + x as usize;
+        if index % step != 0 {
+            continue;
+        }
+        let r = pixel[0] as f64;
+        let g = pixel[1] as f64;
+        let b = pixel[2] as f64;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        sat_sum += if max > 0.0 { (max - min) / max } else { 0.0 };
+        let rg = r - g;
+        let yb = 0.5 * (r + g) - b;
+        rg_sum += rg;
+        rg_sq += rg * rg;
+        yb_sum += yb;
+        yb_sq += yb * yb;
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (61.0..199.0).contains(&luma) {
+            warm_sum += r - b;
+            warm_n += 1;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return report;
+    }
+    let nf = n as f64;
+    let measured_sat = (sat_sum / nf) as f32;
+    let rg_mean = rg_sum / nf;
+    let rg_var = (rg_sq / nf - rg_mean * rg_mean).max(0.0);
+    let yb_mean = yb_sum / nf;
+    let yb_var = (yb_sq / nf - yb_mean * yb_mean).max(0.0);
+    let measured_cf = ((rg_var.sqrt() + yb_var.sqrt())
+        + 0.3 * (rg_mean * rg_mean + yb_mean * yb_mean).sqrt()) as f32;
+    let measured_warmth = if warm_n > 0 {
+        (warm_sum / warm_n as f64) as f32
+    } else {
+        0.0
+    };
+    report.measured_saturation = measured_sat;
+    report.measured_colorfulness = measured_cf;
+    report.measured_warmth = measured_warmth;
+
+    // Bounded chroma gain toward the governor targets, scaled by the
+    // model's own chroma signal (identical math to the legacy governor).
+    let mut gain = 1.0f32;
+    if governor {
+        if measured_sat > 0.001 {
+            let sat_err = config.governor_target_saturation / measured_sat;
+            let cf_err = config.governor_target_colorfulness / measured_cf.max(0.01);
+            gain = (0.5 * sat_err + 0.5 * cf_err)
+                .clamp(config.governor_min_gain, config.governor_max_gain);
+            if let Some(signal) = chroma_signal {
+                gain *= (signal / 50.0).clamp(0.85, 1.15);
+            }
+        }
+        if (gain - 1.0).abs() < 0.01 {
+            gain = 1.0;
+        }
+    }
+    report.gain = gain;
+
     // ---- Sub-pass B: gain + warmth compression --------------------------
     // Measure the SHAPED page's warmth (the hue shifts above warmed it —
     // measuring before them would undercount and leave the golden cast),
@@ -392,28 +426,68 @@ pub(crate) fn unified_grade(
                 // membership is stable here, so every midtone pixel that
                 // drove the measurement actually gets compressed (an HSV
                 // gain before this check shifts warm luma upward and would
-                // push a third of the band out of range).
+                // push a third of the band out of range). Magenta-band
+                // pixels are skipped: the cooling shift (r-10.5, b+10.5)
+                // INCREASES a mauve pixel's saturation and pushes it toward
+                // pure purple — the cap in sub-pass A already muted it, and
+                // the warmth would undo that.
                 if warmth_shift.abs() >= 2.0 && (61.0..199.0).contains(&luma) {
-                    let nr = (r + warmth_shift).clamp(0.0, 255.0);
-                    let nb = (b - warmth_shift).clamp(0.0, 255.0);
-                    g = ((luma - 0.2126 * nr - 0.0722 * nb) / 0.7152).clamp(0.0, 255.0);
-                    r = nr;
-                    b = nb;
+                    let mx = r.max(g).max(b);
+                    let mn = r.min(g).min(b);
+                    let hue = if mx > mn {
+                        if mx == r {
+                            60.0 * (((g - b) / (mx - mn)) % 6.0)
+                        } else if mx == g {
+                            60.0 * ((b - r) / (mx - mn) + 2.0)
+                        } else {
+                            60.0 * ((r - g) / (mx - mn) + 4.0)
+                        }
+                    } else {
+                        0.0
+                    };
+                    let hue_deg = ((hue % 360.0) + 360.0) % 360.0;
+                    if !(280.0..360.0).contains(&hue_deg) {
+                        let nr = (r + warmth_shift).clamp(0.0, 255.0);
+                        let nb = (b - warmth_shift).clamp(0.0, 255.0);
+                        g = ((luma - 0.2126 * nr - 0.0722 * nb) / 0.7152).clamp(0.0, 255.0);
+                        r = nr;
+                        b = nb;
+                    }
                 }
                 // Gain second, in RGB around the luma (legacy math, luma
                 // preserved so paper/ink never shift), attenuated in the
                 // dark zone so near-black chroma noise is never amplified.
+                // Magenta-band pixels are skipped: the luma-preserving gain
+                // WIDENS the spread of an r>b>g pixel (max above luma, min
+                // below), re-saturating the capped mauve (measured 0.28 ->
+                // 0.51).
                 if (gain - 1.0).abs() >= 0.01 {
-                    let gray8 = original_gray.get_pixel(x, y)[0] as f32;
-                    let zone_atten = if gray8 < 60.0 { gray8 / 60.0 } else { 1.0 };
-                    let g_eff = 1.0 + (gain - 1.0) * zone_atten;
-                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                    let nr = (luma + (r - luma) * g_eff).clamp(0.0, 255.0);
-                    let nb = (luma + (b - luma) * g_eff).clamp(0.0, 255.0);
-                    let ng = ((luma - 0.2126 * nr - 0.0722 * nb) / 0.7152).clamp(0.0, 255.0);
-                    r = nr;
-                    g = ng;
-                    b = nb;
+                    let mx = r.max(g).max(b);
+                    let mn = r.min(g).min(b);
+                    let hue = if mx > mn {
+                        if mx == r {
+                            60.0 * (((g - b) / (mx - mn)) % 6.0)
+                        } else if mx == g {
+                            60.0 * ((b - r) / (mx - mn) + 2.0)
+                        } else {
+                            60.0 * ((r - g) / (mx - mn) + 4.0)
+                        }
+                    } else {
+                        0.0
+                    };
+                    let hue_deg = ((hue % 360.0) + 360.0) % 360.0;
+                    if !(280.0..360.0).contains(&hue_deg) {
+                        let gray8 = original_gray.get_pixel(x, y)[0] as f32;
+                        let zone_atten = if gray8 < 60.0 { gray8 / 60.0 } else { 1.0 };
+                        let g_eff = 1.0 + (gain - 1.0) * zone_atten;
+                        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                        let nr = (luma + (r - luma) * g_eff).clamp(0.0, 255.0);
+                        let nb = (luma + (b - luma) * g_eff).clamp(0.0, 255.0);
+                        let ng = ((luma - 0.2126 * nr - 0.0722 * nb) / 0.7152).clamp(0.0, 255.0);
+                        r = nr;
+                        g = ng;
+                        b = nb;
+                    }
                 }
                 image.put_pixel(
                     x,
@@ -606,5 +680,38 @@ mod tests {
         assert!(s > 0.20, "expected not fully gray, got s={s:.2}");
         assert!(!(0.12..=0.9).contains(&h), "hue drifted: h={h:.2}");
         assert!(v > 0.6, "value not preserved: v={v:.2}");
+    }
+}
+
+#[cfg(test)]
+mod suppression_debug {
+    use super::*;
+    use image::Luma;
+
+    #[test]
+    fn magenta_pixel_is_suppressed() {
+        let mut image = RgbImage::from_pixel(8, 8, Rgb([158, 40, 85])); // model mauve, sat 0.75
+        let gray = GrayImage::from_pixel(8, 8, Luma([87]));
+        let lines = GrayImage::from_pixel(8, 8, Luma([0]));
+        let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
+        let hints = GrayImage::from_pixel(8, 8, Luma([0]));
+        let mut cfg = PostprocessSection::default();
+        cfg.muted_target_grade = true;
+        cfg.muted_strength = 0.4;
+        cfg.smart_governor = false;
+        unified_grade(
+            &mut image,
+            &gray,
+            &lines,
+            &bubbles,
+            None,
+            Some(&hints),
+            &cfg,
+            None,
+        );
+        let p = image.get_pixel(4, 4);
+        let (_, s, _) = rgb_to_hsv(p[0], p[1], p[2]);
+        eprintln!("magenta pixel after grade: {p:?} s={s:.3}");
+        assert!(s < 0.45, "magenta must be suppressed, got s={s:.3}");
     }
 }
