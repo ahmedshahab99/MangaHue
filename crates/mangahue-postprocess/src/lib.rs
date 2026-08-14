@@ -1978,6 +1978,260 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
     speck_count
 }
 
+/// Fast exact median filter (per-channel, square window) via sliding
+/// per-column histograms. Returns a new plane; the input is untouched.
+fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let n = radius * 2 + 1;
+    let half_n: u32 = ((n * n) / 2 + 1) as u32; // median index (lower-middle)
+    let mut out = vec![0u8; w * h];
+    // Per-column histograms of the vertical window.
+    let mut col_hists: Vec<[u32; 256]> = vec![[0u32; 256]; w];
+    let mut combined: [u32; 256] = [0; 256];
+
+    // Initial vertical window: rows 0..=radius (clamped).
+    let initial_y = radius.min(h - 1);
+    for yy in 0..=initial_y {
+        let row = &plane[yy * w..(yy + 1) * w];
+        for (c, hist) in col_hists.iter_mut().enumerate() {
+            hist[row[c] as usize] += 1;
+        }
+    }
+
+    for y in 0..h {
+        // Slide the vertical window: drop row y-r-1, add row y+r.
+        if y > 0 {
+            let drop = y as i64 - radius as i64 - 1;
+            if drop >= 0 {
+                let row = &plane[drop as usize * w..(drop as usize + 1) * w];
+                for (c, hist) in col_hists.iter_mut().enumerate() {
+                    hist[row[c] as usize] -= 1;
+                }
+            }
+        }
+        let add = y + radius;
+        if add < h {
+            let row = &plane[add * w..(add + 1) * w];
+            for (c, hist) in col_hists.iter_mut().enumerate() {
+                hist[row[c] as usize] += 1;
+            }
+        }
+
+        // Initial horizontal window: columns 0..=radius (clamped).
+        let initial_x = radius.min(w - 1);
+        for c in 0..=initial_x {
+            let hist = &col_hists[c];
+            for (v, count) in hist.iter().enumerate() {
+                combined[v] += count;
+            }
+        }
+        // Horizontal slide of the combined histogram.
+        let row_out = &mut out[y * w..(y + 1) * w];
+        for x in 0..w {
+            if x > 0 {
+                let drop = x as i64 - radius as i64 - 1;
+                if drop >= 0 {
+                    let hist = &col_hists[drop as usize];
+                    for (v, count) in hist.iter().enumerate() {
+                        combined[v] -= count;
+                    }
+                }
+            }
+            let add = x + radius;
+            if add < w {
+                let hist = &col_hists[add];
+                for (v, count) in hist.iter().enumerate() {
+                    combined[v] += count;
+                }
+            }
+            // Median = first index with cumulative >= half_n.
+            let mut cum = 0u32;
+            for (v, &count) in combined.iter().enumerate() {
+                cum += count;
+                if cum >= half_n {
+                    row_out[x] = v as u8;
+                    break;
+                }
+            }
+        }
+        // Reset combined for the next row (rebuilt at x=0).
+        combined = [0; 256];
+    }
+    out
+}
+
+/// Binary mask morphological ops (0/255 masks).
+fn mask_erode(mask: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let mut out = vec![255u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(h - 1);
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(w - 1);
+            let mut ok = true;
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    if mask[yy * w + xx] == 0 {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if !ok {
+                out[y * w + x] = 0;
+            }
+        }
+    }
+    out
+}
+
+fn mask_dilate(mask: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let y0 = y.saturating_sub(radius);
+            let y1 = (y + radius).min(h - 1);
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(w - 1);
+            let mut any = false;
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    if mask[yy * w + xx] != 0 {
+                        any = true;
+                        break;
+                    }
+                }
+                if any {
+                    break;
+                }
+            }
+            if any {
+                out[y * w + x] = 255;
+            }
+        }
+    }
+    out
+}
+
+/// Descreen printed halftone texture inside red/orange zones of colored
+/// scans (the "red dots / like squares" on already-colored pages): the
+/// print dot field lives in both luma and chroma, so inside the dilated
+/// strong-warm mask the luma and opponent-chroma planes are replaced with
+/// their local median (13x13, matched to the measured ~19px dot spacing),
+/// then recombined. Black line art is protected by an ink mask and keeps
+/// its original pixels; everything outside the warm zones is untouched, so
+/// neutral areas, paper, and non-warm colors ship exactly as scanned.
+/// Returns the number of changed pixels.
+pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
+    let (w, h) = image.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    if w < 20 || h < 20 {
+        return 0;
+    }
+    const MEDIAN_RADIUS: usize = 6; // 13x13 window
+    let idx = |x: usize, y: usize| y * w + x;
+
+    // Planes: luma and opponent chroma (cr = r - luma, cb = b - luma).
+    let mut luma = vec![0f32; w * h];
+    let mut cr = vec![0f32; w * h];
+    let mut cb = vec![0f32; w * h];
+    let mut warm = vec![false; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = idx(x, y);
+            let p = image.get_pixel(x as u32, y as u32);
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            luma[i] = l;
+            cr[i] = r - l;
+            cb[i] = b - l;
+            let mx = r.max(g).max(b);
+            let mn = r.min(g).min(b);
+            if mx > 0.0 {
+                let sat = (mx - mn) / mx;
+                if sat > 0.28 {
+                    let delta = (mx - mn).max(1e-9);
+                    let hue = if r == mx {
+                        60.0 * (((g - b) / delta) % 6.0)
+                    } else if g == mx {
+                        60.0 * ((b - r) / delta + 2.0)
+                    } else {
+                        60.0 * ((r - g) / delta + 4.0)
+                    };
+                    let hue = hue.rem_euclid(360.0);
+                    if (hue < 60.0 || hue > 340.0) && l > 40.0 {
+                        warm[i] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Red-zone mask: dilate the warm mask so the halftone transition band
+    // (where dots fade into the surroundings) is fully covered.
+    let warm_u8: Vec<u8> = warm.iter().map(|&v| if v { 255u8 } else { 0u8 }).collect();
+    let red_zone = mask_dilate(&warm_u8, w, h, 4);
+
+    // Ink line mask: dark pixels or locally-dark outliers, noise-eroded
+    // then dilated for a 3px protection zone.
+    let luma_u8: Vec<u8> = luma
+        .iter()
+        .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let bg = median_filter_plane(&luma_u8, w, h, 2); // ~local background (5x5)
+    let mut line = vec![0u8; w * h];
+    for i in 0..w * h {
+        let l = luma[i];
+        let is_line = l < 60.0 || (l < bg[i] as f32 - 20.0 && l < 130.0);
+        line[i] = if is_line { 255u8 } else { 0u8 };
+    }
+    line = mask_erode(&line, w, h, 1);
+    line = mask_dilate(&line, w, h, 3);
+
+    // Median planes (13x13), only meaningful inside the zone.
+    let cr_u8: Vec<u8> = cr
+        .iter()
+        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let cb_u8: Vec<u8> = cb
+        .iter()
+        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let luma_med = median_filter_plane(&luma_u8, w, h, MEDIAN_RADIUS);
+    let cr_med = median_filter_plane(&cr_u8, w, h, MEDIAN_RADIUS);
+    let cb_med = median_filter_plane(&cb_u8, w, h, MEDIAN_RADIUS);
+
+    // Blend inside the zone, keeping line art and everything outside.
+    let mut changed = 0u64;
+    let mut work = image.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let i = idx(x, y);
+            if red_zone[i] == 0 || line[i] != 0 {
+                continue;
+            }
+            let l_s = luma_med[i] as f32;
+            let cr_s = cr_med[i] as f32 - 128.0;
+            let cb_s = cb_med[i] as f32 - 128.0;
+            let nr = (l_s + cr_s).round().clamp(0.0, 255.0) as u8;
+            let nb = (l_s + cb_s).round().clamp(0.0, 255.0) as u8;
+            let ng = ((l_s - 0.2126 * nr as f32 - 0.0722 * nb as f32) / 0.7152)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let p = work.get_pixel_mut(x as u32, y as u32);
+            if p[0] != nr || p[1] != ng || p[2] != nb {
+                changed += 1;
+            }
+            *p = Rgb([nr, ng, nb]);
+        }
+    }
+    *image = work;
+    changed
+}
+
 /// Adaptive line restoration: stronger in dark ink areas, gentler near edges,
 /// preserving colored details in thin-line regions.
 pub fn restore_lines_adaptive(image: &mut RgbImage, line_mask: &GrayImage, strength: f32) {

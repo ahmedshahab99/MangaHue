@@ -277,18 +277,27 @@ impl MangaHueEngine {
                 // user; clean them before delivery. Black line art and large
                 // colored regions are untouched.
                 let mut halftone_dots_removed = 0u64;
+                let mut descreened_pixels = 0u64;
                 if config.postprocess.descreen_halftone {
                     halftone_dots_removed = mangahue_postprocess::remove_halftone_dots(&mut output);
+                    // The colored scan's PRINT texture (dense halftone in
+                    // the red/orange zones, the "red dots / like squares")
+                    // survives the isolated-dot sweep because it is one
+                    // interconnected field: median-descreen the warm zones
+                    // (luma + chroma), keeping ink line art untouched.
+                    descreened_pixels =
+                        mangahue_postprocess::descreen_halftone_regions(&mut output);
                 }
                 report.add_stage_report(
                     StageReport::new("halftone_descreen")
                         .metric("dot_pixels_removed", halftone_dots_removed as f64)
-                        .note(if halftone_dots_removed > 0 {
+                        .metric("descreened_pixels", descreened_pixels as f64)
+                        .note(if halftone_dots_removed > 0 || descreened_pixels > 0 {
                             format!(
-                                "removed {halftone_dots_removed} halftone dot pixels from colored page"
+                                "removed {halftone_dots_removed} halftone dots, descreened {descreened_pixels} warm-zone pixels on colored page"
                             )
                         } else {
-                            "no halftone dot pixels found".to_string()
+                            "no halftone artifacts found".to_string()
                         }),
                 );
                 save_rgb(&request.output_path, &output)?;
