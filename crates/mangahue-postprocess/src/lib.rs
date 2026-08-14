@@ -2116,15 +2116,16 @@ fn mask_dilate(mask: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
     out
 }
 
-/// Descreen printed halftone texture inside red/orange zones of colored
-/// scans (the "red dots / like squares" on already-colored pages): the
-/// print dot field lives in both luma and chroma, so inside the dilated
-/// strong-warm mask the luma and opponent-chroma planes are replaced with
-/// their local median (13x13, matched to the measured ~19px dot spacing),
-/// then recombined. Black line art is protected by an ink mask and keeps
-/// its original pixels; everything outside the warm zones is untouched, so
-/// neutral areas, paper, and non-warm colors ship exactly as scanned.
-/// Returns the number of changed pixels.
+/// Descreen printed halftone texture from colored scans (the "red dots /
+/// like squares" on already-colored pages): the print dot field lives in
+/// the LUMA everywhere and in the chroma inside warm zones, so (1) the
+/// full-image luma is replaced with its 9x9 median except on pure ink
+/// (luma < 45, eroded + dilated), which is preserved EXACTLY, and (2)
+/// inside the dilated strong-warm mask the opponent-chroma planes are
+/// replaced with their 13x13 median (matched to the measured ~19px dot
+/// spacing) except on the line mask. Everything outside the warm zones
+/// keeps its chroma, so neutral areas, paper, and non-warm colors ship
+/// as scanned. Returns the number of changed pixels.
 pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
     let (w, h) = image.dimensions();
     let (w, h) = (w as usize, h as usize);
@@ -2200,22 +2201,52 @@ pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
         .iter()
         .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
         .collect();
-    let luma_med = median_filter_plane(&luma_u8, w, h, MEDIAN_RADIUS);
+    // Median planes: luma at 9x9 (full-image halftone brightness pattern),
+    // chroma at 13x13 (warm-zone color speckle).
+    let cr_u8: Vec<u8> = cr
+        .iter()
+        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let cb_u8: Vec<u8> = cb
+        .iter()
+        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let luma_med = median_filter_plane(&luma_u8, w, h, 4);
     let cr_med = median_filter_plane(&cr_u8, w, h, MEDIAN_RADIUS);
     let cb_med = median_filter_plane(&cb_u8, w, h, MEDIAN_RADIUS);
 
-    // Blend inside the zone, keeping line art and everything outside.
+    // Pure-ink mask: luma < 45, noise-eroded then dilated 3px. Ink is
+    // preserved EXACTLY — the halftone dots live in the brighter tones.
+    let mut ink = vec![0u8; w * h];
+    for i in 0..w * h {
+        ink[i] = if luma[i] < 45.0 { 255u8 } else { 0u8 };
+    }
+    ink = mask_erode(&ink, w, h, 1);
+    ink = mask_dilate(&ink, w, h, 3);
+
+    // Blend: luma descreened everywhere except pure ink; chroma descreened
+    // inside warm zones except the line mask.
     let mut changed = 0u64;
     let mut work = image.clone();
     for y in 0..h {
         for x in 0..w {
             let i = idx(x, y);
-            if red_zone[i] == 0 || line[i] != 0 {
+            let keep_ink = ink[i] != 0;
+            let chroma_ok = red_zone[i] == 0 || line[i] != 0;
+            if keep_ink && chroma_ok {
                 continue;
             }
-            let l_s = luma_med[i] as f32;
-            let cr_s = cr_med[i] as f32 - 128.0;
-            let cb_s = cb_med[i] as f32 - 128.0;
+            let l_s = if keep_ink { luma[i] } else { luma_med[i] as f32 };
+            let cr_s = if chroma_ok {
+                cr[i]
+            } else {
+                cr_med[i] as f32 - 128.0
+            };
+            let cb_s = if chroma_ok {
+                cb[i]
+            } else {
+                cb_med[i] as f32 - 128.0
+            };
             let nr = (l_s + cr_s).round().clamp(0.0, 255.0) as u8;
             let nb = (l_s + cb_s).round().clamp(0.0, 255.0) as u8;
             let ng = ((l_s - 0.2126 * nr as f32 - 0.0722 * nb as f32) / 0.7152)
