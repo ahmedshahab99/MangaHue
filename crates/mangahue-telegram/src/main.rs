@@ -1738,6 +1738,10 @@ fn handle_photo(
             );
             let delivery_path =
                 prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+            let kept = retain_delivered_copy(&delivery_path, &args.work_dir, 1);
+            if kept.is_some() {
+                tracing::info!(path = %kept.as_ref().unwrap().display(), "delivered copy kept");
+            }
             // Cosmetic typing indicator: never abort the photo job on this.
             let _ = send_chat_action(client, token, chat_id, "upload_document");
             if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption) {
@@ -2818,6 +2822,15 @@ fn handle_link(
                 }
                 let delivery_path =
                     prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+                // Keep a copy of the EXACT file the user receives under
+                // <work_dir>/delivered/YYYY-MM-DD/ so quality complaints can
+                // be traced to the actual delivered bytes (the scratch space
+                // is wiped after the job).
+                let kept =
+                    retain_delivered_copy(&delivery_path, &args.work_dir, position as u32 + 1);
+                if kept.is_some() {
+                    tracing::info!(page = position + 1, path = %kept.as_ref().unwrap().display(), "delivered copy kept");
+                }
                 ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
                 // Cosmetic typing indicator: never abort the chapter on this.
                 let _ = send_chat_action(client, token, chat_id, "upload_document");
@@ -3211,6 +3224,29 @@ fn ensure_scratch_budget(root: &Path, limit: u64) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Copy the exact delivery file (PNG or JPEG) into
+/// `<work_dir>/delivered/YYYY-MM-DD/` before it is sent, so quality
+/// complaints can be traced to the actual bytes the user received.
+/// Returns the kept path (None when the copy failed — never fatal).
+fn retain_delivered_copy(delivery: &Path, work_dir: &Path, page: u32) -> Option<PathBuf> {
+    let day = Utc::now().format("%Y-%m-%d");
+    let dir = work_dir.join("delivered").join(day.to_string());
+    let Ok(_) = std::fs::create_dir_all(&dir) else {
+        return None;
+    };
+    let stem = delivery
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("page");
+    let ext = delivery
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("bin");
+    let target = dir.join(format!("{stem}_p{page:03}.{ext}"));
+    std::fs::copy(delivery, &target).ok()?;
+    Some(target)
 }
 
 fn prepare_delivery(source: &Path, format: DeliveryFormat, jpeg_quality: u8) -> Result<PathBuf> {
