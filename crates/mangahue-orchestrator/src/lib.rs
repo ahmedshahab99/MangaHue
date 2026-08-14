@@ -1206,17 +1206,26 @@ impl MangaHueEngine {
         // so sweep small strong-warm components once more — luma (line
         // art, shading, screentones) is never touched.
         if config.postprocess.descreen_halftone {
-            let halftone_dots_removed =
-                mangahue_postprocess::remove_halftone_dots(&mut final_image);
-            if halftone_dots_removed > 0 {
-                report.add_stage_report(
-                    StageReport::new("halftone_descreen")
-                        .metric("dot_pixels_removed", halftone_dots_removed as f64)
-                        .note(format!(
-                            "removed {halftone_dots_removed} halftone dot pixels at final resolution"
-                        )),
-                );
-            }
+            let halftone_dots_removed = mangahue_postprocess::remove_halftone_dots(&mut final_image);
+            // The source scan's halftone/JPEG texture survives in the
+            // output LUMA (the reconstruction preserves the original
+            // grayscale), where the model's color on top reads as "dots"
+            // on the page. Descreen the luma (pure ink preserved exactly)
+            // plus the warm-zone chroma, same as the pass-through path.
+            let descreened_pixels =
+                mangahue_postprocess::descreen_halftone_regions(&mut final_image);
+            report.add_stage_report(
+                StageReport::new("halftone_descreen")
+                    .metric("dot_pixels_removed", halftone_dots_removed as f64)
+                    .metric("descreened_pixels", descreened_pixels as f64)
+                    .note(if halftone_dots_removed > 0 || descreened_pixels > 0 {
+                        format!(
+                            "removed {halftone_dots_removed} halftone dots, descreened {descreened_pixels} pixels at final resolution"
+                        )
+                    } else {
+                        "no halftone artifacts found".to_string()
+                    }),
+            );
         }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 
