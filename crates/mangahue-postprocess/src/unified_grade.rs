@@ -178,7 +178,14 @@ pub(crate) fn unified_grade(
     let mut graded = 0u64;
     for y in 0..height {
         for x in 0..width {
-            if is_hint_pixel(x, y) {
+            let gray8 = original_gray.get_pixel(x, y)[0] as f32;
+            // Hint-corrected pixels are palette-accurate ground truth in
+            // midtones and brights and are skipped. In the DARK zone the
+            // hint mask also covers the model's most confident noise (the
+            // purple/red dots — measured at 1.1% of a dark page), so dark
+            // pixels get the authoritative floor below regardless of the
+            // hint mask.
+            if is_hint_pixel(x, y) && gray8 >= 60.0 {
                 continue;
             }
             // Protected regions (speech bubbles, text, user-locked areas)
@@ -195,7 +202,6 @@ pub(crate) fn unified_grade(
             if ink > 0.72 || bubble > 0.38 {
                 continue;
             }
-            let gray8 = original_gray.get_pixel(x, y)[0] as f32;
             let gray = gray8 / 255.0;
             // Soft gates (same as the natural grade): only true paper
             // (>0.997) and true ink (<0.05) are fully skipped.
@@ -214,17 +220,26 @@ pub(crate) fn unified_grade(
             // 1. Saturation shaping, honoring the config's intent: the
             // muted profile (per-luma zone targets + vivid knee) when the
             // muted grade is on; the natural curve (midtone boost, gentle
-            // oversaturation taper) when only the natural grade is on. The
-            // dark zone (<60) scales its target toward neutral with
-            // darkness — near-ink pixels keep only a whisper of chroma,
+            // oversaturation taper) when only the natural grade is on.
+            // The dark zone (<60) is the anti-dot floor and is
+            // AUTHORITATIVE in both profiles: near-ink pixels keep only a
+            // whisper of chroma (the target scales to zero with darkness),
             // which replaces the removed tone_chroma_cap and kills the
             // red-dot amplification at its source.
             if reshape {
-                if config.muted_target_grade {
-                    let (target, band_strength) = if gray8 < 60.0 {
-                        let t = (gray8 / 60.0).powf(1.4);
-                        (config.muted_dark_sat * (0.25 + 0.75 * t), 0.92)
-                    } else if gray8 < 120.0 {
+                let dark_floor = if gray8 < 60.0 {
+                    let t = (gray8 / 60.0).powf(1.4);
+                    Some(config.muted_dark_sat * (0.25 + 0.75 * t))
+                } else {
+                    None
+                };
+                if let Some(floor) = dark_floor {
+                    // A hard cap, not a pull: at muted_strength 0.4 a pull
+                    // leaves 0.5+ saturation noise visible (measured). The
+                    // hue survives at a muted tint.
+                    s = s.min(floor);
+                } else if config.muted_target_grade {
+                    let (target, band_strength) = if gray8 < 120.0 {
                         (config.muted_dark_sat, 0.92)
                     } else if gray8 < 180.0 {
                         (config.muted_mid_sat, 0.8)
@@ -235,11 +250,7 @@ pub(crate) fn unified_grade(
                     };
                     // Vivid knee: genuinely strong colors keep a reduced
                     // share; everything else is pulled toward its target.
-                    // In the dark zone (<60) the knee does NOT apply — a
-                    // vivid pixel there is exactly the model's invented
-                    // chroma noise (real dark features rarely exceed 0.55
-                    // saturation), so the anti-dot floor always wins.
-                    if s > 0.55 && gray8 >= 60.0 {
+                    if s > 0.55 {
                         s *= 0.5 + 0.5 * vivid_preserve;
                     } else {
                         s = s + (target - s) * strength * band_strength;
@@ -540,6 +551,31 @@ mod tests {
             "dark pixel brightened: {after:?}"
         );
         assert_ne!(after, before, "grade was inert");
+    }
+
+    #[test]
+    fn dark_zone_hint_pixels_are_capped_not_exempt() {
+        // The hint mask used to exempt dark pixels from the grade, but it
+        // also covers the model's most confident purple/red noise (the
+        // dots). A dark hint pixel must get the authoritative floor.
+        let mut image = RgbImage::from_pixel(8, 8, Rgb([60, 25, 40])); // purple-ish, sat ~0.6
+        let gray = GrayImage::from_pixel(8, 8, Luma([35]));
+        let lines = GrayImage::from_pixel(8, 8, Luma([0]));
+        let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
+        let hints = GrayImage::from_pixel(8, 8, Luma([200]));
+        unified_grade(
+            &mut image,
+            &gray,
+            &lines,
+            &bubbles,
+            None,
+            Some(&hints),
+            &config(),
+            None,
+        );
+        let p = image.get_pixel(4, 4);
+        let (_, s, _) = rgb_to_hsv(p[0], p[1], p[2]);
+        assert!(s < 0.28, "dark hint pixel must be floored, got s={s:.2}");
     }
 
     #[test]
