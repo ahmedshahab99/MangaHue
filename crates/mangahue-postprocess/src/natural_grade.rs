@@ -109,6 +109,7 @@ pub(crate) const PEACH_HUE: f32 = 0.055;
 /// what the model judged this page to be — a muted page stays muted, a
 /// colorful page keeps its life. Hue and luma are preserved; ink and paper
 /// are untouched.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn smart_color_governor(
     image: &mut RgbImage,
     line_mask: &GrayImage,
@@ -147,7 +148,7 @@ pub(crate) fn smart_color_governor(
     let mut n = 0u64;
     for (x, y, pixel) in image.enumerate_pixels() {
         let index = y as usize * width as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let r = pixel[0] as f64;

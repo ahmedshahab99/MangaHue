@@ -908,7 +908,7 @@ impl MangaHueEngine {
             let mut n = 0u64;
             for (x, y, pixel) in merged.enumerate_pixels() {
                 let index = y as usize * mw as usize + x as usize;
-                if index % step != 0 {
+                if !index.is_multiple_of(step) {
                     continue;
                 }
                 let r = pixel[0] as f32;
@@ -1534,7 +1534,7 @@ fn select_backend_for_model(
             model_path,
             &config.inference.model_metadata_path,
         )?;
-        return Ok(Box::new(backend));
+        Ok(Box::new(backend))
     }
     #[cfg(not(feature = "native-onnx"))]
     {
@@ -1668,8 +1668,17 @@ fn director_verdict(
     preprocess: &mangahue_preprocess::PreprocessReport,
     config: &EngineConfig,
 ) -> String {
+    if preprocess.text_ink_pixels >= 64 && preprocess.bubble_regions == 0 {
+        return "needs_bubble_detection_attention".to_string();
+    }
+    if preprocess.protected_coverage > 0.55 {
+        return "needs_protected_mask_precision".to_string();
+    }
     if quality.line_preservation_score < config.eval.line_preservation_threshold {
         return "needs_line_preservation_attention".to_string();
+    }
+    if preprocess.bubble_regions > 0 && quality.bubble_cleanliness_score < 0.95 {
+        return "needs_bubble_cleanup".to_string();
     }
     if quality.protected_region_violation_score < config.eval.protected_region_violation_threshold {
         return "needs_protected_region_cleanup".to_string();
@@ -1751,6 +1760,7 @@ fn resolve_parallel_jobs(requested: usize) -> usize {
 /// Style2Paints ONNX models are identified by file name; the native-onnx
 /// build also verifies the file exists (see mangahue-inference). Kept here
 /// so non-native builds can still produce a clear error for them.
+#[allow(dead_code)]
 fn is_style2paints_model_name(path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("onnx")
         && path
@@ -1774,7 +1784,7 @@ fn measure_page_colorfulness(image: &image::DynamicImage) -> (f32, f32) {
     let mut colored = 0u64;
     for (x, y, pixel) in rgb.enumerate_pixels() {
         let index = y as usize * w as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let r = pixel[0] as f32 / 255.0;

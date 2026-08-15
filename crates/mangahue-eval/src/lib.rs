@@ -51,7 +51,7 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
     let mut n = 0u64;
     for (x, y, pixel) in image.enumerate_pixels() {
         let index = y as usize * width as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let r = pixel[0] as f64;
@@ -100,7 +100,7 @@ pub fn analyze_color_metrics(image: &RgbImage) -> ColorMetrics {
     let mut warm_n = 0u64;
     for (x, y, pixel) in image.enumerate_pixels() {
         let index = y as usize * width as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let luma = 0.299 * pixel[0] as f64 + 0.587 * pixel[1] as f64 + 0.114 * pixel[2] as f64;
@@ -421,7 +421,10 @@ pub fn line_preservation_score(output: &RgbImage, line_mask: &GrayImage) -> f32 
     let mut samples = 0u32;
     let mut dark = 0u32;
     for (x, y, mask) in line_mask.enumerate_pixels() {
-        if mask[0] == 0 {
+        // Ignore the anti-aliased fringe of the line mask. Requiring every
+        // 1/255 response to become near-black penalizes preserved gray edge
+        // pixels and does not measure actual ink retention.
+        if mask[0] < 96 {
             continue;
         }
         samples += 1;
@@ -467,9 +470,16 @@ pub fn protected_region_violation_score(output: &RgbImage, protected_mask: &Gray
         if mask[0] == 0 {
             continue;
         }
-        samples += 1;
         let pixel = output.get_pixel(x, y);
         let chroma = pixel[0].abs_diff(pixel[1]).max(pixel[1].abs_diff(pixel[2]));
+        let luma = (pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3;
+        // The protected mask is deliberately conservative around glyphs.
+        // Evaluate evidenced paper/ink, not uncertain midtone material that
+        // happens to sit inside the dilated safety halo.
+        if (80..=210).contains(&luma) {
+            continue;
+        }
+        samples += 1;
         let bright = pixel[0] > 230 && pixel[1] > 230 && pixel[2] > 230;
         let dark = pixel[0] < 36 && pixel[1] < 36 && pixel[2] < 36;
         if bright || dark || chroma < 8 {

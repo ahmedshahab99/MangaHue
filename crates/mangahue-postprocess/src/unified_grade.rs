@@ -48,6 +48,7 @@ pub(crate) struct UnifiedGradeReport {
 /// One measured, bounded adaptation pass. See the module docs for the
 /// design; every sub-behavior stays gated by its own legacy flag so
 /// `unified_grade: true` never silently changes a config's intent.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unified_grade(
     image: &mut RgbImage,
     original_gray: &GrayImage,
@@ -302,7 +303,7 @@ pub(crate) fn unified_grade(
     let mut n = 0u64;
     for (x, y, pixel) in image.enumerate_pixels() {
         let index = y as usize * width as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let r = pixel[0] as f64;
@@ -377,7 +378,7 @@ pub(crate) fn unified_grade(
         let step = (total / 120_000).max(1);
         for (x, y, pixel) in image.enumerate_pixels() {
             let index = y as usize * width as usize + x as usize;
-            if index % step != 0 {
+            if !index.is_multiple_of(step) {
                 continue;
             }
             let r = pixel[0] as f64;
@@ -531,7 +532,7 @@ mod tests {
 
     #[test]
     fn unified_grade_preserves_ink_bubble_and_hint_pixels() {
-        let mut image = RgbImage::from_pixel(16, 16, Rgb([220, 120, 40]));
+        let image = RgbImage::from_pixel(16, 16, Rgb([220, 120, 40]));
         let gray = GrayImage::from_pixel(16, 16, Luma([150]));
         let lines = GrayImage::from_pixel(16, 16, Luma([0]));
         let bubbles = GrayImage::from_pixel(16, 16, Luma([0]));
@@ -695,10 +696,12 @@ mod suppression_debug {
         let lines = GrayImage::from_pixel(8, 8, Luma([0]));
         let bubbles = GrayImage::from_pixel(8, 8, Luma([0]));
         let hints = GrayImage::from_pixel(8, 8, Luma([0]));
-        let mut cfg = PostprocessSection::default();
-        cfg.muted_target_grade = true;
-        cfg.muted_strength = 0.4;
-        cfg.smart_governor = false;
+        let cfg = PostprocessSection {
+            muted_target_grade: true,
+            muted_strength: 0.4,
+            smart_governor: false,
+            ..PostprocessSection::default()
+        };
         unified_grade(
             &mut image,
             &gray,

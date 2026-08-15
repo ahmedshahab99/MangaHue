@@ -2046,7 +2046,8 @@ struct OnnxIoSpec {
     #[serde(default)]
     shape: Vec<i64>,
     #[serde(default)]
-    color_space: Option<String>,
+    #[serde(rename = "color_space")]
+    _color_space: Option<String>,
     #[serde(default)]
     range: Option<String>,
 }
@@ -2119,13 +2120,13 @@ impl Style2PaintsV3OnnxBackend {
         let input = contract.input.unwrap_or(OnnxIoSpec {
             name: "input".to_string(),
             shape: vec![1, 3, 512, 512],
-            color_space: None,
+            _color_space: None,
             range: None,
         });
         let output = contract.output.unwrap_or(OnnxIoSpec {
             name: "output".to_string(),
             shape: vec![1, 3, 512, 512],
-            color_space: None,
+            _color_space: None,
             range: None,
         });
         let input_size = input.shape.get(2).copied().unwrap_or(512).max(1) as u32;
@@ -2322,14 +2323,14 @@ fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
     let y = inv(fy);
     let z = inv(fz) * 1.08883;
     let r_full = x * 3.2404542 + y * -1.5371385 + z * -0.4985314;
-    let g_full = x * -0.9692660 + y * 1.8760108 + z * 0.0415560;
+    let g_full = x * -0.969_266 + y * 1.8760108 + z * 0.0415560;
     let b_full = x * 0.0556434 + y * -0.2040259 + z * 1.0572252;
     // The neutral (a=b=0) linear RGB at this L*: every channel equals the
     // same gray, computed once with the same matrix.
     let fy0 = fy;
     let gray = inv(fy0);
     let r0 = gray * 3.2404542 + gray * -1.5371385 + gray * -0.4985314;
-    let g0 = gray * -0.9692660 + gray * 1.8760108 + gray * 0.0415560;
+    let g0 = gray * -0.969_266 + gray * 1.8760108 + gray * 0.0415560;
     let b0 = gray * 0.0556434 + gray * -0.2040259 + gray * 1.0572252;
     let mut t = 1.0f32;
     for (c0, c1) in [(r0, r_full), (g0, g_full), (b0, b_full)] {
@@ -2359,8 +2360,8 @@ fn calibrate_ab_scale(
     let mut pattern = vec![0.0f32; 3 * n];
     let half = (DDCOLOR_MODEL_SIZE / 2) as usize;
     // channel 0 (R): top half red; channel 1 (G): bottom half green
-    for i in 0..(half * DDCOLOR_MODEL_SIZE as usize) {
-        pattern[i] = 1.0;
+    for value in pattern.iter_mut().take(half * DDCOLOR_MODEL_SIZE as usize) {
+        *value = 1.0;
     }
     for i in (half * DDCOLOR_MODEL_SIZE as usize)..n {
         pattern[n + i] = 1.0;

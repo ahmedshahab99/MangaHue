@@ -241,7 +241,7 @@ fn normalize_nhentai_url(src: &str) -> String {
 
     // Collapse thumbnail marker + repeated extensions in the filename.
     let cleaned = cleanup_nhentai_filename(parsed.path());
-    let _ = parsed.set_path(&cleaned);
+    parsed.set_path(&cleaned);
     parsed.to_string()
 }
 
@@ -1357,11 +1357,7 @@ mod tests {
             .expect("chapter HTML should fetch");
         assert!(html.contains("reading-content"));
         let urls = extract_madara(&client, &url, &html, &url, 500).unwrap();
-        assert!(
-            urls.len() >= 10,
-            "expected many pages, got {}",
-            urls.len()
-        );
+        assert!(urls.len() >= 10, "expected many pages, got {}", urls.len());
         assert!(
             urls[0].contains("WP-manga/data"),
             "unexpected first URL: {}",

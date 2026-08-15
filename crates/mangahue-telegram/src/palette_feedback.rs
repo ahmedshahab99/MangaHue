@@ -36,7 +36,7 @@ pub fn extract_accent_palette(image: &RgbImage) -> Vec<ColorRgb> {
     }
 
     let mut sums = vec![[0.0f64; 4]; BINS]; // r, g, b, weight
-    let mut counts = vec![0u64; BINS];
+    let mut counts = [0u64; BINS];
     let mut total = 0u64;
 
     for pixel in small.pixels() {

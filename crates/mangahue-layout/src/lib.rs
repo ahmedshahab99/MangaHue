@@ -157,43 +157,141 @@ pub fn detect_panels_basic(lineart: &GrayImage, direction: ReadingDirection) -> 
         return vec![single_panel(width, height)];
     }
 
-    let white_rows = white_runs_rows(lineart);
-    let white_cols = white_runs_cols(lineart);
-    let row_cuts = significant_runs(&white_rows, height / 80 + 3);
-    let col_cuts = significant_runs(&white_cols, width / 80 + 3);
-
-    if row_cuts.is_empty() && col_cuts.is_empty() {
+    // Recursively split on gutters. A global row/column cross-product creates
+    // phantom panels whenever different rows use different column layouts.
+    let page = BoundingBox::new(0, 0, width, height);
+    let mut boxes = Vec::new();
+    split_on_gutters(lineart, page, 0, &mut boxes);
+    if boxes.len() <= 1 {
         return vec![single_panel(width, height)];
     }
-
-    let y_ranges = ranges_from_cuts(height, &row_cuts);
-    let x_ranges = ranges_from_cuts(width, &col_cuts);
-    let x_len = x_ranges.len();
-    let x_ranges_rev: Vec<(u32, u32)> = x_ranges.iter().rev().cloned().collect();
-    let x_iter: &[(u32, u32)] = match direction {
-        ReadingDirection::LeftToRight => &x_ranges,
-        ReadingDirection::RightToLeft => &x_ranges_rev,
-    };
-    let mut panels = Vec::new();
-    for (row, (y0, y1)) in y_ranges.iter().enumerate() {
-        for (col, (x0, x1)) in x_iter.iter().enumerate() {
-            let bbox = BoundingBox::new(*x0, *y0, x1 - x0, y1 - y0);
-            if bbox.area() < (width as u64 * height as u64) / 200 {
-                continue;
+    boxes.sort_by(|a, b| {
+        let row_tolerance = height / 40 + 4;
+        if a.y.abs_diff(b.y) > row_tolerance {
+            a.y.cmp(&b.y)
+        } else {
+            match direction {
+                ReadingDirection::LeftToRight => a.x.cmp(&b.x),
+                ReadingDirection::RightToLeft => b.x.cmp(&a.x),
             }
-            panels.push(MangaPanel {
-                id: format!("panel_{:04}", panels.len() + 1),
-                bbox,
-                reading_order: row * x_len + col,
-                confidence: 0.45,
-            });
+        }
+    });
+    boxes
+        .into_iter()
+        .enumerate()
+        .map(|(index, bbox)| MangaPanel {
+            id: format!("panel_{:04}", index + 1),
+            bbox,
+            reading_order: index,
+            confidence: 0.72,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum GutterAxis {
+    Horizontal,
+    Vertical,
+}
+
+fn split_on_gutters(
+    image: &GrayImage,
+    bbox: BoundingBox,
+    depth: usize,
+    output: &mut Vec<BoundingBox>,
+) {
+    let page_area = image.width() as u64 * image.height() as u64;
+    if depth >= 8 || bbox.area() < page_area / 80 || bbox.width < 40 || bbox.height < 40 {
+        output.push(bbox);
+        return;
+    }
+    let horizontal = best_gutter(image, bbox, GutterAxis::Horizontal);
+    let vertical = best_gutter(image, bbox, GutterAxis::Vertical);
+    let selected = match (horizontal, vertical) {
+        (Some(h), Some(v)) => {
+            let h_score = (h.1 - h.0) as f32 / bbox.height as f32;
+            let v_score = (v.1 - v.0) as f32 / bbox.width as f32;
+            if h_score >= v_score {
+                Some((GutterAxis::Horizontal, h))
+            } else {
+                Some((GutterAxis::Vertical, v))
+            }
+        }
+        (Some(h), None) => Some((GutterAxis::Horizontal, h)),
+        (None, Some(v)) => Some((GutterAxis::Vertical, v)),
+        (None, None) => None,
+    };
+    let Some((axis, (start, end))) = selected else {
+        output.push(bbox);
+        return;
+    };
+    match axis {
+        GutterAxis::Horizontal => {
+            split_on_gutters(
+                image,
+                BoundingBox::new(bbox.x, bbox.y, bbox.width, start - bbox.y),
+                depth + 1,
+                output,
+            );
+            split_on_gutters(
+                image,
+                BoundingBox::new(bbox.x, end, bbox.width, bbox.bottom() - end),
+                depth + 1,
+                output,
+            );
+        }
+        GutterAxis::Vertical => {
+            split_on_gutters(
+                image,
+                BoundingBox::new(bbox.x, bbox.y, start - bbox.x, bbox.height),
+                depth + 1,
+                output,
+            );
+            split_on_gutters(
+                image,
+                BoundingBox::new(end, bbox.y, bbox.right() - end, bbox.height),
+                depth + 1,
+                output,
+            );
         }
     }
-    if panels.is_empty() {
-        vec![single_panel(width, height)]
-    } else {
-        panels
+}
+
+fn best_gutter(image: &GrayImage, bbox: BoundingBox, axis: GutterAxis) -> Option<(u32, u32)> {
+    let (start, end, cross_start, cross_end) = match axis {
+        GutterAxis::Horizontal => (bbox.y, bbox.bottom(), bbox.x, bbox.right()),
+        GutterAxis::Vertical => (bbox.x, bbox.right(), bbox.y, bbox.bottom()),
+    };
+    // Never treat page margins or the white padding just inside a detected
+    // panel as another gutter. A real split must leave meaningful content on
+    // both sides.
+    let margin = ((end - start) / 8).max(8);
+    let min_run = ((end - start) / 100).max(3);
+    let mut runs = Vec::new();
+    let mut run_start = None;
+    for position in start + margin..end.saturating_sub(margin) {
+        let white = (cross_start..cross_end)
+            .filter(|cross| match axis {
+                GutterAxis::Horizontal => image.get_pixel(*cross, position)[0] >= 238,
+                GutterAxis::Vertical => image.get_pixel(position, *cross)[0] >= 238,
+            })
+            .count() as f32
+            / (cross_end - cross_start).max(1) as f32;
+        if white >= 0.94 {
+            run_start.get_or_insert(position);
+        } else if let Some(value) = run_start.take() {
+            if position - value >= min_run {
+                runs.push((value, position));
+            }
+        }
     }
+    if let Some(value) = run_start {
+        let run_end = end.saturating_sub(margin);
+        if run_end - value >= min_run {
+            runs.push((value, run_end));
+        }
+    }
+    runs.into_iter().max_by_key(|(a, b)| b - a)
 }
 
 fn single_panel(width: u32, height: u32) -> MangaPanel {
@@ -242,71 +340,6 @@ fn tile_weight(x: u32, y: u32, width: u32, height: u32, overlap: u32) -> f32 {
     (0.5 - 0.5 * (std::f32::consts::PI * t).cos()).clamp(0.0, 1.0)
 }
 
-fn white_runs_rows(lineart: &GrayImage) -> Vec<(u32, u32)> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for y in 0..lineart.height() {
-        let white = (0..lineart.width())
-            .filter(|x| lineart.get_pixel(*x, y)[0] > 245)
-            .count() as f32
-            / lineart.width() as f32;
-        if white > 0.985 {
-            start.get_or_insert(y);
-        } else if let Some(s) = start.take() {
-            runs.push((s, y));
-        }
-    }
-    if let Some(s) = start {
-        runs.push((s, lineart.height()));
-    }
-    runs
-}
-
-fn white_runs_cols(lineart: &GrayImage) -> Vec<(u32, u32)> {
-    let mut runs = Vec::new();
-    let mut start = None;
-    for x in 0..lineart.width() {
-        let white = (0..lineart.height())
-            .filter(|y| lineart.get_pixel(x, *y)[0] > 245)
-            .count() as f32
-            / lineart.height() as f32;
-        if white > 0.985 {
-            start.get_or_insert(x);
-        } else if let Some(s) = start.take() {
-            runs.push((s, x));
-        }
-    }
-    if let Some(s) = start {
-        runs.push((s, lineart.width()));
-    }
-    runs
-}
-
-fn significant_runs(runs: &[(u32, u32)], min_width: u32) -> Vec<(u32, u32)> {
-    runs.iter()
-        .copied()
-        .filter(|(start, end)| end.saturating_sub(*start) >= min_width)
-        .collect()
-}
-
-fn ranges_from_cuts(length: u32, cuts: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0;
-    for (start, end) in cuts {
-        if *start > cursor {
-            ranges.push((cursor, *start));
-        }
-        cursor = *end;
-    }
-    if cursor < length {
-        ranges.push((cursor, length));
-    }
-    ranges
-        .into_iter()
-        .filter(|(start, end)| end.saturating_sub(*start) > 8)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +369,28 @@ mod tests {
             .collect();
         let merged = merge_rgb_tiles(size, &colored).unwrap();
         assert_eq!(merged.dimensions(), (900, 900));
+    }
+
+    #[test]
+    fn mixed_layout_does_not_create_cross_product_panels() {
+        let mut page = GrayImage::from_pixel(300, 300, image::Luma([255]));
+        for y in 10..140 {
+            for x in 10..140 {
+                page.put_pixel(x, y, image::Luma([80]));
+            }
+            for x in 160..290 {
+                page.put_pixel(x, y, image::Luma([80]));
+            }
+        }
+        for y in 160..290 {
+            for x in 10..290 {
+                page.put_pixel(x, y, image::Luma([80]));
+            }
+        }
+
+        let panels = detect_panels_basic(&page, ReadingDirection::RightToLeft);
+        assert_eq!(panels.len(), 3);
+        assert!(panels[0].bbox.x > panels[1].bbox.x);
+        assert!(panels[2].bbox.width > panels[0].bbox.width);
     }
 }

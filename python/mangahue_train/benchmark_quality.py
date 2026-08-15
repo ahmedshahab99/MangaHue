@@ -107,22 +107,42 @@ def _resolve(base: Path, value: str) -> Path:
 
 def evaluate_manifest(manifest_path: Path, target: str) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1:
-        raise ValueError("benchmark manifest schema_version must be 1")
+    schema_version = manifest.get("schema_version")
+    if schema_version not in (1, 2):
+        raise ValueError("benchmark manifest schema_version must be 1 or 2")
     samples = manifest.get("samples")
     if not isinstance(samples, list) or not samples:
         raise ValueError("benchmark manifest must contain at least one sample")
     base = manifest_path.parent
     systems: dict[str, list[dict[str, float]]] = {}
     pages: list[dict[str, Any]] = []
+    licensed_pages = 0
     for index, sample in enumerate(samples):
         sample_id = str(sample.get("id") or f"page-{index + 1:04d}")
+        license_record = sample.get("license")
+        if schema_version == 2:
+            if not isinstance(license_record, dict):
+                raise ValueError(f"{sample_id}: license record is required")
+            missing = [
+                field
+                for field in ("rights_holder", "usage_grant", "proof")
+                if not str(license_record.get(field, "")).strip()
+            ]
+            if missing:
+                raise ValueError(
+                    f"{sample_id}: license record is missing {', '.join(missing)}"
+                )
+            licensed_pages += 1
         candidates = sample.get("candidates")
         if not isinstance(candidates, dict) or not candidates:
             raise ValueError(f"{sample_id}: candidates must be a non-empty object")
         lineart = _load_rgb(_resolve(base, sample["lineart"]))
         reference = _load_rgb(_resolve(base, sample["reference"]))
-        page_scores: dict[str, Any] = {"id": sample_id, "systems": {}}
+        page_scores: dict[str, Any] = {
+            "id": sample_id,
+            "licensed": schema_version == 2,
+            "systems": {},
+        }
         for system, path_value in sorted(candidates.items()):
             metrics = score_candidate(
                 lineart, reference, _load_rgb(_resolve(base, str(path_value)))
@@ -148,9 +168,10 @@ def evaluate_manifest(manifest_path: Path, target: str) -> dict[str, Any]:
         ),
     )
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "manifest": str(manifest_path.resolve()),
         "target": target,
+        "licensed_pages": licensed_pages,
         "aggregate": aggregate,
         "ranking": ranking,
         "pages": pages,
@@ -167,11 +188,17 @@ def enforce_gate(
     min_ssim: float,
     min_line_preservation: float,
     baseline: str | None,
+    require_licensed: bool = False,
 ) -> list[str]:
     target = report["aggregate"][report["target"]]
     failures: list[str] = []
     if target["pages"] < min_pages:
         failures.append(f"pages {target['pages']:.0f} < required {min_pages}")
+    if require_licensed and report.get("licensed_pages", 0) < target["pages"]:
+        failures.append(
+            f"licensed pages {report.get('licensed_pages', 0)} < evaluated pages "
+            f"{target['pages']:.0f}"
+        )
     if target["delta_e_mean"] > max_delta_e:
         failures.append(
             f"delta_e_mean {target['delta_e_mean']:.4f} > allowed {max_delta_e:.4f}"
@@ -210,6 +237,11 @@ def main() -> None:
     parser.add_argument("--max-delta-e", type=float, default=28.0)
     parser.add_argument("--min-ssim", type=float, default=0.55)
     parser.add_argument("--min-line-preservation", type=float, default=0.92)
+    parser.add_argument(
+        "--allow-unlicensed",
+        action="store_true",
+        help="development only: do not require per-page license records",
+    )
     args = parser.parse_args()
     report = evaluate_manifest(args.manifest, args.target)
     failures = enforce_gate(
@@ -219,6 +251,7 @@ def main() -> None:
         min_ssim=args.min_ssim,
         min_line_preservation=args.min_line_preservation,
         baseline=args.baseline,
+        require_licensed=not args.allow_unlicensed,
     )
     report["gate"] = {"passed": not failures, "failures": failures}
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -110,12 +110,12 @@ def _load_input(request: dict, channels: int, spatial_multiple: int) -> tuple[np
                 umap = cv2.cvtColor(umap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
                 umask = umask.astype(np.float32) / 255.0
                 if umap.shape[:2] == (height, width) and umask.shape == (height, width):
-                    # Rust has the full-page bubble, character-memory, and
-                    # region-lock context. Its map is authoritative; mixing
-                    # the worker's grayscale-only guesses back into unhinted
-                    # pixels mislabeled paper and clothing as skin.
-                    cmap = umap
-                    cmask = umask
+                    # Explicit Rust hints win where their mask is active;
+                    # elsewhere retain the worker's sparse guidance so the
+                    # model never receives an entirely unguided background.
+                    active = umask > 0
+                    cmap[active] = umap[active]
+                    cmask[active] = umask[active]
                 else:
                     print(json.dumps({
                         "warn": "hint_map/hint_mask dimensions do not match lineart; using internal hints",

@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/opt/MangaHue-release
-EnvironmentFile=/opt/MangaHue-release/runtime/telegram.env
+User=mangahue-pro
+Group=mangahue-pro
+WorkingDirectory=/opt/MangaHue-current
+EnvironmentFile=/etc/mangahue/telegram.env
 Environment=MANGAHUE_MODEL_THREADS=2
 Environment=MANGAHUE_MODEL_TIMEOUT_SECONDS=180
 # Inference is fully native (Rust ort backend): no Python needed for the
@@ -26,10 +27,9 @@ ExecStartPre=/usr/bin/install -d -m 0700 /run/mangahue-pro/jobs /run/mangahue-pr
 # frozen against palette re-hueing, harmony gated to neutrals, face paint
 # yields to real skin) + soft_cel_anime_v2 style (de-warmed finishing) +
 # per-chapter palette feedback (each manga carries its own accent hues).
-# Rollback: --model /opt/MangaHue/models/manga-onnx/manga-colorize-fp16.onnx
-#           --preset /opt/MangaHue-release/configs/engine.telegram-cpu.yaml
-#           --style /opt/MangaHue-release/configs/styles/studio_anime.yaml
-ExecStart=/opt/MangaHue-release/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 2 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-release/configs/engine.telegram-pure-model-v2.yaml --style /opt/MangaHue-release/configs/styles/soft_cel_anime_v2.yaml --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
+# Rollback is an atomic symlink change: point /opt/MangaHue-current at a
+# previous directory under /opt/MangaHue-releases and restart this unit.
+ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 30 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.telegram-pure-model-v2.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30
@@ -40,7 +40,15 @@ MemoryMax=5G
 MemorySwapMax=512M
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
 ReadWritePaths=/var/lib/mangahue-pro /run/mangahue-pro
 
 [Install]

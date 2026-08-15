@@ -686,17 +686,20 @@ pub fn detect_speech_bubbles_basic(
     let height = gray.height();
     let mut visited = vec![false; (width as usize) * (height as usize)];
     let min_area = ((width as u64 * height as u64) / 800).max(80);
-    let max_area = (width as u64 * height as u64) / 10;
+    let max_area = (width as u64 * height as u64) / 3;
+    // Cleaned scans commonly contain off-white paper and anti-aliased bubble
+    // interiors. Requiring 246 split otherwise valid balloons into fragments.
+    let white_threshold = 232;
     let mut candidates: Vec<Vec<(u32, u32)>> = Vec::new();
 
     // First pass: flood-fill white regions and apply original heuristics.
     for y in 0..height {
         for x in 0..width {
             let index = idx(x, y, width);
-            if visited[index] || gray.get_pixel(x, y)[0] < 246 {
+            if visited[index] || gray.get_pixel(x, y)[0] < white_threshold {
                 continue;
             }
-            let component = flood_white(gray, &mut visited, x, y);
+            let component = flood_white(gray, &mut visited, x, y, white_threshold);
             let touches_border = component
                 .iter()
                 .any(|&(px, py)| px == 0 || py == 0 || px + 1 == width || py + 1 == height);
@@ -729,8 +732,8 @@ pub fn detect_speech_bubbles_basic(
             let c_val = circularity(perimeter, area);
             let text = enclosed_text_evidence(line_mask, c, bbox);
             c_val >= advanced.bubble_circularity_min as f64
-                && c_val <= advanced.bubble_circularity_max as f64
-                && text.glyphs >= 6
+                && c_val <= (advanced.bubble_circularity_max as f64).max(3.5)
+                && text.glyphs >= 4
                 && text.lines >= 2
         })
         .cloned()
@@ -958,11 +961,10 @@ pub fn detect_text_like_dark_strokes(
     // components big enough to be real glyph strokes (16px is twice the
     // largest speck class while small fonts still pass).
     //
-    // The distance transform ALSO cannot tell a glyph stroke from a hatch
-    // line: on hatched pages, long thin strokes pass every text test. In
-    // manga, text lives inside speech bubbles, so gate the response by
-    // bubble proximity (24px): strokes far from any bubble are linework,
-    // not text, and must not bloat the protected mask.
+    // The distance transform cannot by itself tell glyphs from hatch lines.
+    // Keep components near a bubble, plus compact components arranged in a
+    // local text cluster. The latter is essential for narration boxes, sound
+    // effects, and for fail-safe protection when bubble detection misses one.
     let mut complement = GrayImage::new(w, h);
     for y in 0..h {
         for x in 0..w {
@@ -980,7 +982,10 @@ pub fn detect_text_like_dark_strokes(
     let bubble_dist = distance_transform(&complement);
     let near_bubble = |px: u32, py: u32| bubble_dist[idx(px, py, w)] <= 24;
     let mut visited = vec![false; (w * h) as usize];
-    let mut filtered = GrayImage::new(w, h);
+    let mut components = Vec::<Vec<(u32, u32)>>::new();
+    let max_component_area = ((w as u64 * h as u64) / 2_000).clamp(64, 4_096) as usize;
+    let max_component_width = (w / 2).clamp(24, 320);
+    let max_component_height = (h / 6).clamp(12, 160);
     for y in 0..h {
         for x in 0..w {
             let i = idx(x, y, w);
@@ -988,10 +993,48 @@ pub fn detect_text_like_dark_strokes(
                 continue;
             }
             let points = flood_mask(&text, &mut visited, x, y);
-            if points.len() >= 16 && points.iter().any(|&(px, py)| near_bubble(px, py)) {
-                for &(px, py) in &points {
-                    filtered.put_pixel(px, py, Luma([255]));
-                }
+            let bbox = component_bbox(&points);
+            if points.len() >= 6
+                && points.len() <= max_component_area
+                && bbox.width <= max_component_width
+                && bbox.height <= max_component_height
+            {
+                components.push(points);
+            }
+        }
+    }
+
+    let mut filtered = GrayImage::new(w, h);
+    let boxes: Vec<_> = components
+        .iter()
+        .map(|points| component_bbox(points))
+        .collect();
+    for (index, points) in components.iter().enumerate() {
+        let bbox = boxes[index];
+        let clustered = boxes.iter().enumerate().any(|(other_index, other)| {
+            if index == other_index {
+                return false;
+            }
+            let horizontal_gap = if bbox.right() < other.x {
+                other.x - bbox.right()
+            } else if other.right() < bbox.x {
+                bbox.x - other.right()
+            } else {
+                0
+            };
+            let vertical_gap = if bbox.bottom() < other.y {
+                other.y - bbox.bottom()
+            } else if other.bottom() < bbox.y {
+                bbox.y - other.bottom()
+            } else {
+                0
+            };
+            horizontal_gap <= 3 * bbox.height.max(other.height).max(4)
+                && vertical_gap <= bbox.height.max(other.height).max(4)
+        });
+        if points.iter().any(|&(px, py)| near_bubble(px, py)) || clustered {
+            for &(px, py) in points {
+                filtered.put_pixel(px, py, Luma([255]));
             }
         }
     }
@@ -1170,7 +1213,13 @@ fn top_components(components: &[ComponentStats], count: usize) -> Vec<ComponentS
     components
 }
 
-fn flood_white(gray: &GrayImage, visited: &mut [bool], x: u32, y: u32) -> Vec<(u32, u32)> {
+fn flood_white(
+    gray: &GrayImage,
+    visited: &mut [bool],
+    x: u32,
+    y: u32,
+    threshold: u8,
+) -> Vec<(u32, u32)> {
     let width = gray.width();
     let height = gray.height();
     let mut points = Vec::new();
@@ -1190,7 +1239,7 @@ fn flood_white(gray: &GrayImage, visited: &mut [bool], x: u32, y: u32) -> Vec<(u
                 continue;
             }
             let nidx = idx(nx, ny, width);
-            if visited[nidx] || gray.get_pixel(nx, ny)[0] < 246 {
+            if visited[nidx] || gray.get_pixel(nx, ny)[0] < threshold {
                 continue;
             }
             visited[nidx] = true;
@@ -1220,19 +1269,19 @@ fn bubble_geometry_is_plausible(
     page_height: u32,
     area: u64,
 ) -> bool {
-    if bbox.width > page_width.saturating_mul(7) / 10 {
+    if bbox.width > page_width.saturating_mul(9) / 10 {
         return false;
     }
-    if bbox.height > page_height.saturating_mul(3) / 10 {
+    if bbox.height > page_height / 2 {
         return false;
     }
     let long_axis = bbox.width.max(bbox.height) as f32;
     let short_axis = bbox.width.min(bbox.height).max(1) as f32;
-    if long_axis / short_axis > 4.5 {
+    if long_axis / short_axis > 6.0 {
         return false;
     }
     let fill_ratio = area as f32 / bbox.area().max(1) as f32;
-    (0.45..=0.98).contains(&fill_ratio)
+    (0.35..=0.995).contains(&fill_ratio)
 }
 
 fn border_ink_ratio(mask: &GrayImage, bbox: BoundingBox) -> f32 {
