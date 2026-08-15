@@ -255,10 +255,7 @@ fn cleanup_nhentai_filename(path: &str) -> String {
     // Strip repeated known extensions, keeping the last one.
     let mut ext: Option<&str> = None;
     let mut stem = file;
-    loop {
-        let Some((s, e)) = stem.rsplit_once('.') else {
-            break;
-        };
+    while let Some((s, e)) = stem.rsplit_once('.') {
         if matches!(
             e.to_ascii_lowercase().as_str(),
             "webp" | "jpg" | "jpeg" | "png" | "gif"
