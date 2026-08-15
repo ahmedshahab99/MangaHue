@@ -16,8 +16,12 @@ use mangahue_hints::{
 };
 use mangahue_image::{crop_gray, crop_rgb, load_image, save_gray, save_rgb};
 use mangahue_inference::{ColorizationBackend, MockColorizationBackend, ModelInput};
+use mangahue_intelligence::{
+    build_structure_graph, color_bible_region_locks, verify_color_bible_consistency,
+    ColorBibleConsistencyReport,
+};
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
-use mangahue_memory::{load_project_characters, ProjectMemory};
+use mangahue_memory::{load_project_characters, ColorBible, ProjectMemory};
 use mangahue_postprocess::{
     cross_tile_coherence, finalize, reconstruct_full_resolution, remove_chroma_grid_artifacts,
     remove_color_specks, ChromaGridCleanupReport, PostprocessInput,
@@ -46,6 +50,24 @@ pub struct ColorizeRequest {
     pub style_path: Option<PathBuf>,
     pub project_path: Option<PathBuf>,
     pub region_locks_path: Option<PathBuf>,
+    /// Stable series identifier used by the chapter-aware Color Bible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series_id: Option<String>,
+    /// Stable chapter identifier used for chapter-scoped corrections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter_id: Option<String>,
+    /// Stable page identifier. Defaults to the input image content id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+    /// Versioned canonical palette and correction history for this series.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_bible_path: Option<PathBuf>,
+    /// Optional durable structure graph used by the correction editor/API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structure_graph_output_path: Option<PathBuf>,
+    /// Minimum accepted canonical-color identity score (0..1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_bible_consistency_threshold: Option<f32>,
     #[serde(default)]
     pub character_ids: Vec<String>,
     pub user_hints_path: Option<PathBuf>,
@@ -135,6 +157,8 @@ pub struct ColorizeResult {
     pub report: ProcessingReport,
     pub quality_report_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_bible_consistency_report_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence_map_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
@@ -207,6 +231,7 @@ impl MangaHueEngine {
                         output_path: request.output_path,
                         report,
                         quality_report_path: None,
+                        color_bible_consistency_report_path: None,
                         confidence_map_path: None,
                         idempotency_key: Some(key),
                         from_cache: true,
@@ -334,6 +359,7 @@ impl MangaHueEngine {
                     output_path: request.output_path,
                     report,
                     quality_report_path: None,
+                    color_bible_consistency_report_path: None,
                     confidence_map_path: None,
                     idempotency_key: None,
                     from_cache: false,
@@ -447,6 +473,28 @@ impl MangaHueEngine {
             "layout complete"
         );
 
+        let color_bible = request
+            .color_bible_path
+            .as_deref()
+            .map(ColorBible::load)
+            .transpose()?;
+        if let Some(bible) = &color_bible {
+            anyhow::ensure!(
+                request
+                    .series_id
+                    .as_deref()
+                    .map(|series_id| series_id == bible.series_id)
+                    .unwrap_or(true),
+                "request series does not match Color Bible series"
+            );
+            report.add_stage_report(
+                StageReport::new("color_bible_load")
+                    .metric("revision", bible.revision as f64)
+                    .metric("canonical_colors", bible.colors.len() as f64)
+                    .metric("references", bible.references.len() as f64),
+            );
+        }
+
         let hint_start = Instant::now();
         emit_progress(&progress, "hints", 2, 6, None);
         let user_hints = match request.user_hints_path.as_deref() {
@@ -479,17 +527,17 @@ impl MangaHueEngine {
         // clothing/background/bubbles) so the hint-U-Net sees strong,
         // locally-correct material hints instead of sparse dots. These
         // override the weaker grid/dot hints inside the same regions.
+        let semantic_masks = detect_semantic_regions(
+            &preprocess.original_grayscale,
+            &preprocess.line_mask,
+            &preprocess.bubble_mask,
+        );
         if config.hints.region_style_hints_enabled {
-            let regions = detect_semantic_regions(
-                &preprocess.original_grayscale,
-                &preprocess.line_mask,
-                &preprocess.bubble_mask,
-            );
             let painted = rasterize_semantic_hints(
                 &mut hints.hint_map,
                 &mut hints.hint_mask,
                 &preprocess.original_grayscale,
-                &regions,
+                &semantic_masks,
             );
             if painted > 0 {
                 hints
@@ -602,6 +650,63 @@ impl MangaHueEngine {
                 .with_context(|| format!("failed to save face mask {}", path.display()))?;
             report.debug_files.push(path);
         }
+
+        let structure_graph =
+            if color_bible.is_some() || request.structure_graph_output_path.is_some() {
+                let graph = build_structure_graph(
+                    request.series_id.clone(),
+                    request.chapter_id.clone(),
+                    request
+                        .page_id
+                        .clone()
+                        .unwrap_or_else(|| manga_image.info.id.clone()),
+                    request
+                        .input_path
+                        .file_name()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("page")),
+                    size,
+                    &layout.panels,
+                    &face_boxes,
+                    &semantic_masks,
+                    &bubble_mask,
+                    &preprocess.text_mask,
+                    &preprocess.protected_mask,
+                    scene.lighting.label(),
+                )?;
+                if let Some(path) = request.structure_graph_output_path.as_deref() {
+                    graph.save(path)?;
+                    report.debug_files.push(path.to_path_buf());
+                }
+                report.add_stage_report(
+                    StageReport::new("structure_graph")
+                        .metric("nodes", graph.nodes.len() as f64)
+                        .metric("edges", graph.edges.len() as f64)
+                        .metric(
+                            "protected_nodes",
+                            graph.nodes.iter().filter(|node| node.protected).count() as f64,
+                        )
+                        .metric(
+                            "character_nodes",
+                            graph
+                                .nodes
+                                .iter()
+                                .filter(|node| node.character_id.is_some())
+                                .count() as f64,
+                        ),
+                );
+                Some(graph)
+            } else {
+                None
+            };
+        let color_bible_lock_file = structure_graph
+            .as_ref()
+            .zip(color_bible.as_ref())
+            .map(|(graph, bible)| color_bible_region_locks(graph, bible));
+        let color_bible_lock_raster = color_bible_lock_file
+            .as_ref()
+            .map(|locks| rasterize_region_locks(locks, size))
+            .transpose()?;
         report.hint_ms = hint_start.elapsed().as_millis();
         report.add_stage_report(
             StageReport::new("hints")
@@ -637,12 +742,26 @@ impl MangaHueEngine {
             ));
         }
 
-        let region_lock_raster = request
+        if let Some(raster) = &color_bible_lock_raster {
+            let lock_report =
+                apply_region_locks_to_hints(&mut hints.hint_map, &mut hints.hint_mask, raster);
+            report.add_stage_report(
+                StageReport::new("color_bible_constraints")
+                    .metric("locks", lock_report.applied_locks as f64)
+                    .metric("color_pixels", lock_report.colorized_pixels as f64)
+                    .metric("protected_pixels", lock_report.preserved_pixels as f64)
+                    .metric("excluded_pixels", lock_report.excluded_hint_pixels as f64),
+            );
+        }
+
+        let region_lock_file = request
             .region_locks_path
             .as_deref()
             .map(load_region_locks)
-            .transpose()?
-            .map(|locks| rasterize_region_locks(&locks, size))
+            .transpose()?;
+        let region_lock_raster = region_lock_file
+            .as_ref()
+            .map(|locks| rasterize_region_locks(locks, size))
             .transpose()?;
         if let Some(raster) = &region_lock_raster {
             let lock_report =
@@ -1160,6 +1279,18 @@ impl MangaHueEngine {
                     chroma_signal.map(|v| v as f64).unwrap_or(0.0),
                 ),
         );
+        if let Some(raster) = &color_bible_lock_raster {
+            let lock_report = enforce_region_locks(
+                &mut final_image,
+                &preprocess.original_grayscale,
+                &preprocess.line_mask,
+                raster,
+            );
+            report.warn(format!(
+                "Color Bible enforcement completed: {} canonical-color pixel(s), {} protected pixel(s)",
+                lock_report.colorized_pixels, lock_report.preserved_pixels
+            ));
+        }
         if let Some(raster) = &region_lock_raster {
             let lock_report = enforce_region_locks(
                 &mut final_image,
@@ -1255,6 +1386,80 @@ impl MangaHueEngine {
                 &grid_cleanup,
             ));
         }
+
+        // Re-rasterize and enforce every deterministic constraint at delivery
+        // resolution. Upscaling and artistic cleanup are allowed to change
+        // lighting, but not canonical identity colors, ink, text, or whites.
+        let delivery_size = ImageSize::new(final_image.width(), final_image.height());
+        let delivery_gray = manga_image.image.to_luma8();
+        let delivery_line_mask = image::imageops::resize(
+            &preprocess.line_mask,
+            delivery_size.width,
+            delivery_size.height,
+            image::imageops::FilterType::Nearest,
+        );
+        let delivery_protected_mask = image::imageops::resize(
+            &preprocess.protected_mask,
+            delivery_size.width,
+            delivery_size.height,
+            image::imageops::FilterType::Nearest,
+        );
+        if let Some(locks) = color_bible_lock_file.as_ref() {
+            let raster = rasterize_region_locks(locks, delivery_size)?;
+            let lock_report = enforce_region_locks(
+                &mut final_image,
+                &delivery_gray,
+                &delivery_line_mask,
+                &raster,
+            );
+            report.add_stage_report(
+                StageReport::new("protected_compositor")
+                    .metric("canonical_pixels", lock_report.colorized_pixels as f64)
+                    .metric("protected_pixels", lock_report.preserved_pixels as f64),
+            );
+        }
+        // Explicit page locks remain the final operator override.
+        if let Some(locks) = region_lock_file.as_ref() {
+            let raster = rasterize_region_locks(locks, delivery_size)?;
+            enforce_region_locks(
+                &mut final_image,
+                &delivery_gray,
+                &delivery_line_mask,
+                &raster,
+            );
+        }
+
+        let color_bible_consistency: Option<ColorBibleConsistencyReport> = structure_graph
+            .as_ref()
+            .zip(color_bible.as_ref())
+            .map(|(graph, bible)| {
+                verify_color_bible_consistency(
+                    &final_image,
+                    graph,
+                    bible,
+                    &delivery_line_mask,
+                    &delivery_protected_mask,
+                    request.color_bible_consistency_threshold.unwrap_or(0.62),
+                )
+            });
+        if let Some(consistency) = &color_bible_consistency {
+            report.add_stage_report(
+                StageReport::new("color_bible_verifier")
+                    .metric("revision", consistency.bible_revision as f64)
+                    .metric("evaluated_regions", consistency.evaluated_regions as f64)
+                    .metric("mean_score", consistency.mean_score as f64)
+                    .metric("minimum_score", consistency.minimum_score as f64)
+                    .metric("threshold", consistency.threshold as f64)
+                    .metric("passed", if consistency.passed { 1.0 } else { 0.0 }),
+            );
+            if !consistency.passed {
+                report.director_verdict = Some("needs_color_bible_consistency".to_string());
+                report.warn(format!(
+                    "delivery withheld: canonical color consistency {:.3} is below {:.3}",
+                    consistency.minimum_score, consistency.threshold
+                ));
+            }
+        }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 
         save_rgb(&request.output_path, &final_image)?;
@@ -1309,6 +1514,27 @@ impl MangaHueEngine {
             }
             qpath
         });
+        let color_bible_consistency_report_path =
+            color_bible_consistency.as_ref().map(|consistency| {
+                let path = request.output_path.with_file_name(format!(
+                    "{}.color-bible.json",
+                    request
+                        .output_path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("output")
+                ));
+                if let Err(error) = fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(consistency).unwrap_or_default(),
+                ) {
+                    report.warn(format!(
+                        "failed to write Color Bible consistency report {}: {error:#}",
+                        path.display()
+                    ));
+                }
+                path
+            });
 
         let idempotency_key =
             compute_idempotency_key(&request, &preprocess, &hints, &config, &style);
@@ -1348,6 +1574,7 @@ impl MangaHueEngine {
             output_path: request.output_path,
             report,
             quality_report_path,
+            color_bible_consistency_report_path,
             confidence_map_path,
             idempotency_key: Some(idempotency_key),
             from_cache: false,
@@ -2016,6 +2243,7 @@ fn base64_encode_hash(digest: &[u8]) -> String {
 mod tests {
     use super::*;
     use image::{GrayImage, Luma};
+    use mangahue_memory::{ColorBibleCorrection, ColorSelector, CorrectionScope};
 
     fn quality_report() -> mangahue_eval::QualityReport {
         mangahue_eval::QualityReport {
@@ -2198,5 +2426,62 @@ mod tests {
 
         assert!(output.exists());
         assert_eq!(result.report.tiles_count, 1);
+    }
+
+    #[test]
+    fn full_pipeline_emits_color_bible_graph_and_gate_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("page.png");
+        let output = dir.path().join("out.png");
+        let bible_path = dir.path().join("color-bible.json");
+        let graph_path = dir.path().join("page.structure.json");
+        let page = GrayImage::from_pixel(128, 128, Luma([180]));
+        page.save(&input).unwrap();
+
+        let mut bible = ColorBible::new("series_1", "Test Series").unwrap();
+        bible
+            .apply_correction(ColorBibleCorrection {
+                selector: ColorSelector {
+                    scope: CorrectionScope::Series,
+                    page_id: None,
+                    chapter_id: None,
+                    character_id: None,
+                    location_id: Some("scene".to_string()),
+                    object_id: None,
+                    region_id: None,
+                    semantic: Some("background".to_string()),
+                    region: None,
+                },
+                color: ColorRgb::new(60, 100, 180),
+                confidence: 1.0,
+                source: "test".to_string(),
+                reference_ids: Vec::new(),
+                note: None,
+            })
+            .unwrap();
+        bible.save(&bible_path).unwrap();
+
+        let result = MangaHueEngine::new()
+            .colorize(ColorizeRequest {
+                input_path: input,
+                output_path: output.clone(),
+                use_mock_backend: true,
+                series_id: Some("series_1".to_string()),
+                chapter_id: Some("chapter_1".to_string()),
+                page_id: Some("page_1".to_string()),
+                color_bible_path: Some(bible_path),
+                structure_graph_output_path: Some(graph_path.clone()),
+                ..ColorizeRequest::default()
+            })
+            .unwrap();
+
+        assert!(output.exists());
+        assert!(graph_path.exists());
+        assert!(result.color_bible_consistency_report_path.is_some());
+        assert!(result
+            .report
+            .stage_reports
+            .iter()
+            .any(|stage| stage.name == "color_bible_verifier"));
     }
 }

@@ -18,6 +18,8 @@ ab_glyph = "0.2"
 mangahue-core = { path = "../mangahue-core" }
 mangahue-ingest = { path = "../mangahue-ingest" }
 mangahue-inference = { path = "../mangahue-inference", features = ["native-onnx"] }
+mangahue-intelligence = { path = "../mangahue-intelligence" }
+mangahue-memory = { path = "../mangahue-memory" }
 mangahue-orchestrator = { path = "../mangahue-orchestrator", features = ["native-onnx"] }
 mangahue-export = { path = "../mangahue-export" }
 reqwest.workspace = true
@@ -30,6 +32,7 @@ chrono.workspace = true
 tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

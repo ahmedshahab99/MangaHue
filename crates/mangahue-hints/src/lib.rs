@@ -90,6 +90,14 @@ pub struct RegionPoint {
     pub y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionRun {
+    pub y: u32,
+    pub x_start: u32,
+    /// Inclusive end coordinate.
+    pub x_end: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "snake_case")]
 pub enum RegionShape {
@@ -107,6 +115,12 @@ pub enum RegionShape {
     },
     Polygon {
         points: Vec<RegionPoint>,
+    },
+    /// Exact source-resolution binary mask compressed into horizontal runs.
+    MaskRle {
+        source_width: u32,
+        source_height: u32,
+        runs: Vec<RegionRun>,
     },
 }
 
@@ -278,6 +292,31 @@ pub fn validate_region_locks(file: &RegionLockFile) -> Result<()> {
                     lock.id
                 );
             }
+            RegionShape::MaskRle {
+                source_width,
+                source_height,
+                runs,
+            } => {
+                anyhow::ensure!(
+                    *source_width > 0 && *source_height > 0,
+                    "region lock {} mask has invalid dimensions",
+                    lock.id
+                );
+                anyhow::ensure!(
+                    !runs.is_empty() && runs.len() <= 2_000_000,
+                    "region lock {} mask has an invalid run count",
+                    lock.id
+                );
+                anyhow::ensure!(
+                    runs.iter().all(|run| {
+                        run.y < *source_height
+                            && run.x_start <= run.x_end
+                            && run.x_end < *source_width
+                    }),
+                    "region lock {} mask contains an invalid run",
+                    lock.id
+                );
+            }
         }
     }
     Ok(())
@@ -297,6 +336,14 @@ pub fn generate_hints(
     let mut memory_hints_applied = 0usize;
     let mut user_hints_applied = 0usize;
     let mut notes = Vec::new();
+    let scaled_user_hints = user_hints
+        .map(|file| {
+            file.hints
+                .iter()
+                .map(|hint| scale_user_hint(hint, file, size))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     if config.style_hints_enabled && !config.region_style_hints_enabled {
         style_hints_applied = if config.adaptive_placement_enabled {
@@ -307,31 +354,27 @@ pub fn generate_hints(
         applied += style_hints_applied;
     }
 
-    if config.character_memory_enabled && !characters.is_empty() {
+    if config.character_memory_enabled && !characters.is_empty() && user_hints.is_some() {
         notes.push(format!("loaded {} character profile(s)", characters.len()));
-        if let Some(file) = user_hints {
-            for hint in &file.hints {
-                if let Some(memory_hint) = memory_hint_from_user_hint(hint, characters) {
-                    rasterize_hint(
-                        &mut hint_map,
-                        &mut hint_mask,
-                        &memory_hint,
-                        config.hint_strength,
-                    );
-                    memory_hints_applied += 1;
-                    applied += 1;
-                }
+        for hint in &scaled_user_hints {
+            if let Some(memory_hint) = memory_hint_from_user_hint(hint, characters) {
+                rasterize_hint(
+                    &mut hint_map,
+                    &mut hint_mask,
+                    &memory_hint,
+                    config.hint_strength,
+                );
+                memory_hints_applied += 1;
+                applied += 1;
             }
         }
     }
 
-    if config.user_hints_enabled {
-        if let Some(file) = user_hints {
-            for hint in &file.hints {
-                rasterize_hint(&mut hint_map, &mut hint_mask, hint, config.hint_strength);
-                user_hints_applied += 1;
-                applied += 1;
-            }
+    if config.user_hints_enabled && user_hints.is_some() {
+        for hint in &scaled_user_hints {
+            rasterize_hint(&mut hint_map, &mut hint_mask, hint, config.hint_strength);
+            user_hints_applied += 1;
+            applied += 1;
         }
     }
 
@@ -349,6 +392,26 @@ pub fn generate_hints(
         region_style_hints_applied: 0,
         notes,
     }
+}
+
+fn scale_user_hint(hint: &ColorHint, file: &UserHintFile, size: ImageSize) -> ColorHint {
+    let (Some(source_width), Some(source_height)) = (file.source_width, file.source_height) else {
+        return hint.clone();
+    };
+    if source_width == 0 || source_height == 0 {
+        return hint.clone();
+    }
+    let scale_x = size.width as f32 / source_width as f32;
+    let scale_y = size.height as f32 / source_height as f32;
+    let mut scaled = hint.clone();
+    scaled.x = (hint.x as f32 * scale_x)
+        .round()
+        .clamp(0.0, size.width.saturating_sub(1) as f32) as u32;
+    scaled.y = (hint.y as f32 * scale_y)
+        .round()
+        .clamp(0.0, size.height.saturating_sub(1) as f32) as u32;
+    scaled.radius = (hint.radius as f32 * scale_x.min(scale_y)).round().max(1.0) as u32;
+    scaled
 }
 
 pub fn apply_region_style_hints(
@@ -1127,6 +1190,27 @@ pub fn enforce_region_locks(
 
 fn rasterize_region_shape(file: &RegionLockFile, lock: &RegionLock, size: ImageSize) -> GrayImage {
     let mut mask = GrayImage::from_pixel(size.width, size.height, Luma([0]));
+    if let RegionShape::MaskRle {
+        source_width,
+        source_height,
+        runs,
+    } = &lock.region
+    {
+        let source_width = (*source_width).max(1) as u64;
+        let source_height = (*source_height).max(1) as u64;
+        for run in runs {
+            let min_x = run.x_start as u64 * size.width as u64 / source_width;
+            let max_x = ((run.x_end as u64 + 1) * size.width as u64).div_ceil(source_width);
+            let min_y = run.y as u64 * size.height as u64 / source_height;
+            let max_y = ((run.y as u64 + 1) * size.height as u64).div_ceil(source_height);
+            for y in min_y.min(size.height as u64)..max_y.min(size.height as u64) {
+                for x in min_x.min(size.width as u64)..max_x.min(size.width as u64) {
+                    mask.put_pixel(x as u32, y as u32, Luma([255]));
+                }
+            }
+        }
+        return mask;
+    }
     let shape = ScaledRegionShape::new(file, &lock.region, size);
     let (min_x, min_y, max_x, max_y) = shape.bounds(size);
     for y in min_y..max_y {
@@ -1174,6 +1258,7 @@ enum ScaledRegionShape {
         radius_y: f32,
     },
     Polygon(Vec<RegionPoint>),
+    MaskRle,
 }
 
 impl ScaledRegionShape {
@@ -1236,6 +1321,7 @@ impl ScaledRegionShape {
                     .map(|point| scale_region_point(file, point, size))
                     .collect(),
             ),
+            RegionShape::MaskRle { .. } => Self::MaskRle,
         }
     }
 
@@ -1257,6 +1343,7 @@ impl ScaledRegionShape {
                 dx * dx + dy * dy <= 1.0
             }
             Self::Polygon(points) => point_in_polygon(point, points),
+            Self::MaskRle => false,
         }
     }
 
@@ -1290,6 +1377,7 @@ impl ScaledRegionShape {
                         )
                     })
             }
+            Self::MaskRle => (0.0, 0.0, 0.0, 0.0),
         };
         (
             min_x.floor().max(0.0) as u32,
@@ -1387,7 +1475,11 @@ mod tests {
             strength: 1.0,
             source: HintSource::User,
         };
-        let hints = UserHintFile { hints: vec![hint] };
+        let hints = UserHintFile {
+            source_width: None,
+            source_height: None,
+            hints: vec![hint],
+        };
         let result = generate_hints(
             ImageSize::new(32, 32),
             Some(&hints),
@@ -1397,6 +1489,34 @@ mod tests {
         );
         assert!(result.applied_hints >= 1);
         assert!(result.hint_mask.get_pixel(10, 10)[0] > 0);
+    }
+
+    #[test]
+    fn normalized_canvas_hints_scale_to_each_page() {
+        let mut config = EngineConfig::default();
+        config.hints.hint_blur_radius = 0.0;
+        let hints = UserHintFile {
+            source_width: Some(1000),
+            source_height: Some(1000),
+            hints: vec![ColorHint {
+                x: 500,
+                y: 250,
+                radius: 50,
+                color: ColorRgb::new(20, 140, 220),
+                label: Some("character_001.hair".to_string()),
+                strength: 1.0,
+                source: HintSource::User,
+            }],
+        };
+        let result = generate_hints(
+            ImageSize::new(400, 800),
+            Some(&hints),
+            &StyleProfile::default(),
+            &[],
+            &config.hints,
+        );
+        assert!(result.hint_mask.get_pixel(200, 200)[0] > 0);
+        assert_eq!(result.hint_mask.get_pixel(390, 700)[0], 0);
     }
 
     #[test]
@@ -1476,6 +1596,48 @@ mod tests {
         assert!(raster.color_mask.get_pixel(32, 32)[0] > 0);
         assert!(raster.exclude_mask.get_pixel(4, 4)[0] > 0);
         assert_eq!(raster.color_mask.get_pixel(2, 60)[0], 0);
+    }
+
+    #[test]
+    fn rle_mask_scales_without_filling_its_bounding_box() {
+        let file = RegionLockFile {
+            version: 1,
+            page_id: None,
+            coordinate_space: RegionCoordinateSpace::Pixels,
+            source_width: Some(4),
+            source_height: Some(4),
+            locks: vec![RegionLock {
+                id: "exact".to_string(),
+                label: None,
+                semantic: RegionSemantic::Hair,
+                mode: RegionLockMode::Colorize,
+                region: RegionShape::MaskRle {
+                    source_width: 4,
+                    source_height: 4,
+                    runs: vec![
+                        RegionRun {
+                            y: 1,
+                            x_start: 1,
+                            x_end: 1,
+                        },
+                        RegionRun {
+                            y: 2,
+                            x_start: 2,
+                            x_end: 2,
+                        },
+                    ],
+                },
+                color: Some(ColorRgb::new(200, 30, 60)),
+                strength: 1.0,
+                feather_radius: 0.0,
+                enabled: true,
+            }],
+        };
+        let raster = rasterize_region_locks(&file, ImageSize::new(8, 8)).unwrap();
+        assert!(raster.color_mask.get_pixel(2, 2)[0] > 0);
+        assert!(raster.color_mask.get_pixel(4, 4)[0] > 0);
+        assert_eq!(raster.color_mask.get_pixel(4, 2)[0], 0);
+        assert_eq!(raster.color_mask.get_pixel(2, 4)[0], 0);
     }
 
     #[test]

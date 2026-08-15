@@ -27,13 +27,14 @@ use mangahue_image::{
 use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestReport, IngestRequest};
 use mangahue_intelligence::{
-    analyze_semantics, character_observations, curate_dataset, semantic_region_locks,
-    track_characters, CuratedSample, CuratorCandidate, SemanticAnalysisConfig, SemanticClass,
-    SemanticPageReport,
+    analyze_semantics, character_observations, curate_dataset, plan_correction_impact,
+    semantic_region_locks, track_characters, CuratedSample, CuratorCandidate,
+    SemanticAnalysisConfig, SemanticClass, SemanticPageReport, StructureGraph,
 };
 use mangahue_memory::{
     add_correction, create_character, create_project_directory, export_correction_hints,
-    export_correction_training_manifest, export_corrections_jsonl, NewCorrection, ProjectMemory,
+    export_correction_training_manifest, export_corrections_jsonl, ColorBible,
+    ColorBibleCorrection, ColorSelector, CorrectionScope, NewCorrection, ProjectMemory,
 };
 use mangahue_orchestrator::{ColorizeRequest, InspectRequest, MangaHueEngine, PageInspection};
 use mangahue_production::{DurableJob, NewJob, ProductionStore, QuotaSnapshot, UserAccount};
@@ -330,6 +331,47 @@ pub struct ApiCorrectionAddRequest {
 pub struct ApiCorrectionExportRequest {
     pub project: PathBuf,
     pub output: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiColorBibleCreateRequest {
+    pub path: PathBuf,
+    pub series_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiColorBiblePathRequest {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiColorBibleCorrectionRequest {
+    pub path: PathBuf,
+    pub selector: ColorSelector,
+    pub color: String,
+    #[serde(default = "default_correction_confidence")]
+    pub confidence: f32,
+    #[serde(default)]
+    pub reference_ids: Vec<String>,
+    pub note: Option<String>,
+    pub graphs_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiColorBibleTapRequest {
+    pub path: PathBuf,
+    pub structure_graph: PathBuf,
+    /// Normalized horizontal coordinate (0..1).
+    pub x: f32,
+    /// Normalized vertical coordinate (0..1).
+    pub y: f32,
+    pub color: String,
+    pub scope: CorrectionScope,
+    /// Optional stable identity override for character-scope corrections.
+    pub character_id: Option<String>,
+    pub note: Option<String>,
+    pub graphs_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -686,7 +728,12 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
             "/api/projects/:project_id/characters",
             post(create_character_profile_for_project),
         )
-        .route("/api/corrections", post(add_project_correction));
+        .route("/api/corrections", post(add_project_correction))
+        .route("/api/color-bibles/create", post(create_color_bible))
+        .route("/api/color-bibles/status", post(color_bible_status))
+        .route("/api/color-bibles/correct", post(correct_color_bible))
+        .route("/api/color-bibles/tap", post(tap_correct_color_bible))
+        .route("/api/color-bibles/undo", post(undo_color_bible));
 
     // Public static assets: locally installed models. The webapp and
     // operator Studio were removed with the web/ tree; the API is a
@@ -1060,6 +1107,8 @@ fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.user_hints_path = None;
     request.project_path = None;
     request.region_locks_path = None;
+    request.color_bible_path = None;
+    request.structure_graph_output_path = None;
     request.character_ids.clear();
     request.idempotency_key = None;
     request.use_mock_backend = false;
@@ -2553,6 +2602,147 @@ async fn add_project_correction(
     })))
 }
 
+async fn create_color_bible(
+    Json(payload): Json<ApiColorBibleCreateRequest>,
+) -> Result<Json<ColorBible>, ApiError> {
+    let bible = ColorBible::load_or_create(&payload.path, payload.series_id, payload.name)?;
+    Ok(Json(bible))
+}
+
+async fn color_bible_status(
+    Json(payload): Json<ApiColorBiblePathRequest>,
+) -> Result<Json<ColorBible>, ApiError> {
+    Ok(Json(ColorBible::load(payload.path)?))
+}
+
+async fn correct_color_bible(
+    Json(payload): Json<ApiColorBibleCorrectionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut bible = ColorBible::load(&payload.path)?;
+    let selector = payload.selector;
+    bible.apply_correction(ColorBibleCorrection {
+        selector: selector.clone(),
+        color: payload
+            .color
+            .parse::<ColorRgb>()
+            .map_err(anyhow::Error::from)?,
+        confidence: payload.confidence,
+        source: "api_correction".to_string(),
+        reference_ids: payload.reference_ids,
+        note: payload.note,
+    })?;
+    bible.save(&payload.path)?;
+    let impact = payload
+        .graphs_root
+        .map(|root| plan_correction_impact(root, &selector))
+        .transpose()?;
+    Ok(Json(serde_json::json!({
+        "color_bible": bible,
+        "impact": impact
+    })))
+}
+
+async fn tap_correct_color_bible(
+    Json(payload): Json<ApiColorBibleTapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let graph = StructureGraph::load(&payload.structure_graph)?;
+    let node = graph
+        .node_at(payload.x, payload.y)
+        .with_context(|| "no correctable region was detected at this coordinate")?;
+    let semantic = node
+        .kind
+        .semantic()
+        .with_context(|| "selected region does not have a color identity")?
+        .to_string();
+    let character_id = payload
+        .character_id
+        .as_deref()
+        .or(node.character_id.as_deref())
+        .map(str::to_string);
+    let selector = match payload.scope {
+        CorrectionScope::Region => ColorSelector {
+            scope: payload.scope,
+            page_id: Some(graph.page_id.clone()),
+            chapter_id: graph.chapter_id.clone(),
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: Some(node.id.clone()),
+            semantic: Some(semantic),
+            region: Some(node.normalized_bounds),
+        },
+        CorrectionScope::Character => ColorSelector {
+            scope: payload.scope,
+            page_id: None,
+            chapter_id: None,
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+        CorrectionScope::Chapter => ColorSelector {
+            scope: payload.scope,
+            page_id: None,
+            chapter_id: graph.chapter_id.clone(),
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+        CorrectionScope::Series => ColorSelector {
+            scope: payload.scope,
+            page_id: None,
+            chapter_id: None,
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+    };
+    selector.validate()?;
+    let mut bible = ColorBible::load(&payload.path)?;
+    if let Some(series_id) = graph.series_id.as_deref() {
+        if bible.series_id != series_id {
+            return Err(anyhow!("structure graph series does not match Color Bible").into());
+        }
+    }
+    bible.apply_correction(ColorBibleCorrection {
+        selector: selector.clone(),
+        color: payload
+            .color
+            .parse::<ColorRgb>()
+            .map_err(anyhow::Error::from)?,
+        confidence: 1.0,
+        source: "tap_correction".to_string(),
+        reference_ids: Vec::new(),
+        note: payload.note,
+    })?;
+    bible.save(&payload.path)?;
+    let impact = payload
+        .graphs_root
+        .map(|root| plan_correction_impact(root, &selector))
+        .transpose()?;
+    Ok(Json(serde_json::json!({
+        "color_bible": bible,
+        "impact": impact
+    })))
+}
+
+async fn undo_color_bible(
+    Json(payload): Json<ApiColorBiblePathRequest>,
+) -> Result<Json<ColorBible>, ApiError> {
+    let mut bible = ColorBible::load(&payload.path)?;
+    bible.undo_last()?;
+    bible.save(&payload.path)?;
+    Ok(Json(bible))
+}
+
 fn parse_color(value: Option<String>) -> Result<Option<mangahue_core::ColorRgb>> {
     value
         .as_deref()
@@ -3172,6 +3362,10 @@ fn default_retry_max_pages() -> usize {
     24
 }
 
+fn default_correction_confidence() -> f32 {
+    1.0
+}
+
 fn default_max_attempts() -> u32 {
     3
 }
@@ -3580,6 +3774,11 @@ pub fn planned_routes() -> &'static [&'static str] {
         "POST /api/projects/characters",
         "POST /api/projects/{id}/characters",
         "POST /api/corrections",
+        "POST /api/color-bibles/create",
+        "POST /api/color-bibles/status",
+        "POST /api/color-bibles/correct",
+        "POST /api/color-bibles/tap",
+        "POST /api/color-bibles/undo",
         "GET /api/styles",
     ]
 }

@@ -340,6 +340,12 @@ fn default_hint_source() -> HintSource {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserHintFile {
+    /// Coordinate canvas used by the stored hints. When omitted, hints use
+    /// legacy absolute image pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_height: Option<u32>,
     #[serde(default)]
     pub hints: Vec<ColorHint>,
 }

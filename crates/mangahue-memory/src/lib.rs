@@ -4,6 +4,7 @@ use mangahue_core::{
     BoundingBox, CharacterProfile, ColorHint, ColorRgb, CorrectionRecord, HintSource, UserHintFile,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -216,6 +217,8 @@ pub fn export_correction_hints(
 ) -> Result<usize> {
     let project = ProjectMemory::load(project_path)?;
     let hints = UserHintFile {
+        source_width: None,
+        source_height: None,
         hints: project
             .corrections
             .iter()
@@ -453,6 +456,475 @@ fn slugify(input: &str) -> String {
     slug.trim_matches('_').to_string()
 }
 
+pub const COLOR_BIBLE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionScope {
+    Region,
+    Character,
+    Chapter,
+    Series,
+}
+
+impl CorrectionScope {
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Region => 4,
+            Self::Character => 3,
+            Self::Chapter => 2,
+            Self::Series => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedRegion {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl NormalizedRegion {
+    pub fn validate(self) -> Result<()> {
+        anyhow::ensure!(
+            [self.x, self.y, self.width, self.height]
+                .into_iter()
+                .all(f32::is_finite),
+            "normalized region contains a non-finite value"
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.x) && (0.0..=1.0).contains(&self.y),
+            "normalized region origin must be within 0..=1"
+        );
+        anyhow::ensure!(
+            self.width > 0.0 && self.height > 0.0,
+            "normalized region must have positive dimensions"
+        );
+        anyhow::ensure!(
+            self.x + self.width <= 1.000_001 && self.y + self.height <= 1.000_001,
+            "normalized region extends beyond the page"
+        );
+        Ok(())
+    }
+
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x && y >= self.y && x <= self.x + self.width && y <= self.y + self.height
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColorSelector {
+    pub scope: CorrectionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapter_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<NormalizedRegion>,
+}
+
+impl ColorSelector {
+    pub fn validate(&self) -> Result<()> {
+        match self.scope {
+            CorrectionScope::Region => {
+                anyhow::ensure!(
+                    self.page_id.as_deref().is_some_and(non_empty)
+                        && (self.region_id.as_deref().is_some_and(non_empty)
+                            || self.region.is_some()),
+                    "region correction requires page_id and region_id or normalized region"
+                );
+            }
+            CorrectionScope::Character => anyhow::ensure!(
+                self.character_id.as_deref().is_some_and(non_empty),
+                "character correction requires character_id"
+            ),
+            CorrectionScope::Chapter => anyhow::ensure!(
+                self.chapter_id.as_deref().is_some_and(non_empty),
+                "chapter correction requires chapter_id"
+            ),
+            CorrectionScope::Series => {}
+        }
+        anyhow::ensure!(
+            self.semantic.as_deref().is_some_and(non_empty)
+                || self.region_id.as_deref().is_some_and(non_empty)
+                || self.object_id.as_deref().is_some_and(non_empty)
+                || self.location_id.as_deref().is_some_and(non_empty),
+            "color selector needs a semantic, region, object, or location identity"
+        );
+        if let Some(region) = self.region {
+            region.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn stable_key(&self) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}|{}|{}",
+            self.scope,
+            normalized(self.page_id.as_deref()),
+            normalized(self.chapter_id.as_deref()),
+            normalized(self.character_id.as_deref()),
+            normalized(self.location_id.as_deref()),
+            normalized(self.object_id.as_deref()),
+            normalized(self.region_id.as_deref()),
+            normalized(self.semantic.as_deref()),
+        )
+        .to_ascii_lowercase()
+    }
+
+    pub fn matches_context(&self, context: &ColorContext<'_>) -> bool {
+        selector_match_score(self, context).is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColorContext<'a> {
+    pub page_id: Option<&'a str>,
+    pub chapter_id: Option<&'a str>,
+    pub character_id: Option<&'a str>,
+    pub location_id: Option<&'a str>,
+    pub object_id: Option<&'a str>,
+    pub region_id: Option<&'a str>,
+    pub semantic: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalColorEntry {
+    pub id: String,
+    pub selector: ColorSelector,
+    pub color: ColorRgb,
+    pub confidence: f32,
+    pub source: String,
+    #[serde(default)]
+    pub reference_ids: Vec<String>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceKind {
+    Style,
+    Character,
+    Location,
+    Object,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorBibleReference {
+    pub id: String,
+    pub kind: ReferenceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    pub approved: bool,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorBibleRevisionAction {
+    Apply,
+    Undo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorBibleRevision {
+    pub revision: u64,
+    pub id: String,
+    pub action: ColorBibleRevisionAction,
+    pub selector_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<CanonicalColorEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<CanonicalColorEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorBible {
+    pub schema_version: u32,
+    pub id: String,
+    pub series_id: String,
+    pub name: String,
+    pub revision: u64,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+    #[serde(default)]
+    pub colors: BTreeMap<String, CanonicalColorEntry>,
+    #[serde(default)]
+    pub references: Vec<ColorBibleReference>,
+    #[serde(default)]
+    pub history: Vec<ColorBibleRevision>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColorBibleCorrection {
+    pub selector: ColorSelector,
+    pub color: ColorRgb,
+    pub confidence: f32,
+    pub source: String,
+    pub reference_ids: Vec<String>,
+    pub note: Option<String>,
+}
+
+impl ColorBible {
+    pub fn new(series_id: impl Into<String>, name: impl Into<String>) -> Result<Self> {
+        let series_id = series_id.into();
+        anyhow::ensure!(non_empty(&series_id), "series_id cannot be empty");
+        let now = Utc::now();
+        Ok(Self {
+            schema_version: COLOR_BIBLE_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            series_id,
+            name: name.into(),
+            revision: 0,
+            created_at: now,
+            updated_at: now,
+            colors: BTreeMap::new(),
+            references: Vec::new(),
+            history: Vec::new(),
+        })
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bible: Self = serde_json::from_slice(
+            &fs::read(path)
+                .with_context(|| format!("failed to read color bible {}", path.display()))?,
+        )
+        .with_context(|| format!("failed to parse color bible {}", path.display()))?;
+        anyhow::ensure!(
+            bible.schema_version == COLOR_BIBLE_SCHEMA_VERSION,
+            "unsupported color bible schema {}",
+            bible.schema_version
+        );
+        Ok(bible)
+    }
+
+    pub fn load_or_create(
+        path: impl AsRef<Path>,
+        series_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        if path.is_file() {
+            Self::load(path)
+        } else {
+            let bible = Self::new(series_id, name)?;
+            bible.save(path)?;
+            Ok(bible)
+        }
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("failed to write {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("failed to commit color bible {}", path.display()))
+    }
+
+    pub fn apply_correction(&mut self, correction: ColorBibleCorrection) -> Result<u64> {
+        correction.selector.validate()?;
+        anyhow::ensure!(
+            correction.confidence.is_finite(),
+            "correction confidence must be finite"
+        );
+        let selector_key = correction.selector.stable_key();
+        let previous = self.colors.get(&selector_key).cloned();
+        let now = Utc::now();
+        let current = CanonicalColorEntry {
+            id: previous
+                .as_ref()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            selector: correction.selector,
+            color: correction.color,
+            confidence: correction.confidence.clamp(0.0, 1.0),
+            source: correction.source,
+            reference_ids: correction.reference_ids,
+            updated_at: now,
+        };
+        self.colors.insert(selector_key.clone(), current.clone());
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        self.history.push(ColorBibleRevision {
+            revision: self.revision,
+            id: Uuid::new_v4().to_string(),
+            action: ColorBibleRevisionAction::Apply,
+            selector_key,
+            previous,
+            current: Some(current),
+            target_revision: None,
+            note: correction.note,
+            created_at: now,
+        });
+        Ok(self.revision)
+    }
+
+    pub fn undo_last(&mut self) -> Result<u64> {
+        let undone = self
+            .history
+            .iter()
+            .filter_map(|revision| {
+                (revision.action == ColorBibleRevisionAction::Undo)
+                    .then_some(revision.target_revision)
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let target = self
+            .history
+            .iter()
+            .rev()
+            .find(|revision| {
+                revision.action == ColorBibleRevisionAction::Apply
+                    && !undone.contains(&revision.revision)
+            })
+            .cloned()
+            .context("color bible has no active correction to undo")?;
+        let before_undo = self.colors.get(&target.selector_key).cloned();
+        if let Some(previous) = target.previous.clone() {
+            self.colors.insert(target.selector_key.clone(), previous);
+        } else {
+            self.colors.remove(&target.selector_key);
+        }
+        let now = Utc::now();
+        self.revision = self.revision.saturating_add(1);
+        self.updated_at = now;
+        self.history.push(ColorBibleRevision {
+            revision: self.revision,
+            id: Uuid::new_v4().to_string(),
+            action: ColorBibleRevisionAction::Undo,
+            selector_key: target.selector_key,
+            previous: before_undo,
+            current: target.previous,
+            target_revision: Some(target.revision),
+            note: Some(format!("undo revision {}", target.revision)),
+            created_at: now,
+        });
+        Ok(self.revision)
+    }
+
+    pub fn resolve_color(&self, context: &ColorContext<'_>) -> Option<&CanonicalColorEntry> {
+        self.colors
+            .values()
+            .filter_map(|entry| {
+                selector_match_score(&entry.selector, context).map(|score| (entry, score))
+            })
+            .max_by(|(left, left_score), (right, right_score)| {
+                left_score
+                    .cmp(right_score)
+                    .then_with(|| left.confidence.total_cmp(&right.confidence))
+                    .then_with(|| left.updated_at.cmp(&right.updated_at))
+            })
+            .map(|(entry, _)| entry)
+    }
+
+    pub fn add_reference(&mut self, reference: ColorBibleReference) -> Result<()> {
+        anyhow::ensure!(
+            !reference.path.as_os_str().is_empty(),
+            "reference path is empty"
+        );
+        if let Some(existing) = self
+            .references
+            .iter_mut()
+            .find(|existing| existing.id == reference.id)
+        {
+            *existing = reference;
+        } else {
+            self.references.push(reference);
+        }
+        self.updated_at = Utc::now();
+        Ok(())
+    }
+}
+
+fn selector_match_score(selector: &ColorSelector, context: &ColorContext<'_>) -> Option<u16> {
+    let matches = |expected: Option<&str>, actual: Option<&str>| {
+        expected.is_none_or(|value| actual.is_some_and(|other| value.eq_ignore_ascii_case(other)))
+    };
+    if !matches(selector.page_id.as_deref(), context.page_id)
+        || !matches(selector.chapter_id.as_deref(), context.chapter_id)
+        || !matches(selector.character_id.as_deref(), context.character_id)
+        || !matches(selector.location_id.as_deref(), context.location_id)
+        || !matches(selector.object_id.as_deref(), context.object_id)
+        || !matches(selector.region_id.as_deref(), context.region_id)
+        || !matches(selector.semantic.as_deref(), context.semantic)
+    {
+        return None;
+    }
+    match selector.scope {
+        CorrectionScope::Region
+            if selector.page_id.as_deref().is_none_or(|value| {
+                context
+                    .page_id
+                    .is_some_and(|other| value.eq_ignore_ascii_case(other))
+            }) && selector.region_id.as_deref().is_none_or(|value| {
+                context
+                    .region_id
+                    .is_some_and(|other| value.eq_ignore_ascii_case(other))
+            }) => {}
+        CorrectionScope::Character
+            if selector.character_id.as_deref().is_some_and(|value| {
+                context
+                    .character_id
+                    .is_some_and(|other| value.eq_ignore_ascii_case(other))
+            }) => {}
+        CorrectionScope::Chapter
+            if selector.chapter_id.as_deref().is_some_and(|value| {
+                context
+                    .chapter_id
+                    .is_some_and(|other| value.eq_ignore_ascii_case(other))
+            }) => {}
+        CorrectionScope::Series => {}
+        _ => return None,
+    }
+    let qualifiers = [
+        selector.page_id.is_some(),
+        selector.chapter_id.is_some(),
+        selector.character_id.is_some(),
+        selector.location_id.is_some(),
+        selector.object_id.is_some(),
+        selector.region_id.is_some(),
+        selector.semantic.is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count() as u16;
+    Some(selector.scope.priority() as u16 * 100 + qualifiers)
+}
+
+fn normalized(value: Option<&str>) -> &str {
+    value.map(str::trim).unwrap_or("")
+}
+
+fn non_empty(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +1029,103 @@ mod tests {
             PathBuf::from("hints").join("page_001.hints.json")
         );
         assert_eq!(rows[0].correction_count, 1);
+    }
+
+    fn correction(
+        scope: CorrectionScope,
+        page: Option<&str>,
+        chapter: Option<&str>,
+        character: Option<&str>,
+        region: Option<&str>,
+        semantic: &str,
+        color: ColorRgb,
+    ) -> ColorBibleCorrection {
+        ColorBibleCorrection {
+            selector: ColorSelector {
+                scope,
+                page_id: page.map(str::to_string),
+                chapter_id: chapter.map(str::to_string),
+                character_id: character.map(str::to_string),
+                location_id: None,
+                object_id: None,
+                region_id: region.map(str::to_string),
+                semantic: Some(semantic.to_string()),
+                region: None,
+            },
+            color,
+            confidence: 0.95,
+            source: "test".to_string(),
+            reference_ids: Vec::new(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn color_bible_resolves_most_specific_scope_and_undo_restores_previous() {
+        let mut bible = ColorBible::new("series-a", "Series A").unwrap();
+        bible
+            .apply_correction(correction(
+                CorrectionScope::Series,
+                None,
+                None,
+                None,
+                None,
+                "hair",
+                ColorRgb::new(20, 20, 30),
+            ))
+            .unwrap();
+        bible
+            .apply_correction(correction(
+                CorrectionScope::Character,
+                None,
+                None,
+                Some("hero"),
+                None,
+                "hair",
+                ColorRgb::new(180, 40, 30),
+            ))
+            .unwrap();
+        let context = ColorContext {
+            page_id: Some("page-1"),
+            chapter_id: Some("chapter-1"),
+            character_id: Some("hero"),
+            semantic: Some("hair"),
+            ..ColorContext::default()
+        };
+        assert_eq!(
+            bible.resolve_color(&context).unwrap().color,
+            ColorRgb::new(180, 40, 30)
+        );
+
+        bible.undo_last().unwrap();
+        assert_eq!(
+            bible.resolve_color(&context).unwrap().color,
+            ColorRgb::new(20, 20, 30)
+        );
+        assert_eq!(bible.history.len(), 3);
+    }
+
+    #[test]
+    fn color_bible_round_trips_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("series").join("color-bible.json");
+        let mut bible = ColorBible::new("series-b", "Series B").unwrap();
+        bible
+            .apply_correction(correction(
+                CorrectionScope::Region,
+                Some("page-1"),
+                Some("chapter-1"),
+                None,
+                Some("region-7"),
+                "clothing",
+                ColorRgb::new(20, 90, 180),
+            ))
+            .unwrap();
+        bible.save(&path).unwrap();
+        let loaded = ColorBible::load(&path).unwrap();
+        assert_eq!(loaded.series_id, "series-b");
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.colors.len(), 1);
+        assert!(!path.with_extension("json.tmp").exists());
     }
 }

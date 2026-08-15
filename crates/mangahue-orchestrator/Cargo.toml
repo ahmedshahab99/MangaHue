@@ -19,6 +19,7 @@ mangahue-eval = { path = "../mangahue-eval" }
 mangahue-hints = { path = "../mangahue-hints" }
 mangahue-image = { path = "../mangahue-image" }
 mangahue-inference = { path = "../mangahue-inference" }
+mangahue-intelligence = { path = "../mangahue-intelligence" }
 mangahue-layout = { path = "../mangahue-layout" }
 mangahue-memory = { path = "../mangahue-memory" }
 mangahue-postprocess = { path = "../mangahue-postprocess" }

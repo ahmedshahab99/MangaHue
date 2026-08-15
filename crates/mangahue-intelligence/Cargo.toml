@@ -11,6 +11,7 @@ image.workspace = true
 mangahue-brain = { path = "../mangahue-brain" }
 mangahue-core = { path = "../mangahue-core" }
 mangahue-hints = { path = "../mangahue-hints" }
+mangahue-memory = { path = "../mangahue-memory" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

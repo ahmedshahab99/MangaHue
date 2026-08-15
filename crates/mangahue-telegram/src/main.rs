@@ -5,12 +5,18 @@ use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode}
 use mangahue_ingest::{
     extract_manga_tags, extract_manga_urls, validate_public_url, SafePublicResolver,
 };
+use mangahue_intelligence::{plan_correction_impact, StructureGraph};
+use mangahue_memory::{
+    ColorBible, ColorBibleCorrection, ColorBibleReference, ColorSelector, CorrectionScope,
+    ReferenceKind,
+};
 use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
 use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -284,7 +290,7 @@ struct DailyUsage {
     pages: HashMap<i64, usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PerChatSettings {
     style_path: Option<PathBuf>,
     batch_size: usize,
@@ -293,6 +299,16 @@ struct PerChatSettings {
     palette_path: Option<PathBuf>,
     /// Auto-select the artist palette from the page fingerprint.
     auto_palette: bool,
+    #[serde(default)]
+    active_series_id: Option<String>,
+    #[serde(default)]
+    active_chapter_id: Option<String>,
+    #[serde(default)]
+    last_page_id: Option<String>,
+    #[serde(default)]
+    color_bible_path: Option<PathBuf>,
+    #[serde(default)]
+    last_structure_graph_path: Option<PathBuf>,
 }
 
 /// A job waiting for a free worker slot (FIFO, shared across all chats).
@@ -465,11 +481,8 @@ impl BotState {
     fn get_settings(&self, chat_id: i64, default_batch: usize) -> PerChatSettings {
         let settings = lock_or_recover(&self.per_chat_settings);
         let mut result = settings.get(&chat_id).cloned().unwrap_or(PerChatSettings {
-            style_path: None,
             batch_size: default_batch,
-            reference_image: None,
-            palette_path: None,
-            auto_palette: false,
+            ..PerChatSettings::default()
         });
         if result
             .reference_image
@@ -484,11 +497,8 @@ impl BotState {
     fn set_reference_image(&self, chat_id: i64, path: PathBuf) {
         let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
-            reference_image: None,
-            palette_path: None,
-            auto_palette: false,
+            ..PerChatSettings::default()
         });
         entry.reference_image = Some(path);
         self.persist_settings_locked(chat_id, &settings);
@@ -497,11 +507,8 @@ impl BotState {
     fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
         let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
-            reference_image: None,
-            palette_path: None,
-            auto_palette: false,
+            ..PerChatSettings::default()
         });
         entry.style_path = path;
         self.persist_settings_locked(chat_id, &settings);
@@ -510,11 +517,8 @@ impl BotState {
     fn set_palette(&self, chat_id: i64, path: Option<PathBuf>, auto: bool) {
         let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
-            reference_image: None,
-            palette_path: None,
-            auto_palette: false,
+            ..PerChatSettings::default()
         });
         entry.palette_path = path;
         entry.auto_palette = auto;
@@ -524,13 +528,32 @@ impl BotState {
     fn set_batch_size(&self, chat_id: i64, size: usize) {
         let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            style_path: None,
             batch_size: DEFAULT_BATCH_SIZE,
-            reference_image: None,
-            palette_path: None,
-            auto_palette: false,
+            ..PerChatSettings::default()
         });
         entry.batch_size = size.clamp(1, 10);
+        self.persist_settings_locked(chat_id, &settings);
+    }
+
+    fn set_color_context(
+        &self,
+        chat_id: i64,
+        series_id: String,
+        chapter_id: String,
+        page_id: Option<String>,
+        bible_path: PathBuf,
+        graph_path: Option<PathBuf>,
+    ) {
+        let mut settings = lock_or_recover(&self.per_chat_settings);
+        let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
+            batch_size: DEFAULT_BATCH_SIZE,
+            ..PerChatSettings::default()
+        });
+        entry.active_series_id = Some(series_id);
+        entry.active_chapter_id = Some(chapter_id);
+        entry.last_page_id = page_id;
+        entry.color_bible_path = Some(bible_path);
+        entry.last_structure_graph_path = graph_path;
         self.persist_settings_locked(chat_id, &settings);
     }
 
@@ -1404,6 +1427,9 @@ fn handle_command(
         "/resetref" => cmd_reset_reference(client, token, args, state, chat_id),
         "/memory" => cmd_memory(client, token, args, chat_id),
         "/color" => cmd_color(client, token, args, chat_id, &arg),
+        "/bible" => cmd_color_bible(client, token, state, chat_id),
+        "/correct" => cmd_color_bible_correction(client, token, state, chat_id, &arg),
+        "/undo" => cmd_color_bible_undo(client, token, state, chat_id),
         "/rate" => cmd_rate(client, token, args, chat_id, &arg),
         _ => {
             send_message(
@@ -1472,6 +1498,219 @@ fn cmd_memory(client: &Client, token: &str, args: &Args, chat_id: i64) -> Result
             .to_string()
     };
     send_message(client, token, chat_id, &text, None)?;
+    Ok(())
+}
+
+fn cmd_color_bible(
+    client: &Client,
+    token: &str,
+    state: &Arc<BotState>,
+    chat_id: i64,
+) -> Result<()> {
+    let settings = state.get_settings(chat_id, DEFAULT_BATCH_SIZE);
+    let Some(path) = settings.color_bible_path else {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "No active Color Bible yet. Send a chapter link first.",
+            None,
+        )?;
+        return Ok(());
+    };
+    let bible = ColorBible::load(&path)?;
+    send_message(
+        client,
+        token,
+        chat_id,
+        &format!(
+            "Color Bible: {}\nSeries: {}\nRevision: {}\nCanonical colors: {}\nApproved references: {}",
+            bible.name,
+            bible.series_id,
+            bible.revision,
+            bible.colors.len(),
+            bible.references.iter().filter(|item| item.approved).count()
+        ),
+        None,
+    )?;
+    Ok(())
+}
+
+fn parse_correction_scope(value: &str) -> Option<CorrectionScope> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "region" | "this_region" => Some(CorrectionScope::Region),
+        "character" | "this_character" => Some(CorrectionScope::Character),
+        "chapter" | "this_chapter" => Some(CorrectionScope::Chapter),
+        "series" | "future" | "every_future_chapter" => Some(CorrectionScope::Series),
+        _ => None,
+    }
+}
+
+fn color_selector_from_tap(
+    graph: &StructureGraph,
+    x: f32,
+    y: f32,
+    scope: CorrectionScope,
+    character_override: Option<&str>,
+) -> Result<ColorSelector> {
+    let node = graph
+        .node_at(x, y)
+        .with_context(|| "no correctable region was detected at that coordinate")?;
+    let semantic = node
+        .kind
+        .semantic()
+        .with_context(|| "the selected region has no color identity")?
+        .to_string();
+    let character_id = character_override
+        .map(str::to_string)
+        .or_else(|| node.character_id.clone());
+    let selector = match scope {
+        CorrectionScope::Region => ColorSelector {
+            scope,
+            page_id: Some(graph.page_id.clone()),
+            chapter_id: graph.chapter_id.clone(),
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: Some(node.id.clone()),
+            semantic: Some(semantic),
+            region: Some(node.normalized_bounds),
+        },
+        CorrectionScope::Character => ColorSelector {
+            scope,
+            page_id: None,
+            chapter_id: None,
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+        CorrectionScope::Chapter => ColorSelector {
+            scope,
+            page_id: None,
+            chapter_id: graph.chapter_id.clone(),
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+        CorrectionScope::Series => ColorSelector {
+            scope,
+            page_id: None,
+            chapter_id: None,
+            character_id,
+            location_id: node.location_id.clone(),
+            object_id: node.object_id.clone(),
+            region_id: None,
+            semantic: Some(semantic),
+            region: None,
+        },
+    };
+    selector.validate()?;
+    Ok(selector)
+}
+
+fn cmd_color_bible_correction(
+    client: &Client,
+    token: &str,
+    state: &Arc<BotState>,
+    chat_id: i64,
+    arg: &str,
+) -> Result<()> {
+    let parts = arg.split_whitespace().collect::<Vec<_>>();
+    if parts.len() < 4 {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "Usage: /correct <x> <y> <#RRGGBB> <region|character|chapter|series> [character-id]. Coordinates are 0..1 on the last delivered page.",
+            None,
+        )?;
+        return Ok(());
+    }
+    let x = parts[0].parse::<f32>().unwrap_or(-1.0);
+    let y = parts[1].parse::<f32>().unwrap_or(-1.0);
+    if !(0.0..=1.0).contains(&x) || !(0.0..=1.0).contains(&y) {
+        anyhow::bail!("correction coordinates must be between 0 and 1");
+    }
+    let color = parts[2]
+        .parse::<mangahue_core::ColorRgb>()
+        .map_err(anyhow::Error::from)?;
+    let scope = parse_correction_scope(parts[3])
+        .context("scope must be region, character, chapter, or series")?;
+    let settings = state.get_settings(chat_id, DEFAULT_BATCH_SIZE);
+    let bible_path = settings
+        .color_bible_path
+        .context("no active Color Bible; send a chapter link first")?;
+    let graph_path = settings
+        .last_structure_graph_path
+        .context("no delivered page graph is available yet")?;
+    let graph = StructureGraph::load(graph_path)?;
+    let selector = color_selector_from_tap(&graph, x, y, scope, parts.get(4).copied())?;
+    let semantic = selector
+        .semantic
+        .clone()
+        .unwrap_or_else(|| "region".to_string());
+    let mut bible = ColorBible::load(&bible_path)?;
+    let graphs_root = bible_path
+        .parent()
+        .map(|parent| parent.join("graphs"))
+        .unwrap_or_else(|| PathBuf::from("graphs"));
+    let impact = plan_correction_impact(&graphs_root, &selector)?;
+    bible.apply_correction(ColorBibleCorrection {
+        selector,
+        color,
+        confidence: 1.0,
+        source: "telegram_tap_correction".to_string(),
+        reference_ids: Vec::new(),
+        note: Some(format!("chat {chat_id} correction on last delivered page")),
+    })?;
+    bible.save(&bible_path)?;
+    send_message(
+        client,
+        token,
+        chat_id,
+        &format!(
+            "Saved {} = {} at {} scope (Color Bible revision {}). {} region(s) on {} known page(s) are affected; resend that chapter to rerender only those matches.",
+            semantic,
+            color.to_hex(),
+            parts[3],
+            bible.revision,
+            impact.affected_regions,
+            impact.affected_pages
+        ),
+        None,
+    )?;
+    Ok(())
+}
+
+fn cmd_color_bible_undo(
+    client: &Client,
+    token: &str,
+    state: &Arc<BotState>,
+    chat_id: i64,
+) -> Result<()> {
+    let settings = state.get_settings(chat_id, DEFAULT_BATCH_SIZE);
+    let path = settings
+        .color_bible_path
+        .context("no active Color Bible; send a chapter link first")?;
+    let mut bible = ColorBible::load(&path)?;
+    bible.undo_last()?;
+    bible.save(&path)?;
+    send_message(
+        client,
+        token,
+        chat_id,
+        &format!(
+            "Last Color Bible correction undone. Revision {} is active.",
+            bible.revision
+        ),
+        None,
+    )?;
     Ok(())
 }
 
@@ -1584,6 +1823,8 @@ fn cmd_color(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str)
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
+    file.source_width = Some(1000);
+    file.source_height = Some(1000);
     file.hints.push(mangahue_core::ColorHint {
         x: (x * 1000.0) as u32,
         y: (y * 1000.0) as u32,
@@ -1632,6 +1873,27 @@ fn save_reference_photo(
     std::fs::write(&local_path, &bytes).context("failed to save reference photo")?;
 
     state.set_reference_image(chat_id, local_path.clone());
+    if let Some(bible_path) = state
+        .get_settings(chat_id, args.batch_size)
+        .color_bible_path
+    {
+        let mut bible = ColorBible::load(&bible_path)?;
+        bible.add_reference(ColorBibleReference {
+            id: format!("chat_{chat_id}_approved_reference"),
+            kind: ReferenceKind::Style,
+            entity_id: None,
+            path: local_path.clone(),
+            sha256: Some(
+                Sha256::digest(&bytes)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            ),
+            approved: true,
+            created_at: Utc::now(),
+        })?;
+        bible.save(bible_path)?;
+    }
     Ok(local_path)
 }
 
@@ -1789,7 +2051,33 @@ fn handle_photo(
         .reference_image
         .clone()
         .filter(|p| !p.as_os_str().is_empty());
-
+    let image_series_id = settings
+        .active_series_id
+        .clone()
+        .unwrap_or_else(|| format!("chat_{chat_id}_uploads"));
+    let image_chapter_id = settings
+        .active_chapter_id
+        .clone()
+        .unwrap_or_else(|| "standalone_uploads".to_string());
+    let image_page_id = format!("upload_{job_id}");
+    let image_color_bible_path = settings.color_bible_path.clone().unwrap_or_else(|| {
+        args.work_dir
+            .join("color-bibles")
+            .join(format!("chat_{chat_id}"))
+            .join(&image_series_id)
+            .join("color-bible.json")
+    });
+    ColorBible::load_or_create(
+        &image_color_bible_path,
+        image_series_id.clone(),
+        image_series_id.clone(),
+    )?;
+    let image_structure_graph_path = image_color_bible_path
+        .parent()
+        .unwrap_or(&args.work_dir)
+        .join("graphs")
+        .join(&image_chapter_id)
+        .join(format!("{image_page_id}.json"));
     let output_path = output_dir.join("image.png");
     let (progress_sender, mut progress_receiver) =
         tokio::sync::mpsc::unbounded_channel::<ProgressUpdate>();
@@ -1836,6 +2124,12 @@ fn handle_photo(
         style_path: style_path.clone(),
         project_path: args.project.clone(),
         region_locks_path: None,
+        series_id: Some(image_series_id.clone()),
+        chapter_id: Some(image_chapter_id.clone()),
+        page_id: Some(image_page_id.clone()),
+        color_bible_path: Some(image_color_bible_path.clone()),
+        structure_graph_output_path: Some(image_structure_graph_path.clone()),
+        color_bible_consistency_threshold: Some(0.62),
         user_hints_path: resolve_user_hints(args, chat_id, "image"),
         use_mock_backend: args.mock,
         pyramid_enabled: args.pyramid,
@@ -1903,6 +2197,14 @@ fn handle_photo(
                 );
             } else {
                 state.record_pages(chat_id, 1);
+                state.set_color_context(
+                    chat_id,
+                    image_series_id,
+                    image_chapter_id,
+                    Some(image_page_id),
+                    image_color_bible_path,
+                    Some(image_structure_graph_path),
+                );
                 let _ = edit_message_with_markup(
                     client,
                     token,
@@ -1967,6 +2269,9 @@ fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -
                 /clean \\- Delete all your job data from the server\n\
                 /resetref \\- Clear your reference style photo\n\
                 /memory \\- Show learned correction memory\n\
+                /bible \\- Show the active series Color Bible\n\
+                /correct _x y hex scope_ \\- Correct the last page at region, character, chapter, or series scope\n\
+                /undo \\- Undo the last Color Bible correction\n\
                 /color _x y radius hex_ \\- Add a correction for future pages\n\
                 /rate _1\\-5 note_ \\- Record a blind beta quality rating\n\n\
                 *How it works:*\n\
@@ -2594,6 +2899,59 @@ fn normalize_madara_url(url: &url::Url) -> String {
     cleaned.to_string()
 }
 
+fn stable_context_id(prefix: &str, value: &str, label: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    let short_hash = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let slug = label
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let slug = slug.trim_matches('_');
+    let slug = if slug.is_empty() { prefix } else { slug };
+    format!("{prefix}_{slug}_{short_hash}")
+}
+
+fn color_bible_context(source_url: &url::Url) -> (String, String) {
+    let mut canonical = source_url.clone();
+    canonical.set_query(None);
+    canonical.set_fragment(None);
+    let segments = canonical
+        .path_segments()
+        .map(|parts| {
+            parts
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let chapter_label = segments
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "chapter".to_string());
+    let series_label = segments
+        .get(segments.len().saturating_sub(2))
+        .cloned()
+        .or_else(|| canonical.host_str().map(str::to_string))
+        .unwrap_or_else(|| "series".to_string());
+    let mut series_url = canonical.clone();
+    if segments.len() > 1 {
+        series_url.set_path(&format!("/{}/", segments[..segments.len() - 1].join("/")));
+    }
+    (
+        stable_context_id("series", series_url.as_str(), &series_label),
+        stable_context_id("chapter", canonical.as_str(), &chapter_label),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_link(
     client: &Client,
@@ -2644,6 +3002,50 @@ fn handle_link(
         .reference_image
         .clone()
         .filter(|p| !p.as_os_str().is_empty());
+
+    let (series_id, chapter_id) = color_bible_context(&source_url);
+    let color_bible_dir = args
+        .work_dir
+        .join("color-bibles")
+        .join(format!("chat_{chat_id}"))
+        .join(&series_id);
+    let color_bible_path = color_bible_dir.join("color-bible.json");
+    let structure_graph_dir = color_bible_dir.join("graphs").join(&chapter_id);
+    std::fs::create_dir_all(&structure_graph_dir).with_context(|| {
+        format!(
+            "failed to create Color Bible graph directory {}",
+            structure_graph_dir.display()
+        )
+    })?;
+    let mut color_bible = ColorBible::load_or_create(
+        &color_bible_path,
+        series_id.clone(),
+        if job_title.is_empty() {
+            series_id.clone()
+        } else {
+            job_title.clone()
+        },
+    )?;
+    if let Some(reference_path) = reference_image.as_ref() {
+        color_bible.add_reference(ColorBibleReference {
+            id: format!("chat_{chat_id}_approved_reference"),
+            kind: ReferenceKind::Style,
+            entity_id: None,
+            path: reference_path.clone(),
+            sha256: None,
+            approved: true,
+            created_at: Utc::now(),
+        })?;
+        color_bible.save(&color_bible_path)?;
+    }
+    state.set_color_context(
+        chat_id,
+        series_id.clone(),
+        chapter_id.clone(),
+        None,
+        color_bible_path.clone(),
+        None,
+    );
 
     send_chat_action(client, token, chat_id, "typing")?;
     let scan_msg_id = send_message(
@@ -2809,6 +3211,9 @@ fn handle_link(
             .and_then(|v| v.to_str())
             .unwrap_or("page");
         let output_path = output_dir.join(format!("{stem}.png"));
+        let page_id = format!("{chapter_id}:page_{:03}", position + 1);
+        let structure_graph_path =
+            structure_graph_dir.join(format!("page_{:03}.json", position + 1));
 
         let (progress_sender, mut progress_receiver) =
             tokio::sync::mpsc::unbounded_channel::<ProgressUpdate>();
@@ -2858,6 +3263,12 @@ fn handle_link(
             style_path: style_path.clone(),
             project_path: args.project.clone(),
             region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
+            series_id: Some(series_id.clone()),
+            chapter_id: Some(chapter_id.clone()),
+            page_id: Some(page_id.clone()),
+            color_bible_path: Some(color_bible_path.clone()),
+            structure_graph_output_path: Some(structure_graph_path.clone()),
+            color_bible_consistency_threshold: Some(0.62),
             user_hints_path: resolve_user_hints(args, chat_id, stem),
             use_mock_backend: args.mock,
             pyramid_enabled: args.pyramid,
@@ -2991,6 +3402,14 @@ fn handle_link(
                     c.failed += 1;
                 } else {
                     c.sent += 1;
+                    state.set_color_context(
+                        chat_id,
+                        series_id.clone(),
+                        chapter_id.clone(),
+                        Some(page_id.clone()),
+                        color_bible_path.clone(),
+                        Some(structure_graph_path.clone()),
+                    );
                     // Quota is charged only for pages actually delivered:
                     // retrying failed pages must not double-charge.
                     state.record_pages(chat_id, 1);
@@ -3418,6 +3837,34 @@ fn purge_expired_user_data(work_dir: &Path, retention_hours: u64) -> Result<()> 
         for directory in directories {
             if directory != root {
                 let _ = std::fs::remove_dir(&directory);
+            }
+        }
+    }
+    prune_missing_color_bible_references(&work_dir.join("color-bibles"))?;
+    Ok(())
+}
+
+fn prune_missing_color_bible_references(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .with_context(|| format!("failed to inspect {}", directory.display()))?
+        {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some("color-bible.json") {
+                let mut bible = ColorBible::load(&path)?;
+                let before = bible.references.len();
+                bible
+                    .references
+                    .retain(|reference| reference.path.is_file());
+                if bible.references.len() != before {
+                    bible.save(&path)?;
+                }
             }
         }
     }
@@ -4232,6 +4679,55 @@ mod tests {
     }
 
     #[test]
+    fn chapter_urls_share_a_series_bible_but_not_a_chapter_id() {
+        let first = url::Url::parse("https://reader.test/manga/hero/chapter-1/").unwrap();
+        let second = url::Url::parse("https://reader.test/manga/hero/chapter-2/").unwrap();
+        let (first_series, first_chapter) = color_bible_context(&first);
+        let (second_series, second_chapter) = color_bible_context(&second);
+        assert_eq!(first_series, second_series);
+        assert_ne!(first_chapter, second_chapter);
+    }
+
+    #[test]
+    fn tap_correction_builds_character_scope_from_structure_graph() {
+        let graph = StructureGraph {
+            schema_version: mangahue_intelligence::STRUCTURE_GRAPH_SCHEMA_VERSION,
+            series_id: Some("series".to_string()),
+            chapter_id: Some("chapter".to_string()),
+            page_id: "page".to_string(),
+            input_path: PathBuf::from("page.png"),
+            size: mangahue_core::ImageSize::new(100, 100),
+            lighting: "neutral".to_string(),
+            nodes: vec![mangahue_intelligence::StructureNode {
+                id: "hero_hair".to_string(),
+                kind: mangahue_intelligence::StructureNodeKind::Hair,
+                bounds: mangahue_core::BoundingBox::new(10, 10, 30, 30),
+                normalized_bounds: mangahue_memory::NormalizedRegion {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.3,
+                    height: 0.3,
+                },
+                confidence: 0.9,
+                parent_id: None,
+                panel_id: None,
+                character_id: Some("hero".to_string()),
+                location_id: None,
+                object_id: None,
+                protected: false,
+                source: "test".to_string(),
+                mask_runs: Vec::new(),
+            }],
+            edges: Vec::new(),
+        };
+        let selector =
+            color_selector_from_tap(&graph, 0.2, 0.2, CorrectionScope::Character, None).unwrap();
+        assert_eq!(selector.character_id.as_deref(), Some("hero"));
+        assert_eq!(selector.semantic.as_deref(), Some("hair"));
+        assert!(selector.page_id.is_none());
+    }
+
+    #[test]
     fn creative_rotation_cycles_deterministically_per_chat() {
         // Build a BotState with a styles dir containing the creative styles.
         let dir = tempfile::tempdir().unwrap();
@@ -4405,6 +4901,23 @@ mod tests {
         let usage = dir.path().join("usage").join("daily.json");
         std::fs::create_dir_all(usage.parent().unwrap()).unwrap();
         std::fs::write(&usage, b"{}").unwrap();
+        let reference = dir.path().join("references/nested/user-image.bin");
+        let bible_path = dir
+            .path()
+            .join("color-bibles/chat_1/series/color-bible.json");
+        let mut bible = ColorBible::new("series", "Series").unwrap();
+        bible
+            .add_reference(ColorBibleReference {
+                id: "ref".to_string(),
+                kind: ReferenceKind::Style,
+                entity_id: None,
+                path: reference,
+                sha256: None,
+                approved: true,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        bible.save(&bible_path).unwrap();
 
         purge_expired_user_data(dir.path(), 0).unwrap();
 
@@ -4412,6 +4925,7 @@ mod tests {
         assert!(!dir.path().join("quality/nested/user-image.bin").exists());
         assert!(!dir.path().join("references/nested/user-image.bin").exists());
         assert!(usage.exists());
+        assert!(ColorBible::load(bible_path).unwrap().references.is_empty());
     }
 
     #[test]
