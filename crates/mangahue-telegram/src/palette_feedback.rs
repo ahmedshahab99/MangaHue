@@ -95,7 +95,7 @@ pub fn extract_accent_palette(image: &RgbImage) -> Vec<ColorRgb> {
         let b = (sums[bin][2] / *count as f64).round().clamp(0.0, 255.0) as u8;
         candidates.push((*count, ColorRgb::new(r, g, b)));
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates.truncate(10);
     candidates.into_iter().map(|(_, color)| color).collect()
 }
