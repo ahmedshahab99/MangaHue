@@ -429,7 +429,7 @@ fn resize_area(src: &GrayImage, dw: u32, dh: u32) -> GrayImage {
                     n += 1;
                 }
             }
-            dst.put_pixel(x, y, Luma([if n > 0 { (acc / n) as u8 } else { 0 }]));
+            dst.put_pixel(x, y, Luma([acc.checked_div(n).unwrap_or(0) as u8]));
         }
     }
     dst

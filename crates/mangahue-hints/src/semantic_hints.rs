@@ -362,7 +362,7 @@ mod tests {
         let mask = rasterize_face_mask(&[[20, 30, 40, 50]], 100, 100);
 
         for (x, y, pixel) in mask.enumerate_pixels() {
-            if x < 20 || x >= 60 || y < 30 || y >= 80 {
+            if !(20..60).contains(&x) || !(30..80).contains(&y) {
                 assert_eq!(pixel[0], 0, "painted outside face box at {x},{y}");
             }
         }

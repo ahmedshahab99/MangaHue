@@ -395,6 +395,16 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
     if input.config.despeckle_color_specks {
         remove_color_specks(&mut output, input.line_mask);
     }
+    if let Some(protected_mask) = input.protected_mask {
+        report.protected_pixels_restored = restore_protected_paper_and_ink(
+            &mut output,
+            input.original_grayscale,
+            input.line_mask,
+            input.bubble_mask,
+            protected_mask,
+        );
+    }
+    enforce_strong_ink(&mut output, input.line_mask);
     measure_purity(
         &output,
         &semantic_evidence,
@@ -448,8 +458,8 @@ fn measure_purity(
                     retention_sum += (o_mag / e_mag).min(3.0) as f64;
                 }
                 // Opponent-space hue angle difference.
-                let e_angle = e_mag.atan2((e[2] as f32 - el) as f32);
-                let o_angle = o_mag.atan2((o[2] as f32 - ol) as f32);
+                let e_angle = e_mag.atan2(e[2] as f32 - el);
+                let o_angle = o_mag.atan2(o[2] as f32 - ol);
                 let mut delta = (e_angle - o_angle).abs();
                 while delta > std::f32::consts::PI {
                     delta -= std::f32::consts::PI * 2.0;
@@ -861,16 +871,69 @@ pub fn clean_speech_bubbles(
         if bubble_mask.get_pixel(x, y)[0] == 0 {
             continue;
         }
+        let original = original_gray.get_pixel(x, y)[0];
         let chroma = pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
-        if chroma >= 14 {
+        let luma = (pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3;
+        if chroma >= 14 && luma < 225 {
             continue;
         }
-        let original_luma = original_gray.get_pixel(x, y)[0] as f32;
-        let t = (original_luma / 255.0).powf(1.4).clamp(0.0, 1.0);
-        for c in 0..3 {
-            pixel[c] = blend(pixel[c], 255, t);
-        }
         *bubble_pixels_restored += 1;
+        if original < 200 {
+            continue;
+        }
+        let paper = original.max(250);
+        *pixel = Rgb([paper, paper, paper]);
+    }
+}
+
+/// Last-mile safety layer. It runs after every color-producing pass and only
+/// restores protected pixels that are evidenced as bubble paper, bright
+/// paper, or ink. A broad/uncertain protected mask therefore cannot erase
+/// legitimate midtone material color.
+fn restore_protected_paper_and_ink(
+    image: &mut RgbImage,
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+    bubble_mask: &GrayImage,
+    protected_mask: &GrayImage,
+) -> u64 {
+    let mut restored = 0;
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if protected_mask.get_pixel(x, y)[0] == 0 {
+            continue;
+        }
+        let original = original_gray.get_pixel(x, y)[0];
+        let bubble = bubble_mask.get_pixel(x, y)[0] > 0;
+        let ink = line_mask.get_pixel(x, y)[0] > 0 || original < 72;
+        let paper = original >= 228;
+        if !bubble && !ink && !paper {
+            continue;
+        }
+        let neutral = if bubble {
+            let chroma =
+                pixel[0].max(pixel[1]).max(pixel[2]) - pixel[0].min(pixel[1]).min(pixel[2]);
+            let luma = (pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3;
+            if original >= 72 && chroma >= 14 && luma < 225 {
+                continue;
+            }
+            original.max(250)
+        } else {
+            original
+        };
+        *pixel = Rgb([neutral, neutral, neutral]);
+        restored += 1;
+    }
+    restored
+}
+
+/// Strong manga ink is an invariant, not a style choice. The adaptive pass
+/// keeps anti-aliased edges, while this final floor removes residual colored
+/// ink left by inference or sharpening.
+fn enforce_strong_ink(image: &mut RgbImage, line_mask: &GrayImage) {
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        if line_mask.get_pixel(x, y)[0] >= 96 {
+            *pixel = Rgb([32, 32, 32]);
+        }
     }
 }
 
@@ -1501,7 +1564,7 @@ pub fn preserve_screentones(
         let tone_strength = blend * (0.52 + 0.16 * (1.0 - original_luma / 255.0));
         let target_luma =
             colored_luma + (original_luma - colored_luma) * tone_strength.clamp(0.0, 0.72);
-        let mut chroma = [
+        let chroma = [
             pixel[0] as f32 - colored_luma,
             pixel[1] as f32 - colored_luma,
             pixel[2] as f32 - colored_luma,
@@ -1533,7 +1596,6 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     if w < 3 || h < 3 || line_mask.dimensions() != (w, h) {
         return;
     }
-    const MAX_SPECKSIZE: u32 = 6;
     const DENSITY_WINDOW: u32 = 15;
     const MAX_DENSITY: f32 = 0.18;
     let idx = |x: u32, y: u32| (y * w + x) as usize;
@@ -1888,7 +1950,7 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
             60.0 * ((r - g) / delta + 4.0)
         };
         let hue = hue.rem_euclid(360.0);
-        if hue < 60.0 || hue > 250.0 {
+        if !(60.0..=250.0).contains(&hue) {
             strong[i] = true;
         }
     }
@@ -1961,7 +2023,7 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
             (cy as i32 + WINDOW).min(h as i32 - 1),
         );
         let mut target = [0u8; 3];
-        for channel in 0..3 {
+        for (channel, value) in target.iter_mut().enumerate() {
             window.clear();
             for yy in y0..=y1 {
                 for xx in x0..=x1 {
@@ -1969,7 +2031,7 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
                 }
             }
             window.sort_unstable();
-            target[channel] = window[window.len() / 2];
+            *value = window[window.len() / 2];
         }
         let p = work.get_pixel_mut(cx as u32, cy as u32);
         *p = Rgb(target);
@@ -2018,15 +2080,14 @@ fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u
 
         // Initial horizontal window: columns 0..=radius (clamped).
         let initial_x = radius.min(w - 1);
-        for c in 0..=initial_x {
-            let hist = &col_hists[c];
+        for hist in col_hists.iter().take(initial_x + 1) {
             for (v, count) in hist.iter().enumerate() {
                 combined[v] += count;
             }
         }
         // Horizontal slide of the combined histogram.
         let row_out = &mut out[y * w..(y + 1) * w];
-        for x in 0..w {
+        for (x, output_value) in row_out.iter_mut().enumerate().take(w) {
             if x > 0 {
                 let drop = x as i64 - radius as i64 - 1;
                 if drop >= 0 {
@@ -2048,7 +2109,7 @@ fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u
             for (v, &count) in combined.iter().enumerate() {
                 cum += count;
                 if cum >= half_n {
-                    row_out[x] = v as u8;
+                    *output_value = v as u8;
                     break;
                 }
             }
@@ -2162,7 +2223,7 @@ pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
                         60.0 * ((r - g) / delta + 4.0)
                     };
                     let hue = hue.rem_euclid(360.0);
-                    if (hue < 60.0 || hue > 340.0) && l > 40.0 {
+                    if !(60.0..=340.0).contains(&hue) && l > 40.0 {
                         warm[i] = true;
                     }
                 }
@@ -2404,12 +2465,6 @@ fn gaussian_blur_3x3(image: &RgbImage) -> RgbImage {
         }
     }
     blurred
-}
-
-fn blend(a: u8, b: u8, t: f32) -> u8 {
-    (a as f32 + (b as f32 - a as f32) * t)
-        .round()
-        .clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]

@@ -908,7 +908,7 @@ impl MangaHueEngine {
             let mut n = 0u64;
             for (x, y, pixel) in merged.enumerate_pixels() {
                 let index = y as usize * mw as usize + x as usize;
-                if index % step != 0 {
+                if !index.is_multiple_of(step) {
                     continue;
                 }
                 let r = pixel[0] as f32;
@@ -1172,7 +1172,11 @@ impl MangaHueEngine {
             Some(&hints.hint_map),
             Some(&hints.hint_mask),
         );
-        report.director_verdict = Some(director_verdict(&quality, &preprocess.report, &config));
+        let verdict = director_verdict(&quality, &preprocess.report, &config);
+        if verdict.starts_with("production_ready_with_") {
+            report.warn(format!("non-blocking quality warning: {verdict}"));
+        }
+        report.director_verdict = Some(verdict);
 
         if final_image.dimensions() != manga_image.image.dimensions() {
             let original_gray = manga_image.image.to_luma8();
@@ -1534,7 +1538,7 @@ fn select_backend_for_model(
             model_path,
             &config.inference.model_metadata_path,
         )?;
-        return Ok(Box::new(backend));
+        Ok(Box::new(backend))
     }
     #[cfg(not(feature = "native-onnx"))]
     {
@@ -1668,14 +1672,27 @@ fn director_verdict(
     preprocess: &mangahue_preprocess::PreprocessReport,
     config: &EngineConfig,
 ) -> String {
+    // Only measured output damage is delivery-blocking. Detector uncertainty
+    // is common on captions, borderless dialogue, SFX and decorative manga
+    // text; treating "text but no closed bubble" as corruption caused valid
+    // pages to disappear from chapter delivery.
     if quality.line_preservation_score < config.eval.line_preservation_threshold {
         return "needs_line_preservation_attention".to_string();
     }
     if quality.protected_region_violation_score < config.eval.protected_region_violation_threshold {
         return "needs_protected_region_cleanup".to_string();
     }
+    if preprocess.protected_coverage > 0.55 {
+        return "production_ready_with_protected_mask_warning".to_string();
+    }
+    if preprocess.bubble_regions > 0 && quality.bubble_cleanliness_score < 0.95 {
+        return "production_ready_with_bubble_cleanup_warning".to_string();
+    }
+    if preprocess.text_ink_pixels >= 64 && preprocess.bubble_regions == 0 {
+        return "production_ready_with_bubble_detection_warning".to_string();
+    }
     if quality.hint_adherence_score < config.eval.hint_adherence_threshold {
-        return "needs_stronger_hint_or_memory_guidance".to_string();
+        return "production_ready_with_hint_guidance_warning".to_string();
     }
     if preprocess.screen_tone_score > config.eval.screen_tone_warning_threshold {
         return "production_ready_with_tone_training_warning".to_string();
@@ -1751,6 +1768,7 @@ fn resolve_parallel_jobs(requested: usize) -> usize {
 /// Style2Paints ONNX models are identified by file name; the native-onnx
 /// build also verifies the file exists (see mangahue-inference). Kept here
 /// so non-native builds can still produce a clear error for them.
+#[allow(dead_code)]
 fn is_style2paints_model_name(path: &Path) -> bool {
     path.extension().and_then(|value| value.to_str()) == Some("onnx")
         && path
@@ -1774,7 +1792,7 @@ fn measure_page_colorfulness(image: &image::DynamicImage) -> (f32, f32) {
     let mut colored = 0u64;
     for (x, y, pixel) in rgb.enumerate_pixels() {
         let index = y as usize * w as usize + x as usize;
-        if index % step != 0 {
+        if !index.is_multiple_of(step) {
             continue;
         }
         let r = pixel[0] as f32 / 255.0;
@@ -1955,6 +1973,36 @@ mod tests {
     use super::*;
     use image::{GrayImage, Luma};
 
+    fn quality_report() -> mangahue_eval::QualityReport {
+        mangahue_eval::QualityReport {
+            line_preservation_score: 1.0,
+            bubble_cleanliness_score: 1.0,
+            protected_region_violation_score: 1.0,
+            hint_adherence_score: 1.0,
+            output_sharpness_estimate: 1.0,
+        }
+    }
+
+    fn preprocess_report() -> mangahue_preprocess::PreprocessReport {
+        mangahue_preprocess::PreprocessReport {
+            background_level: 255,
+            adaptive_threshold: 128,
+            line_density: 0.1,
+            ink_component_count: 1,
+            large_ink_components: 0,
+            speckle_pixels_removed: 0,
+            bubble_regions: 0,
+            bubble_coverage: 0.0,
+            text_ink_pixels: 0,
+            protected_coverage: 0.1,
+            screen_tone_score: 0.0,
+            page_complexity_score: 0.1,
+            top_ink_components: Vec::new(),
+            contour_count: 0,
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn automatic_palette_preserves_semantic_roles() {
         let base = (0..12)
@@ -2004,6 +2052,52 @@ mod tests {
         assert!(
             colored_fraction > 0.5,
             "colored page share: {colored_fraction}"
+        );
+    }
+
+    #[test]
+    fn uncertain_bubble_detection_does_not_reject_a_clean_page() {
+        let quality = quality_report();
+        let mut preprocess = preprocess_report();
+        preprocess.text_ink_pixels = 64;
+
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "production_ready_with_bubble_detection_warning"
+        );
+    }
+
+    #[test]
+    fn bubble_warning_never_hides_measured_output_damage() {
+        let mut quality = quality_report();
+        quality.line_preservation_score = 0.0;
+        quality.bubble_cleanliness_score = 0.0;
+        let mut preprocess = preprocess_report();
+        preprocess.bubble_regions = 1;
+
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "needs_line_preservation_attention"
+        );
+
+        quality.line_preservation_score = 1.0;
+        quality.protected_region_violation_score = 0.0;
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "needs_protected_region_cleanup"
+        );
+    }
+
+    #[test]
+    fn bubble_cleanup_signal_is_deliverable_when_hard_invariants_pass() {
+        let mut quality = quality_report();
+        quality.bubble_cleanliness_score = 0.5;
+        let mut preprocess = preprocess_report();
+        preprocess.bubble_regions = 1;
+
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "production_ready_with_bubble_cleanup_warning"
         );
     }
 

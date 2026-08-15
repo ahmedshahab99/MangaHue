@@ -21,7 +21,7 @@ mod mood;
 mod palette_feedback;
 mod watermark;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: usize = 10;
@@ -44,6 +44,12 @@ const TELEGRAM_RETRY_BASE_SECS: u64 = 2;
 /// `--telegram-api-base` flag / `MANGAHUE_TELEGRAM_API` env can point at a
 /// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
+
+fn delivery_quality_approved(verdict: Option<&str>) -> bool {
+    verdict.is_some_and(|verdict| {
+        verdict == "already colored" || verdict.starts_with("production_ready")
+    })
+}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DeliveryFormat {
@@ -100,7 +106,7 @@ struct Args {
         help = "Maximum bytes allowed in the ephemeral job workspace"
     )]
     scratch_limit_bytes: u64,
-    #[arg(long, default_value_t = 2016)]
+    #[arg(long, default_value_t = 100)]
     max_pages: usize,
     #[arg(long, default_value_t = 33_554_432)]
     max_bytes_per_page: u64,
@@ -142,8 +148,29 @@ struct Args {
         help = "Per-chapter palette feedback: extract the first page's dominant hues and merge them as accent colors for the rest of the chapter (creative variety, model-derived)"
     )]
     palette_feedback: bool,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 1)]
     max_concurrent_jobs: usize,
+    #[arg(
+        long,
+        default_value_t = 16,
+        help = "Maximum waiting jobs across all users"
+    )]
+    max_queued_jobs: usize,
+    #[arg(long, default_value_t = 1, help = "Maximum waiting jobs per user")]
+    max_queued_jobs_per_chat: usize,
+    #[arg(
+        long,
+        default_value_t = 24,
+        help = "Hours to retain user inputs, references, delivered copies, and quality telemetry; 0 disables diagnostic retention"
+    )]
+    retention_hours: u64,
+    #[arg(
+        long,
+        env = "MANGAHUE_ALLOWED_CHAT_IDS",
+        value_delimiter = ',',
+        help = "Invite-only Telegram chat IDs; empty allows all chats"
+    )]
+    allowed_chat_ids: Vec<i64>,
     #[arg(long, help = "Stop a chapter after the first failed page")]
     fail_fast: bool,
     #[arg(
@@ -286,6 +313,8 @@ struct BotState {
     usage_lock: Mutex<()>,
     usage_path: PathBuf,
     daily_limit: usize,
+    max_queued_jobs: usize,
+    max_queued_jobs_per_chat: usize,
     styles_dir: Option<PathBuf>,
     palettes_dir: PathBuf,
 }
@@ -297,6 +326,19 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn queue_admission_message(result: std::result::Result<usize, &'static str>) -> String {
+    match result {
+        Ok(position) => format!(
+            "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
+        ),
+        Err(message) => message.to_string(),
+    }
+}
+
+fn chat_is_allowed(args: &Args, chat_id: i64) -> bool {
+    args.allowed_chat_ids.is_empty() || args.allowed_chat_ids.contains(&chat_id)
 }
 
 impl BotState {
@@ -317,15 +359,23 @@ impl BotState {
         self.active_jobs.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Add a job to the FIFO queue. Returns its 1-based position. Multiple
-    /// jobs per chat are allowed: a chat's next queued job starts only after
-    /// its current one finishes (the dispatch deferral handles that), so
-    /// users can queue a whole chapter list without being rejected.
-    fn enqueue(&self, chat_id: i64, job: QueuedJob) -> usize {
+    /// Add a job to the bounded FIFO queue. Admission is intentionally strict
+    /// on the CPU-only production host so one user cannot monopolize disk or
+    /// keep an unbounded backlog alive.
+    fn enqueue(&self, chat_id: i64, job: QueuedJob) -> std::result::Result<usize, &'static str> {
         let mut queue = lock_or_recover(&self.queue);
+        if queue.len() >= self.max_queued_jobs {
+            return Err("MangaHue is at capacity. Please try again after a current job finishes.");
+        }
+        let queued_for_chat = queue.iter().filter(|(cid, _)| *cid == chat_id).count();
+        if queued_for_chat >= self.max_queued_jobs_per_chat {
+            return Err(
+                "You already have a job waiting. Please let it finish before adding another.",
+            );
+        }
         queue.push_back((chat_id, job));
         self.persist_queue_locked(&queue);
-        queue.len()
+        Ok(queue.len())
     }
 
     fn queue_len(&self) -> usize {
@@ -414,13 +464,21 @@ impl BotState {
 
     fn get_settings(&self, chat_id: i64, default_batch: usize) -> PerChatSettings {
         let settings = lock_or_recover(&self.per_chat_settings);
-        settings.get(&chat_id).cloned().unwrap_or(PerChatSettings {
+        let mut result = settings.get(&chat_id).cloned().unwrap_or(PerChatSettings {
             style_path: None,
             batch_size: default_batch,
             reference_image: None,
             palette_path: None,
             auto_palette: false,
-        })
+        });
+        if result
+            .reference_image
+            .as_ref()
+            .is_some_and(|path| !path.is_file())
+        {
+            result.reference_image = None;
+        }
+        result
     }
 
     fn set_reference_image(&self, chat_id: i64, path: PathBuf) {
@@ -841,6 +899,7 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(args.work_dir.join("memory")).context("failed to create memory dir")?;
     std::fs::create_dir_all(args.work_dir.join("references"))
         .context("failed to create references dir")?;
+    purge_expired_user_data(&args.work_dir, args.retention_hours)?;
     let scratch_dir = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     std::fs::create_dir_all(scratch_dir).context("failed to create scratch_dir")?;
     if args.scratch_dir.is_some() {
@@ -872,6 +931,8 @@ fn main() -> Result<()> {
         usage_lock: Mutex::new(()),
         usage_path,
         daily_limit: args.daily_limit,
+        max_queued_jobs: args.max_queued_jobs.max(1),
+        max_queued_jobs_per_chat: args.max_queued_jobs_per_chat.max(1),
         styles_dir,
         palettes_dir: args.palettes_dir.clone(),
     });
@@ -896,7 +957,14 @@ fn main() -> Result<()> {
 
     let mut offset = None;
     let mut backoff = Duration::from_secs(1);
+    let mut last_retention_purge = Instant::now();
     loop {
+        if last_retention_purge.elapsed() >= Duration::from_secs(3_600) {
+            if let Err(error) = purge_expired_user_data(&args.work_dir, args.retention_hours) {
+                tracing::warn!(error = %error, "retention purge failed");
+            }
+            last_retention_purge = Instant::now();
+        }
         match poll_once(&client, &fetch_client, &token, &args, &state, &mut offset) {
             Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => {
@@ -972,6 +1040,17 @@ fn process_update(
     update: Update,
 ) -> Result<()> {
     if let Some(cb) = update.callback_query {
+        let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(cb.from.id);
+        if !chat_is_allowed(args, chat_id) {
+            answer_callback_query(
+                client,
+                token,
+                &cb.id,
+                Some("MangaHue is currently invite-only"),
+                Some(true),
+            )?;
+            return Ok(());
+        }
         handle_callback(client, token, args, state, cb)?;
         return Ok(());
     }
@@ -981,6 +1060,16 @@ fn process_update(
     };
 
     let chat_id = message.chat.id;
+    if !chat_is_allowed(args, chat_id) {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "MangaHue is currently in a small invite-only quality beta. Access will open after the release benchmark passes.",
+            None,
+        )?;
+        return Ok(());
+    }
     let caption = message
         .caption
         .as_deref()
@@ -1068,41 +1157,25 @@ fn process_update(
         // (active_jobs never decremented) and wedges the whole bot once all
         // slots are gone.
         if state.queue_len() > 0 {
-            let position = state.enqueue(
+            let message = queue_admission_message(state.enqueue(
                 chat_id,
                 QueuedJob::Photo {
                     file_id: file_id.clone(),
                 },
-            );
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!(
-                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                ),
-                None,
-            )?;
+            ));
+            send_message(client, token, chat_id, &message, None)?;
             return Ok(());
         }
         let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
             // A slot was taken between the queue check and now — queue
             // instead of blocking (never leak the slot we did not take).
-            let position = state.enqueue(
+            let message = queue_admission_message(state.enqueue(
                 chat_id,
                 QueuedJob::Photo {
                     file_id: file_id.clone(),
                 },
-            );
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!(
-                    "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-                ),
-                None,
-            )?;
+            ));
+            send_message(client, token, chat_id, &message, None)?;
             return Ok(());
         };
         let client = client.clone();
@@ -1195,30 +1268,16 @@ fn process_update(
     // take a slot we might abandon (abandoned slots leak forever and wedge
     // the bot once all slots are gone).
     if state.queue_len() > 0 {
-        let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
-        send_message(
-            client,
-            token,
-            chat_id,
-            &format!(
-                "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-            ),
-            None,
-        )?;
+        let message =
+            queue_admission_message(state.enqueue(chat_id, QueuedJob::Link { url: url.clone() }));
+        send_message(client, token, chat_id, &message, None)?;
         return Ok(());
     }
     let Some(cancel_token) = state.try_start(chat_id, args.max_concurrent_jobs) else {
         // A slot was taken between the queue check and now — queue instead.
-        let position = state.enqueue(chat_id, QueuedJob::Link { url: url.clone() });
-        send_message(
-            client,
-            token,
-            chat_id,
-            &format!(
-                "⏳ MangaHue is busy — you are #{position} in the queue. I'll start when a slot opens."
-            ),
-            None,
-        )?;
+        let message =
+            queue_admission_message(state.enqueue(chat_id, QueuedJob::Link { url: url.clone() }));
+        send_message(client, token, chat_id, &message, None)?;
         return Ok(());
     };
 
@@ -1237,12 +1296,13 @@ fn process_update(
         QueuedJob::Link { url: url.clone() },
         cancel_token,
     );
-    return Ok(());
+    Ok(())
 }
 
 /// Spawn a job (link or photo) on a worker thread; on completion, release
 /// the chat slot and dispatch the next queued job. Errors are reported to
 /// the user instead of being dropped.
+#[allow(clippy::too_many_arguments)]
 fn spawn_job(
     client: Client,
     fetch_client: Client,
@@ -1324,7 +1384,11 @@ fn handle_command(
         .next()
         .unwrap_or(text)
         .to_lowercase();
-    let arg = text.split_whitespace().nth(1).unwrap_or("").to_string();
+    let arg = text
+        .split_once(char::is_whitespace)
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or("")
+        .to_string();
 
     match cmd.as_str() {
         "/start" => cmd_start(client, token, chat_id),
@@ -1340,6 +1404,7 @@ fn handle_command(
         "/resetref" => cmd_reset_reference(client, token, args, state, chat_id),
         "/memory" => cmd_memory(client, token, args, chat_id),
         "/color" => cmd_color(client, token, args, chat_id, &arg),
+        "/rate" => cmd_rate(client, token, args, chat_id, &arg),
         _ => {
             send_message(
                 client,
@@ -1407,6 +1472,64 @@ fn cmd_memory(client: &Client, token: &str, args: &Args, chat_id: i64) -> Result
             .to_string()
     };
     send_message(client, token, chat_id, &text, None)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BetaFeedback<'a> {
+    recorded_at: String,
+    chat_id: i64,
+    rating: u8,
+    note: &'a str,
+    release: &'a str,
+}
+
+fn cmd_rate(client: &Client, token: &str, args: &Args, chat_id: i64, arg: &str) -> Result<()> {
+    let mut parts = arg.splitn(2, char::is_whitespace);
+    let rating = parts.next().and_then(|value| value.parse::<u8>().ok());
+    let Some(rating @ 1..=5) = rating else {
+        send_message(
+            client,
+            token,
+            chat_id,
+            "Usage: /rate <1-5> [optional note]. Example: /rate 4 Great colors, but the hair changed.",
+            None,
+        )?;
+        return Ok(());
+    };
+    let note: String = parts
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(500)
+        .collect();
+    let day = Utc::now().format("%Y-%m-%d");
+    let directory = args.work_dir.join("feedback").join(day.to_string());
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    let record = BetaFeedback {
+        recorded_at: Utc::now().to_rfc3339(),
+        chat_id,
+        rating,
+        note: &note,
+        release: env!("CARGO_PKG_VERSION"),
+    };
+    let path = directory.join("ratings.jsonl");
+    use std::io::Write;
+    let mut output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    writeln!(output, "{}", serde_json::to_string(&record)?)?;
+    send_message(
+        client,
+        token,
+        chat_id,
+        "Thank you. Your blind quality rating was recorded and will be included in the beta release review.",
+        None,
+    )?;
     Ok(())
 }
 
@@ -1588,7 +1711,11 @@ fn handle_photo(
     let job_id = Uuid::new_v4().to_string();
     let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
-    let _workspace = JobWorkspace::new(job_dir.clone(), args.work_dir.clone());
+    let _workspace = JobWorkspace::new(
+        job_dir.clone(),
+        args.work_dir.clone(),
+        args.retention_hours > 0,
+    );
     let downloads_dir = job_dir.join("downloads");
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
@@ -1614,21 +1741,21 @@ fn handle_photo(
 
     if cancel_token.load(Ordering::Acquire) {
         let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
-        cleanup_dir(&job_dir);
         return Ok(());
     }
 
     // Download + validate the image.
     let bytes = fetch_telegram_file(client, token, file_id)?;
     if bytes.len() > args.max_bytes_per_page as usize {
-        cleanup_dir(&job_dir);
         anyhow::bail!("image exceeds {} bytes", args.max_bytes_per_page);
     }
     let local_path = downloads_dir.join("image.jpg");
     std::fs::write(&local_path, &bytes).context("failed to save uploaded image")?;
     // Keep the INPUT image too (the exact bytes the user sent), so quality
     // complaints can be traced back to the source.
-    let _ = retain_input_copy(&local_path, &args.work_dir);
+    if args.retention_hours > 0 {
+        let _ = retain_input_copy(&local_path, &args.work_dir);
+    }
     // Header-only dimension validation BEFORE decode: a small file with a
     // huge IHDR would otherwise allocate gigabytes at decode time.
     let (img_width, img_height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -1640,7 +1767,6 @@ fn handle_photo(
         || img_height > 50_000
         || img_width as u64 * img_height as u64 > MAX_PHOTO_PIXELS
     {
-        cleanup_dir(&job_dir);
         anyhow::bail!("image dimensions exceed security limits");
     }
     let image = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -1649,7 +1775,6 @@ fn handle_photo(
         .decode()
         .context("uploaded file is not a readable image")?;
     if image.width() < 64 || image.height() < 64 {
-        cleanup_dir(&job_dir);
         anyhow::bail!("that image is too small to colorize (minimum 64x64 px)");
     }
 
@@ -1657,7 +1782,7 @@ fn handle_photo(
     // Content-aware mood: pick the style from the photo's own lighting
     // (dark ink-heavy pages -> dark styles, bright airy pages -> pastels).
     let mood_override = mood::select_style_for_scene(&image.to_luma8())
-        .and_then(|id| resolve_style_file(&state, id));
+        .and_then(|id| resolve_style_file(state, id));
     let style_path =
         state.resolve_style_path(chat_id, &args.style, mood_override, args.creative_rotation);
     let reference_image = settings
@@ -1729,7 +1854,22 @@ fn handle_photo(
         Ok(colorize_result) => {
             if cancel_token.load(Ordering::Acquire) {
                 let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
-                cleanup_dir(&job_dir);
+                return Ok(());
+            }
+            let verdict = colorize_result.report.director_verdict.as_deref();
+            if !delivery_quality_approved(verdict) {
+                tracing::warn!(
+                    verdict = verdict.unwrap_or("missing"),
+                    "delivery blocked by quality gate"
+                );
+                let _ = edit_message_with_markup(
+                    client,
+                    token,
+                    chat_id,
+                    status_msg_id,
+                    "This result did not pass MangaHue's quality checks, so it was not delivered or counted against your quota. Please try another scan while we review the detector.",
+                    Some(r#"{"inline_keyboard":[]}"#),
+                );
                 return Ok(());
             }
             let caption = format!(
@@ -1741,9 +1881,11 @@ fn handle_photo(
             );
             let delivery_path =
                 prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
-            let kept = retain_delivered_copy(&delivery_path, &args.work_dir, 1);
-            if kept.is_some() {
-                tracing::info!(path = %kept.as_ref().unwrap().display(), "delivered copy kept");
+            let kept = (args.retention_hours > 0)
+                .then(|| retain_delivered_copy(&delivery_path, &args.work_dir, 1))
+                .flatten();
+            if let Some(kept_path) = &kept {
+                tracing::info!(path = %kept_path.display(), "delivered copy kept");
             }
             // Cosmetic typing indicator: never abort the photo job on this.
             let _ = send_chat_action(client, token, chat_id, "upload_document");
@@ -1798,7 +1940,6 @@ fn handle_photo(
             }
         }
     }
-    cleanup_dir(&job_dir);
     Ok(())
 }
 
@@ -1824,7 +1965,10 @@ fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -
                 /batch _N_ \\- Set batch size \\(1\\-10, default 10\\)\n\
                 /stats \\- Show your daily page usage\n\
                 /clean \\- Delete all your job data from the server\n\
-                /resetref \\- Clear your reference style photo\n\n\
+                /resetref \\- Clear your reference style photo\n\
+                /memory \\- Show learned correction memory\n\
+                /color _x y radius hex_ \\- Add a correction for future pages\n\
+                /rate _1\\-5 note_ \\- Record a blind beta quality rating\n\n\
                 *How it works:*\n\
                 Send a photo, a manga chapter URL, or a direct image link\\. The bot colorizes it in soft cel\\-shaded anime style and sends the result back\\.\n\n\
                 *Optional reference style:*\n\
@@ -2213,13 +2357,9 @@ fn cmd_clean(
         .work_dir
         .join("memory")
         .join(format!("chat_{chat_id}.hints.json"));
-    let mut removed_any = false;
-
     if chat_dir.exists() {
         match std::fs::remove_dir_all(&chat_dir) {
-            Ok(()) => {
-                removed_any = true;
-            }
+            Ok(()) => {}
             Err(e) => {
                 send_message(
                     client,
@@ -2233,29 +2373,21 @@ fn cmd_clean(
     }
     if ref_file.exists() {
         let _ = std::fs::remove_file(&ref_file);
-        removed_any = true;
     }
     if mem_file.exists() {
         let _ = std::fs::remove_file(&mem_file);
-        removed_any = true;
     }
     {
         let _ = lock_or_recover(&state.per_chat_settings).remove(&chat_id);
     }
     state.clear_usage(chat_id);
-    removed_any = true;
-
-    if removed_any {
-        send_message(
-            client,
-            token,
-            chat_id,
-            "All your job data, reference photo, and color memory have been cleaned up.",
-            None,
-        )?;
-    } else {
-        send_message(client, token, chat_id, "No job data found to clean.", None)?;
-    }
+    send_message(
+        client,
+        token,
+        chat_id,
+        "All your job data, reference photo, and color memory have been cleaned up.",
+        None,
+    )?;
     Ok(())
 }
 
@@ -2476,7 +2608,11 @@ fn handle_link(
     let job_id = Uuid::new_v4().to_string();
     let scratch_root = args.scratch_dir.as_ref().unwrap_or(&args.work_dir);
     let job_dir = scratch_root.join(chat_id.to_string()).join(&job_id);
-    let _workspace = JobWorkspace::new(job_dir.clone(), args.work_dir.clone());
+    let _workspace = JobWorkspace::new(
+        job_dir.clone(),
+        args.work_dir.clone(),
+        args.retention_hours > 0,
+    );
     let downloads_dir = job_dir.join("downloads");
     let output_dir = job_dir.join("colored");
     std::fs::create_dir_all(&output_dir)
@@ -2539,7 +2675,7 @@ fn handle_link(
         .map(|html| extract_manga_tags(fetch_client, &source_url, html))
         .unwrap_or_default();
     let mood_style =
-        mood::select_style_for_tags(&tags).and_then(|id| resolve_style_file(&state, id));
+        mood::select_style_for_tags(&tags).and_then(|id| resolve_style_file(state, id));
     let mood_name = mood_style
         .as_deref()
         .and_then(load_style_name)
@@ -2580,20 +2716,17 @@ fn handle_link(
         .collect();
 
     if all_image_urls.is_empty() {
-        cleanup_dir(&job_dir);
         anyhow::bail!("no page images were found at that URL");
     }
 
     let total = all_image_urls.len();
     if cancel_token.load(Ordering::Acquire) {
         let _ = edit_message(client, token, chat_id, scan_msg_id, "Cancelled.");
-        cleanup_dir(&job_dir);
         return Ok(());
     }
     let remaining = state.remaining_pages_today(chat_id);
     let effective_total = total.min(remaining);
     if effective_total == 0 {
-        cleanup_dir(&job_dir);
         anyhow::bail!(
             "daily limit of {} pages reached; you already used {} today",
             state.daily_limit,
@@ -2645,6 +2778,7 @@ fn handle_link(
     struct PageCounters {
         sent: usize,
         failed: usize,
+        quality_rejected: Vec<usize>,
         failed_pages: Vec<PathBuf>,
         page_times: Vec<f32>,
     }
@@ -2744,6 +2878,19 @@ fn handle_link(
 
         match result {
             Ok(colorize_result) => {
+                let quality_verdict = colorize_result.report.director_verdict.as_deref();
+                if !delivery_quality_approved(quality_verdict) {
+                    tracing::warn!(
+                        page = position + 1,
+                        verdict = quality_verdict.unwrap_or("missing"),
+                        "chapter page blocked by quality gate"
+                    );
+                    c.failed += 1;
+                    c.quality_rejected.push(position + 1);
+                    let _ = std::fs::remove_file(&output_path);
+                    let _ = std::fs::remove_file(local_path);
+                    return Ok(args.fail_fast);
+                }
                 // Chapter palette feedback: seed the accents from the first
                 // colored page so later pages of this chapter share its
                 // color universe (deterministic per job, model-derived).
@@ -2768,7 +2915,6 @@ fn handle_link(
                         &format!("Cancelled after {} page(s).", c.sent),
                         Some(r#"{"inline_keyboard":[]}"#),
                     );
-                    cleanup_dir(&job_dir);
                     return Ok(true);
                 }
                 let verdict = colorize_result
@@ -2829,10 +2975,13 @@ fn handle_link(
                 // <work_dir>/delivered/YYYY-MM-DD/ so quality complaints can
                 // be traced to the actual delivered bytes (the scratch space
                 // is wiped after the job).
-                let kept =
-                    retain_delivered_copy(&delivery_path, &args.work_dir, position as u32 + 1);
-                if kept.is_some() {
-                    tracing::info!(page = position + 1, path = %kept.as_ref().unwrap().display(), "delivered copy kept");
+                let kept = (args.retention_hours > 0)
+                    .then(|| {
+                        retain_delivered_copy(&delivery_path, &args.work_dir, position as u32 + 1)
+                    })
+                    .flatten();
+                if let Some(kept_path) = &kept {
+                    tracing::info!(page = position + 1, path = %kept_path.display(), "delivered copy kept");
                 }
                 ensure_scratch_budget(scratch_root, args.scratch_limit_bytes)?;
                 // Cosmetic typing indicator: never abort the chapter on this.
@@ -2862,7 +3011,6 @@ fn handle_link(
                         "Cancelled.",
                         Some(r#"{"inline_keyboard":[]}"#),
                     );
-                    cleanup_dir(&job_dir);
                     return Ok(true);
                 }
                 // Evidence for undecodable pages: file existence, size and
@@ -2886,7 +3034,6 @@ fn handle_link(
                 c.failed += 1;
                 c.failed_pages.push(local_path.clone());
                 if args.fail_fast {
-                    cleanup_dir(&job_dir);
                     return Err(error);
                 }
             }
@@ -2922,7 +3069,6 @@ fn handle_link(
                 "Cancelled.",
                 Some(r#"{"inline_keyboard":[]}"#),
             );
-            cleanup_dir(&job_dir);
             return Ok(());
         }
 
@@ -2962,7 +3108,6 @@ fn handle_link(
 
         for (position, page) in &batch_pages {
             if process_page(*position, page, batch_idx)? {
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
         }
@@ -3000,7 +3145,6 @@ fn handle_link(
         }
         for (position, page) in &recovered {
             if process_page(*position, page, total_batches)? {
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
         }
@@ -3008,8 +3152,6 @@ fn handle_link(
             let _ = std::fs::remove_file(path);
         }
     }
-
-    cleanup_dir(&job_dir);
 
     let elapsed = total_start.elapsed().as_secs_f32();
     let completion_kb = InlineKeyboardMarkup {
@@ -3023,10 +3165,25 @@ fn handle_link(
         elapsed,
         counters.borrow().sent
     );
-    if counters.borrow().failed > 0 {
+    let quality_rejected = counters.borrow().quality_rejected.clone();
+    let other_failures = counters
+        .borrow()
+        .failed
+        .saturating_sub(quality_rejected.len());
+    if !quality_rejected.is_empty() {
+        let pages = quality_rejected
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        final_text.push_str(&format!(
+            " The safety gate withheld page\\(s\\) `{pages}` because measured line or protected\\-region damage remained\\."
+        ));
+    }
+    if other_failures > 0 {
         final_text.push_str(&format!(
             " *{}* page\\(s\\) failed\\. Send the URL again to retry failed pages\\.",
-            counters.borrow().failed
+            other_failures
         ));
     }
 
@@ -3108,7 +3265,7 @@ fn estimate_eta(times: &[f32], done: usize, total: usize) -> Option<f32> {
 }
 
 /// Append every `*.quality.json` report the engine wrote into `job_dir` to
-/// `<work_dir>/quality/<YYYY-MM>/telemetry.jsonl` before the scratch space is
+/// `<work_dir>/quality/<YYYY-MM-DD>/<job>.jsonl` before the scratch space is
 /// wiped. Keeps per-page quality data (line preservation, bubble cleanliness,
 /// sharpness…) so tuning decisions are grounded in real telemetry instead of
 /// anecdote.
@@ -3135,23 +3292,21 @@ fn retain_quality_telemetry(job_dir: &Path, work_dir: &Path) {
     if files.is_empty() {
         return;
     }
-    let month = Utc::now().format("%Y-%m");
-    let dir = work_dir.join("quality").join(month.to_string());
+    let day = Utc::now().format("%Y-%m-%d");
+    let dir = work_dir.join("quality").join(day.to_string());
     let Ok(_) = std::fs::create_dir_all(&dir) else {
         return;
     };
-    let log_path = dir.join("telemetry.jsonl");
-    let Ok(mut log) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    else {
+    let log_path = dir.join(format!("{}.jsonl", Uuid::new_v4()));
+    let Ok(mut log) = std::fs::File::create(&log_path) else {
         return;
     };
     use std::io::Write;
     for file in files {
         if let Ok(json) = std::fs::read_to_string(&file) {
-            let _ = writeln!(log, "{json}");
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+                let _ = writeln!(log, "{value}");
+            }
         }
     }
 }
@@ -3165,17 +3320,24 @@ fn cleanup_dir(path: &Path) {
 struct JobWorkspace {
     path: PathBuf,
     work_dir: PathBuf,
+    retain_telemetry: bool,
 }
 
 impl JobWorkspace {
-    fn new(path: PathBuf, work_dir: PathBuf) -> Self {
-        Self { path, work_dir }
+    fn new(path: PathBuf, work_dir: PathBuf, retain_telemetry: bool) -> Self {
+        Self {
+            path,
+            work_dir,
+            retain_telemetry,
+        }
     }
 }
 
 impl Drop for JobWorkspace {
     fn drop(&mut self) {
-        retain_quality_telemetry(&self.path, &self.work_dir);
+        if self.retain_telemetry {
+            retain_quality_telemetry(&self.path, &self.work_dir);
+        }
         cleanup_dir(&self.path);
         if let Some(chat_dir) = self.path.parent() {
             let _ = std::fs::remove_dir(chat_dir);
@@ -3195,6 +3357,68 @@ fn cleanup_stale_scratch(root: &Path) -> Result<()> {
             std::fs::remove_file(&path).with_context(|| {
                 format!("failed to remove stale scratch file {}", path.display())
             })?;
+        }
+    }
+    Ok(())
+}
+
+/// Enforce a finite lifetime for every retained user image and diagnostic.
+/// Only product-owned retention directories are traversed; configuration,
+/// quota ledgers, and the executable release tree are never touched.
+fn purge_expired_user_data(work_dir: &Path, retention_hours: u64) -> Result<()> {
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_hours.saturating_mul(3_600)))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut roots = ["delivered", "quality", "references"]
+        .into_iter()
+        .map(|name| work_dir.join(name))
+        .collect::<Vec<_>>();
+    // Older releases retained job workspaces directly under
+    // `<work_dir>/<chat-id>/<job-id>`. Numeric top-level directories are
+    // user-owned legacy data, so include them without traversing named
+    // configuration, quota, settings, feedback, or memory directories.
+    if work_dir.is_dir() {
+        for entry in std::fs::read_dir(work_dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.parse::<i64>().is_ok())
+            {
+                roots.push(entry.path());
+            }
+        }
+    }
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        let mut pending = vec![root.clone()];
+        let mut directories = Vec::new();
+        while let Some(directory) = pending.pop() {
+            directories.push(directory.clone());
+            for entry in std::fs::read_dir(&directory)
+                .with_context(|| format!("failed to inspect {}", directory.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if retention_hours == 0
+                    || metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH) <= cutoff
+                {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("failed to purge {}", path.display()))?;
+                }
+            }
+        }
+        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for directory in directories {
+            if directory != root {
+                let _ = std::fs::remove_dir(&directory);
+            }
         }
     }
     Ok(())
@@ -3595,7 +3819,7 @@ fn restore_persisted_queue(state: &BotState) -> usize {
         // The queue file is now authoritative again (dedup may have shrunk
         // it, and dispatch will keep it updated from here on).
         state.persist_queue();
-        return restored;
+        restored
     }
 }
 
@@ -4029,6 +4253,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: Some(dir.path().to_path_buf()),
             palettes_dir: dir.path().join("palettes"),
         };
@@ -4064,6 +4290,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
@@ -4081,7 +4309,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_is_fifo_and_allows_multiple_jobs_per_chat() {
+    fn queue_is_fifo_and_enforces_admission_limits() {
         let state = BotState {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
@@ -4091,14 +4319,19 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
+            max_queued_jobs: 4,
+            max_queued_jobs_per_chat: 2,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
-        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "a".into() }), 1);
-        assert_eq!(state.enqueue(2, QueuedJob::Link { url: "b".into() }), 2);
+        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "a".into() }), Ok(1));
+        assert_eq!(state.enqueue(2, QueuedJob::Link { url: "b".into() }), Ok(2));
         // The same chat may queue several links; each starts after the
         // previous one finishes (dispatch defers jobs of active chats).
-        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "c".into() }), 3);
+        assert_eq!(state.enqueue(1, QueuedJob::Link { url: "c".into() }), Ok(3));
+        assert!(state
+            .enqueue(1, QueuedJob::Link { url: "d".into() })
+            .is_err());
         assert_eq!(state.queue_len(), 3);
         // FIFO order: chat 1's second job sits behind chat 2's job.
         assert_eq!(state.queue_position(2), Some(1));
@@ -4107,6 +4340,95 @@ mod tests {
         assert_eq!(state.dequeue(1), 2);
         assert_eq!(state.queue_len(), 1);
         assert_eq!(state.dequeue(1), 0);
+    }
+
+    #[test]
+    fn delivery_gate_fails_closed() {
+        assert!(delivery_quality_approved(Some("production_ready_preview")));
+        assert!(delivery_quality_approved(Some(
+            "production_ready_with_tone_training_warning"
+        )));
+        assert!(delivery_quality_approved(Some(
+            "production_ready_with_bubble_detection_warning"
+        )));
+        assert!(delivery_quality_approved(Some(
+            "production_ready_with_bubble_cleanup_warning"
+        )));
+        assert!(!delivery_quality_approved(None));
+        assert!(!delivery_quality_approved(Some(
+            "needs_protected_region_cleanup"
+        )));
+    }
+
+    #[test]
+    fn job_workspace_retains_quality_report_before_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("retained");
+        let job_dir = dir.path().join("scratch").join("1").join("job");
+        std::fs::create_dir_all(&job_dir).unwrap();
+
+        {
+            let _workspace = JobWorkspace::new(job_dir.clone(), work_dir.clone(), true);
+            std::fs::write(
+                job_dir.join("page.quality.json"),
+                br#"{"director_verdict":"production_ready_preview"}"#,
+            )
+            .unwrap();
+        }
+
+        assert!(!job_dir.exists());
+        let day_dirs = std::fs::read_dir(work_dir.join("quality"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(day_dirs.len(), 1);
+        let reports = std::fs::read_dir(&day_dirs[0])
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        assert!(std::fs::read_to_string(&reports[0])
+            .unwrap()
+            .contains("production_ready_preview"));
+    }
+
+    #[test]
+    fn zero_retention_purges_user_images_only() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["delivered", "quality", "references"] {
+            let path = dir.path().join(name).join("nested");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("user-image.bin"), b"private").unwrap();
+        }
+        let usage = dir.path().join("usage").join("daily.json");
+        std::fs::create_dir_all(usage.parent().unwrap()).unwrap();
+        std::fs::write(&usage, b"{}").unwrap();
+
+        purge_expired_user_data(dir.path(), 0).unwrap();
+
+        assert!(!dir.path().join("delivered/nested/user-image.bin").exists());
+        assert!(!dir.path().join("quality/nested/user-image.bin").exists());
+        assert!(!dir.path().join("references/nested/user-image.bin").exists());
+        assert!(usage.exists());
+    }
+
+    #[test]
+    fn retention_purges_legacy_chat_workspaces_without_touching_named_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("12345").join("job-id").join("downloads");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let uploaded = legacy.join("page.jpg");
+        std::fs::write(&uploaded, b"user-image").unwrap();
+        let settings = dir.path().join("settings").join("chat_12345.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, b"{}").unwrap();
+
+        purge_expired_user_data(dir.path(), 0).unwrap();
+
+        assert!(!uploaded.exists());
+        assert!(settings.exists());
     }
 
     #[test]
@@ -4121,6 +4443,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
@@ -4157,6 +4481,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 100,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: Some(dir.path().to_path_buf()),
             palettes_dir: dir.path().to_path_buf(),
         });
@@ -4293,6 +4619,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 0,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
@@ -4333,6 +4661,8 @@ mod tests {
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 0,
+            max_queued_jobs: 16,
+            max_queued_jobs_per_chat: 1,
             styles_dir: None,
             palettes_dir: PathBuf::from("configs/palettes"),
         };
@@ -4340,7 +4670,7 @@ mod tests {
         let cancel = state.try_start(1, 1).unwrap();
         // Chat 2 is queued (as the fixed call sites do when the queue is
         // non-empty): it must not hold a slot.
-        state.enqueue(
+        let _ = state.enqueue(
             2,
             QueuedJob::Photo {
                 file_id: "b".into(),

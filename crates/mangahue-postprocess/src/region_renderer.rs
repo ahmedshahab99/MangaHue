@@ -848,6 +848,7 @@ fn accumulate_region(
     stats.touches_border |= x == 0 || y == 0 || x + 1 == width || y + 1 == height;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_region_color(
     region: &RegionStats,
     palette: &[(f32, f32, f32)],

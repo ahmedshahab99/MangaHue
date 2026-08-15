@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "samples": [
+    {
+      "id": "replace-with-private-page-id",
+      "lineart": "lineart/page-001.png",
+      "reference": "reference/page-001.png",
+      "license": {
+        "rights_holder": "replace with rights holder",
+        "usage_grant": "replace with written evaluation grant identifier",
+        "proof": "rights/replace-with-private-proof-document"
+      },
+      "candidates": {
+        "mangahue": "candidates/mangahue/page-001.png",
+        "ddcolor": "candidates/ddcolor/page-001.png"
+      }
+    }
+  ]
+}

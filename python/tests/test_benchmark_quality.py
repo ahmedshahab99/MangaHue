@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from mangahue_train.benchmark_quality import enforce_gate, evaluate_manifest
@@ -75,3 +76,36 @@ def test_gate_rejects_insufficient_pages_and_missing_baseline(tmp_path: Path) ->
 
     assert any("pages" in failure for failure in failures)
     assert any("baseline" in failure for failure in failures)
+
+
+def test_licensed_gate_requires_complete_rights_records(tmp_path: Path) -> None:
+    pixels = np.full((8, 8, 3), 128, dtype=np.uint8)
+    for name in ("lineart.png", "reference.png", "candidate.png"):
+        _write(tmp_path / name, pixels)
+    sample = {
+        "id": "licensed-page",
+        "lineart": "lineart.png",
+        "reference": "reference.png",
+        "candidates": {"mangahue": "candidate.png"},
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"schema_version": 2, "samples": [sample]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="license record is required"):
+        evaluate_manifest(manifest_path, "mangahue")
+
+    sample["license"] = {
+        "rights_holder": "Example rights holder",
+        "usage_grant": "Written evaluation-only grant",
+        "proof": "rights/grant-001.pdf",
+    }
+    manifest_path.write_text(
+        json.dumps({"schema_version": 2, "samples": [sample]}),
+        encoding="utf-8",
+    )
+    report = evaluate_manifest(manifest_path, "mangahue")
+
+    assert report["licensed_pages"] == 1
+    assert not enforce_gate(report, 1, 1.0, 0.99, 0.99, None, require_licensed=True)

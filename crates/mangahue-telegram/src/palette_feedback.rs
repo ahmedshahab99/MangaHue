@@ -36,7 +36,7 @@ pub fn extract_accent_palette(image: &RgbImage) -> Vec<ColorRgb> {
     }
 
     let mut sums = vec![[0.0f64; 4]; BINS]; // r, g, b, weight
-    let mut counts = vec![0u64; BINS];
+    let mut counts = [0u64; BINS];
     let mut total = 0u64;
 
     for pixel in small.pixels() {
@@ -95,7 +95,7 @@ pub fn extract_accent_palette(image: &RgbImage) -> Vec<ColorRgb> {
         let b = (sums[bin][2] / *count as f64).round().clamp(0.0, 255.0) as u8;
         candidates.push((*count, ColorRgb::new(r, g, b)));
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates.truncate(10);
     candidates.into_iter().map(|(_, color)| color).collect()
 }

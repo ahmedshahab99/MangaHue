@@ -3118,7 +3118,7 @@ fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
     {
         // DDColor ONNX runs natively through the Rust ort backend; the
         // Python sidecar is not part of this build.
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(feature = "native-onnx"))]
     {

@@ -241,7 +241,7 @@ fn normalize_nhentai_url(src: &str) -> String {
 
     // Collapse thumbnail marker + repeated extensions in the filename.
     let cleaned = cleanup_nhentai_filename(parsed.path());
-    let _ = parsed.set_path(&cleaned);
+    parsed.set_path(&cleaned);
     parsed.to_string()
 }
 
@@ -255,10 +255,7 @@ fn cleanup_nhentai_filename(path: &str) -> String {
     // Strip repeated known extensions, keeping the last one.
     let mut ext: Option<&str> = None;
     let mut stem = file;
-    loop {
-        let Some((s, e)) = stem.rsplit_once('.') else {
-            break;
-        };
+    while let Some((s, e)) = stem.rsplit_once('.') {
         if matches!(
             e.to_ascii_lowercase().as_str(),
             "webp" | "jpg" | "jpeg" | "png" | "gif"
@@ -1357,11 +1354,7 @@ mod tests {
             .expect("chapter HTML should fetch");
         assert!(html.contains("reading-content"));
         let urls = extract_madara(&client, &url, &html, &url, 500).unwrap();
-        assert!(
-            urls.len() >= 10,
-            "expected many pages, got {}",
-            urls.len()
-        );
+        assert!(urls.len() >= 10, "expected many pages, got {}", urls.len());
         assert!(
             urls[0].contains("WP-manga/data"),
             "unexpected first URL: {}",
