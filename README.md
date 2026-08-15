@@ -1,5 +1,7 @@
 # MangaHue Engine
 
+See [Color Bible Engine](docs/COLOR_BIBLE_ENGINE.md) for the chapter-aware consistency, protected-compositing, correction-propagation, and release-gate workflow.
+
 MangaHue Engine is a Rust-first manga colorization intelligence layer. It does not treat colorization as a single "upload image, run model" step. The engine cleans line art, protects ink and speech bubbles, builds hint tensors, tiles large pages, coordinates model backends, restores manga structure, and writes reports that can improve later passes.
 
 This repository currently contains the first production-shaped slice:

@@ -398,19 +398,33 @@ fn process_manifest_pages(
             request.colorize_template.region_locks_path.as_deref(),
             &manifest.pages[index].input_path,
         );
+        configure_color_bible_page(&mut colorize, &manifest, index);
         let result = engine.colorize(colorize);
         match result {
             Ok(result) => {
-                manifest.pages[index].status = ChapterPageStatus::Complete;
+                let verdict = result.report.director_verdict.clone();
+                let approved = delivery_quality_approved(verdict.as_deref());
+                manifest.pages[index].status = if approved {
+                    ChapterPageStatus::Complete
+                } else {
+                    ChapterPageStatus::Failed
+                };
                 manifest.pages[index].total_ms = start.elapsed().as_millis();
                 manifest.pages[index].tiles = result.report.tiles_count;
-                manifest.pages[index].verdict = result.report.director_verdict;
+                manifest.pages[index].verdict = verdict.clone();
                 manifest.pages[index].quality_report_path = result.quality_report_path;
                 manifest.pages[index].report_path = Some(mangahue_image::sibling_with_suffix(
                     &manifest.pages[index].output_path,
                     ".report",
                     "json",
                 ));
+                if !approved {
+                    manifest.pages[index].error = Some(format!(
+                        "delivery blocked by quality gate: {}",
+                        verdict.as_deref().unwrap_or("missing verdict")
+                    ));
+                    let _ = fs::remove_file(&manifest.pages[index].output_path);
+                }
             }
             Err(error) => {
                 manifest.pages[index].status = ChapterPageStatus::Failed;
@@ -609,22 +623,37 @@ fn run_consistency_retry(
             request.colorize_template.region_locks_path.as_deref(),
             &manifest.pages[index].input_path,
         );
+        configure_color_bible_page(&mut colorize, manifest, index);
 
         match engine.colorize(colorize) {
             Ok(result) => {
-                manifest.pages[index].status = ChapterPageStatus::Complete;
+                let verdict = result.report.director_verdict.clone();
+                let approved = delivery_quality_approved(verdict.as_deref());
+                manifest.pages[index].status = if approved {
+                    ChapterPageStatus::Complete
+                } else {
+                    ChapterPageStatus::Failed
+                };
                 manifest.pages[index].total_ms = start.elapsed().as_millis();
                 manifest.pages[index].tiles = result.report.tiles_count;
-                manifest.pages[index].verdict = result.report.director_verdict;
+                manifest.pages[index].verdict = verdict.clone();
                 manifest.pages[index].quality_report_path = result.quality_report_path;
                 manifest.pages[index].report_path = Some(mangahue_image::sibling_with_suffix(
                     &manifest.pages[index].output_path,
                     ".report",
                     "json",
                 ));
-                manifest.pages[index].consistency_retry_count += 1;
-                manifest.consistency_retried += 1;
-                retried += 1;
+                if approved {
+                    manifest.pages[index].consistency_retry_count += 1;
+                    manifest.consistency_retried += 1;
+                    retried += 1;
+                } else {
+                    manifest.pages[index].error = Some(format!(
+                        "delivery blocked by quality gate: {}",
+                        verdict.as_deref().unwrap_or("missing verdict")
+                    ));
+                    let _ = fs::remove_file(&manifest.pages[index].output_path);
+                }
             }
             Err(error) => {
                 manifest.pages[index].status = ChapterPageStatus::Failed;
@@ -636,6 +665,39 @@ fn run_consistency_retry(
         save_job_manifest(manifest, manifest_path)?;
     }
     Ok(retried)
+}
+
+fn configure_color_bible_page(
+    colorize: &mut ColorizeRequest,
+    manifest: &ChapterJobManifest,
+    page_index: usize,
+) {
+    if colorize.color_bible_path.is_none() && colorize.structure_graph_output_path.is_none() {
+        return;
+    }
+    let page = &manifest.pages[page_index];
+    let stem = page
+        .input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("page_{:04}", page.index));
+    colorize.page_id = Some(format!("{}:{stem}", manifest.id));
+    colorize
+        .chapter_id
+        .get_or_insert_with(|| manifest.id.clone());
+    colorize.structure_graph_output_path = Some(
+        manifest
+            .output_dir
+            .join("structure-graphs")
+            .join(format!("{stem}.json")),
+    );
+}
+
+fn delivery_quality_approved(verdict: Option<&str>) -> bool {
+    verdict.is_some_and(|verdict| {
+        verdict == "already colored" || verdict.starts_with("production_ready")
+    })
 }
 
 fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
