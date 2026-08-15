@@ -29,7 +29,7 @@ ExecStartPre=/usr/bin/install -d -m 0700 /run/mangahue-pro/jobs /run/mangahue-pr
 # per-chapter palette feedback (each manga carries its own accent hues).
 # Rollback is an atomic symlink change: point /opt/MangaHue-current at a
 # previous directory under /opt/MangaHue-releases and restart this unit.
-ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 30 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.telegram-pure-model-v2.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
+ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 0 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.telegram-pure-model-v2.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30

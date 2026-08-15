@@ -25,7 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 const DEFAULT_BATCH_SIZE: usize = 10;
-const DEFAULT_DAILY_PAGE_LIMIT: usize = 30;
+const DEFAULT_DAILY_PAGE_LIMIT: usize = 0;
 const DIRECT_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tiff", "tif"];
 /// Cap for user-supplied photos and URL images. 32 MP keeps the full-res
 /// reconstruction buffers (five f32 planes) under ~0.7 GB on the 5.4 GB VPS
