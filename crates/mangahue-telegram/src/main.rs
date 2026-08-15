@@ -46,15 +46,9 @@ const TELEGRAM_RETRY_BASE_SECS: u64 = 2;
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
 
 fn delivery_quality_approved(verdict: Option<&str>) -> bool {
-    matches!(
-        verdict,
-        Some(
-            "production_ready_preview"
-                | "production_ready_with_tone_training_warning"
-                | "production_ready"
-                | "already colored"
-        )
-    )
+    verdict.is_some_and(|verdict| {
+        verdict == "already colored" || verdict.starts_with("production_ready")
+    })
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1747,14 +1741,12 @@ fn handle_photo(
 
     if cancel_token.load(Ordering::Acquire) {
         let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
-        cleanup_dir(&job_dir);
         return Ok(());
     }
 
     // Download + validate the image.
     let bytes = fetch_telegram_file(client, token, file_id)?;
     if bytes.len() > args.max_bytes_per_page as usize {
-        cleanup_dir(&job_dir);
         anyhow::bail!("image exceeds {} bytes", args.max_bytes_per_page);
     }
     let local_path = downloads_dir.join("image.jpg");
@@ -1775,7 +1767,6 @@ fn handle_photo(
         || img_height > 50_000
         || img_width as u64 * img_height as u64 > MAX_PHOTO_PIXELS
     {
-        cleanup_dir(&job_dir);
         anyhow::bail!("image dimensions exceed security limits");
     }
     let image = image::ImageReader::new(std::io::Cursor::new(&bytes))
@@ -1784,7 +1775,6 @@ fn handle_photo(
         .decode()
         .context("uploaded file is not a readable image")?;
     if image.width() < 64 || image.height() < 64 {
-        cleanup_dir(&job_dir);
         anyhow::bail!("that image is too small to colorize (minimum 64x64 px)");
     }
 
@@ -1864,7 +1854,6 @@ fn handle_photo(
         Ok(colorize_result) => {
             if cancel_token.load(Ordering::Acquire) {
                 let _ = edit_message(client, token, chat_id, status_msg_id, "Cancelled.");
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
             let verdict = colorize_result.report.director_verdict.as_deref();
@@ -1881,7 +1870,6 @@ fn handle_photo(
                     "This result did not pass MangaHue's quality checks, so it was not delivered or counted against your quota. Please try another scan while we review the detector.",
                     Some(r#"{"inline_keyboard":[]}"#),
                 );
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
             let caption = format!(
@@ -1952,7 +1940,6 @@ fn handle_photo(
             }
         }
     }
-    cleanup_dir(&job_dir);
     Ok(())
 }
 
@@ -2729,20 +2716,17 @@ fn handle_link(
         .collect();
 
     if all_image_urls.is_empty() {
-        cleanup_dir(&job_dir);
         anyhow::bail!("no page images were found at that URL");
     }
 
     let total = all_image_urls.len();
     if cancel_token.load(Ordering::Acquire) {
         let _ = edit_message(client, token, chat_id, scan_msg_id, "Cancelled.");
-        cleanup_dir(&job_dir);
         return Ok(());
     }
     let remaining = state.remaining_pages_today(chat_id);
     let effective_total = total.min(remaining);
     if effective_total == 0 {
-        cleanup_dir(&job_dir);
         anyhow::bail!(
             "daily limit of {} pages reached; you already used {} today",
             state.daily_limit,
@@ -2794,6 +2778,7 @@ fn handle_link(
     struct PageCounters {
         sent: usize,
         failed: usize,
+        quality_rejected: Vec<usize>,
         failed_pages: Vec<PathBuf>,
         page_times: Vec<f32>,
     }
@@ -2901,6 +2886,7 @@ fn handle_link(
                         "chapter page blocked by quality gate"
                     );
                     c.failed += 1;
+                    c.quality_rejected.push(position + 1);
                     let _ = std::fs::remove_file(&output_path);
                     let _ = std::fs::remove_file(local_path);
                     return Ok(args.fail_fast);
@@ -2929,7 +2915,6 @@ fn handle_link(
                         &format!("Cancelled after {} page(s).", c.sent),
                         Some(r#"{"inline_keyboard":[]}"#),
                     );
-                    cleanup_dir(&job_dir);
                     return Ok(true);
                 }
                 let verdict = colorize_result
@@ -3026,7 +3011,6 @@ fn handle_link(
                         "Cancelled.",
                         Some(r#"{"inline_keyboard":[]}"#),
                     );
-                    cleanup_dir(&job_dir);
                     return Ok(true);
                 }
                 // Evidence for undecodable pages: file existence, size and
@@ -3050,7 +3034,6 @@ fn handle_link(
                 c.failed += 1;
                 c.failed_pages.push(local_path.clone());
                 if args.fail_fast {
-                    cleanup_dir(&job_dir);
                     return Err(error);
                 }
             }
@@ -3086,7 +3069,6 @@ fn handle_link(
                 "Cancelled.",
                 Some(r#"{"inline_keyboard":[]}"#),
             );
-            cleanup_dir(&job_dir);
             return Ok(());
         }
 
@@ -3126,7 +3108,6 @@ fn handle_link(
 
         for (position, page) in &batch_pages {
             if process_page(*position, page, batch_idx)? {
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
         }
@@ -3164,7 +3145,6 @@ fn handle_link(
         }
         for (position, page) in &recovered {
             if process_page(*position, page, total_batches)? {
-                cleanup_dir(&job_dir);
                 return Ok(());
             }
         }
@@ -3172,8 +3152,6 @@ fn handle_link(
             let _ = std::fs::remove_file(path);
         }
     }
-
-    cleanup_dir(&job_dir);
 
     let elapsed = total_start.elapsed().as_secs_f32();
     let completion_kb = InlineKeyboardMarkup {
@@ -3187,10 +3165,25 @@ fn handle_link(
         elapsed,
         counters.borrow().sent
     );
-    if counters.borrow().failed > 0 {
+    let quality_rejected = counters.borrow().quality_rejected.clone();
+    let other_failures = counters
+        .borrow()
+        .failed
+        .saturating_sub(quality_rejected.len());
+    if !quality_rejected.is_empty() {
+        let pages = quality_rejected
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        final_text.push_str(&format!(
+            " The safety gate withheld page\\(s\\) `{pages}` because measured line or protected\\-region damage remained\\."
+        ));
+    }
+    if other_failures > 0 {
         final_text.push_str(&format!(
             " *{}* page\\(s\\) failed\\. Send the URL again to retry failed pages\\.",
-            counters.borrow().failed
+            other_failures
         ));
     }
 
@@ -4355,10 +4348,50 @@ mod tests {
         assert!(delivery_quality_approved(Some(
             "production_ready_with_tone_training_warning"
         )));
+        assert!(delivery_quality_approved(Some(
+            "production_ready_with_bubble_detection_warning"
+        )));
+        assert!(delivery_quality_approved(Some(
+            "production_ready_with_bubble_cleanup_warning"
+        )));
         assert!(!delivery_quality_approved(None));
         assert!(!delivery_quality_approved(Some(
             "needs_protected_region_cleanup"
         )));
+    }
+
+    #[test]
+    fn job_workspace_retains_quality_report_before_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let work_dir = dir.path().join("retained");
+        let job_dir = dir.path().join("scratch").join("1").join("job");
+        std::fs::create_dir_all(&job_dir).unwrap();
+
+        {
+            let _workspace = JobWorkspace::new(job_dir.clone(), work_dir.clone(), true);
+            std::fs::write(
+                job_dir.join("page.quality.json"),
+                br#"{"director_verdict":"production_ready_preview"}"#,
+            )
+            .unwrap();
+        }
+
+        assert!(!job_dir.exists());
+        let day_dirs = std::fs::read_dir(work_dir.join("quality"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(day_dirs.len(), 1);
+        let reports = std::fs::read_dir(&day_dirs[0])
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(reports.len(), 1);
+        assert!(std::fs::read_to_string(&reports[0])
+            .unwrap()
+            .contains("production_ready_preview"));
     }
 
     #[test]
