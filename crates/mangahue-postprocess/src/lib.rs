@@ -2044,15 +2044,19 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
 /// per-column histograms. Returns a new plane; the input is untouched.
 fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
     let n = radius * 2 + 1;
-    let half_n: u32 = ((n * n) / 2 + 1) as u32; // median index (lower-middle)
+    let half_n: u32 = ((n * n) / 2 + 1) as u32;
     let mut out = vec![0u8; w * h];
     // Per-column histograms of the vertical window.
     let mut col_hists: Vec<[u32; 256]> = vec![[0u32; 256]; w];
     let mut combined: [u32; 256] = [0; 256];
 
-    // Initial vertical window: rows 0..=radius (clamped).
-    let initial_y = radius.min(h - 1);
-    for yy in 0..=initial_y {
+    // Replicate the boundary pixels so every window contains exactly n*n
+    // samples. The old implementation used a partial window but compared
+    // it against the full-window median index and also inserted row/column
+    // `radius` twice. That biased the result and returned zero near page
+    // edges, which is why dense dot fields survived the descreen pass.
+    for offset in 0..n {
+        let yy = offset.saturating_sub(radius).min(h - 1);
         let row = &plane[yy * w..(yy + 1) * w];
         for (c, hist) in col_hists.iter_mut().enumerate() {
             hist[row[c] as usize] += 1;
@@ -2060,27 +2064,22 @@ fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u
     }
 
     for y in 0..h {
-        // Slide the vertical window: drop row y-r-1, add row y+r.
+        // Slide the replicated vertical window by one row.
         if y > 0 {
-            let drop = y as i64 - radius as i64 - 1;
-            if drop >= 0 {
-                let row = &plane[drop as usize * w..(drop as usize + 1) * w];
-                for (c, hist) in col_hists.iter_mut().enumerate() {
-                    hist[row[c] as usize] -= 1;
-                }
-            }
-        }
-        let add = y + radius;
-        if add < h {
-            let row = &plane[add * w..(add + 1) * w];
+            let drop = y.saturating_sub(radius + 1).min(h - 1);
+            let add = (y + radius).min(h - 1);
+            let drop_row = &plane[drop * w..(drop + 1) * w];
+            let add_row = &plane[add * w..(add + 1) * w];
             for (c, hist) in col_hists.iter_mut().enumerate() {
-                hist[row[c] as usize] += 1;
+                hist[drop_row[c] as usize] -= 1;
+                hist[add_row[c] as usize] += 1;
             }
         }
 
-        // Initial horizontal window: columns 0..=radius (clamped).
-        let initial_x = radius.min(w - 1);
-        for hist in col_hists.iter().take(initial_x + 1) {
+        // Build the replicated x=0 window.
+        for offset in 0..n {
+            let xx = offset.saturating_sub(radius).min(w - 1);
+            let hist = &col_hists[xx];
             for (v, count) in hist.iter().enumerate() {
                 combined[v] += count;
             }
@@ -2089,18 +2088,12 @@ fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u
         let row_out = &mut out[y * w..(y + 1) * w];
         for (x, output_value) in row_out.iter_mut().enumerate().take(w) {
             if x > 0 {
-                let drop = x as i64 - radius as i64 - 1;
-                if drop >= 0 {
-                    let hist = &col_hists[drop as usize];
-                    for (v, count) in hist.iter().enumerate() {
-                        combined[v] -= count;
-                    }
+                let drop = x.saturating_sub(radius + 1).min(w - 1);
+                let add = (x + radius).min(w - 1);
+                for (v, count) in col_hists[drop].iter().enumerate() {
+                    combined[v] -= count;
                 }
-            }
-            let add = x + radius;
-            if add < w {
-                let hist = &col_hists[add];
-                for (v, count) in hist.iter().enumerate() {
+                for (v, count) in col_hists[add].iter().enumerate() {
                     combined[v] += count;
                 }
             }
@@ -2120,177 +2113,232 @@ fn median_filter_plane(plane: &[u8], w: usize, h: usize, radius: usize) -> Vec<u
     out
 }
 
-/// Binary mask morphological ops (0/255 masks).
-fn mask_erode(mask: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
-    let mut out = vec![255u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let y0 = y.saturating_sub(radius);
-            let y1 = (y + radius).min(h - 1);
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(w - 1);
-            let mut ok = true;
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    if mask[yy * w + xx] == 0 {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    break;
-                }
-            }
-            if !ok {
-                out[y * w + x] = 0;
-            }
-        }
-    }
-    out
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ChromaGridArtifactReport {
+    pub candidate_fraction: f32,
+    pub grid_score: f32,
+    pub period_x: u32,
+    pub period_y: u32,
+    pub needs_cleanup: bool,
 }
 
-fn mask_dilate(mask: &[u8], w: usize, h: usize, radius: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let y0 = y.saturating_sub(radius);
-            let y1 = (y + radius).min(h - 1);
-            let x0 = x.saturating_sub(radius);
-            let x1 = (x + radius).min(w - 1);
-            let mut any = false;
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    if mask[yy * w + xx] != 0 {
-                        any = true;
-                        break;
-                    }
-                }
-                if any {
-                    break;
-                }
-            }
-            if any {
-                out[y * w + x] = 255;
-            }
-        }
-    }
-    out
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct ChromaGridCleanupReport {
+    pub changed_pixels: u64,
+    pub before: ChromaGridArtifactReport,
+    pub after: ChromaGridArtifactReport,
 }
 
-/// Descreen printed halftone texture inside red/orange zones of colored
-/// scans (the "red dots / like squares" on already-colored pages): the
-/// print dot field lives in both luma and chroma, so inside the dilated
-/// strong-warm mask the luma and opponent-chroma planes are replaced with
-/// their local median (13x13, matched to the measured ~19px dot spacing),
-/// then recombined. Black line art is protected by an ink mask and keeps
-/// its original pixels; everything outside the warm zones is untouched, so
-/// neutral areas, paper, and non-warm colors ship exactly as scanned.
-/// Returns the number of changed pixels.
-pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
-    let (w, h) = image.dimensions();
-    let (w, h) = (w as usize, h as usize);
-    if w < 20 || h < 20 {
-        return 0;
-    }
-    const MEDIAN_RADIUS: usize = 6; // 13x13 window
-    let idx = |x: usize, y: usize| y * w + x;
+const CHROMA_OFFSET: f32 = 128.0;
+// Scale the full legal R-Y / B-Y ranges into u8 without clipping. Storing
+// raw opponent values with an offset loses yellow/orange B-Y values below
+// -128, making vivid grid squares indistinguishable from their median.
+const CR_SCALE: f32 = 0.635;
+const CB_SCALE: f32 = 0.539;
 
-    // Planes: luma and opponent chroma (cr = r - luma, cb = b - luma).
-    let mut luma = vec![0f32; w * h];
-    let mut cr = vec![0f32; w * h];
-    let mut cb = vec![0f32; w * h];
-    let mut warm = vec![false; w * h];
+fn chroma_candidate_mask(image: &RgbImage, radius: usize) -> Vec<bool> {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let mut luma = Vec::with_capacity(w * h);
+    let mut saturation = Vec::with_capacity(w * h);
+    let mut cr = Vec::with_capacity(w * h);
+    let mut cb = Vec::with_capacity(w * h);
+    for p in image.pixels() {
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        luma.push(l);
+        saturation.push(if mx > 0.0 { (mx - mn) / mx } else { 0.0 });
+        cr.push(
+            ((r - l) * CR_SCALE + CHROMA_OFFSET)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+        );
+        cb.push(
+            ((b - l) * CB_SCALE + CHROMA_OFFSET)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+        );
+    }
+    let cr_median = median_filter_plane(&cr, w, h, radius);
+    let cb_median = median_filter_plane(&cb, w, h, radius);
+    (0..w * h)
+        .map(|i| {
+            let dr = (cr[i] as f32 - cr_median[i] as f32) / CR_SCALE;
+            let db = (cb[i] as f32 - cb_median[i] as f32) / CB_SCALE;
+            let residual = (dr * dr + db * db).sqrt();
+            residual > 8.0 && saturation[i] > 0.14 && luma[i] > 40.0 && luma[i] < 245.0
+        })
+        .collect()
+}
+
+fn best_projection_period(values: &[f32]) -> (f32, u32) {
+    if values.len() < 27 {
+        return (0.0, 0);
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let centered: Vec<f32> = values.iter().map(|value| value - mean).collect();
+    let max_lag = 24usize.min(values.len() / 3);
+    let mut best = (0.0f32, 0u32);
+    for lag in 8..=max_lag {
+        let mut numerator = 0.0f32;
+        let mut left_energy = 0.0f32;
+        let mut right_energy = 0.0f32;
+        for i in 0..values.len() - lag {
+            numerator += centered[i] * centered[i + lag];
+            left_energy += centered[i] * centered[i];
+            right_energy += centered[i + lag] * centered[i + lag];
+        }
+        let denominator = (left_energy * right_energy).sqrt();
+        let score = if denominator > 1e-9 {
+            numerator / denominator
+        } else {
+            0.0
+        };
+        if score > best.0 {
+            best = (score, lag as u32);
+        }
+    }
+    best
+}
+
+/// Detect repeated square opponent-chroma outliers. Detection runs on a
+/// bounded 512px preview, making it cheap enough to gate every delivered
+/// page. Requiring matching horizontal and vertical periods separates the
+/// decoder/halftone grid from ordinary colored edges and small details.
+pub fn detect_chroma_grid_artifacts(image: &RgbImage) -> ChromaGridArtifactReport {
+    if image.width() < 32 || image.height() < 32 {
+        return ChromaGridArtifactReport::default();
+    }
+    let longest = image.width().max(image.height());
+    let preview = if longest > 512 {
+        let scale = 512.0 / longest as f32;
+        image::imageops::resize(
+            image,
+            (image.width() as f32 * scale).round().max(1.0) as u32,
+            (image.height() as f32 * scale).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image.clone()
+    };
+    let (w, h) = (preview.width() as usize, preview.height() as usize);
+    let radius = w.max(h).div_ceil(105).clamp(3, 6);
+    let mask = chroma_candidate_mask(&preview, radius);
+    let candidate_count = mask.iter().filter(|&&value| value).count();
+    let candidate_fraction = candidate_count as f32 / (w * h).max(1) as f32;
+    let mut x_projection = vec![0.0f32; w];
+    let mut y_projection = vec![0.0f32; h];
     for y in 0..h {
         for x in 0..w {
-            let i = idx(x, y);
-            let p = image.get_pixel(x as u32, y as u32);
-            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
-            let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-            luma[i] = l;
-            cr[i] = r - l;
-            cb[i] = b - l;
-            let mx = r.max(g).max(b);
-            let mn = r.min(g).min(b);
-            if mx > 0.0 {
-                let sat = (mx - mn) / mx;
-                if sat > 0.28 {
-                    let delta = (mx - mn).max(1e-9);
-                    let hue = if r == mx {
-                        60.0 * (((g - b) / delta) % 6.0)
-                    } else if g == mx {
-                        60.0 * ((b - r) / delta + 2.0)
-                    } else {
-                        60.0 * ((r - g) / delta + 4.0)
-                    };
-                    let hue = hue.rem_euclid(360.0);
-                    if !(60.0..=340.0).contains(&hue) && l > 40.0 {
-                        warm[i] = true;
-                    }
-                }
+            if mask[y * w + x] {
+                x_projection[x] += 1.0 / h as f32;
+                y_projection[y] += 1.0 / w as f32;
             }
         }
     }
+    let (x_score, period_x) = best_projection_period(&x_projection);
+    let (y_score, period_y) = best_projection_period(&y_projection);
+    let periods_align = period_x.abs_diff(period_y) <= 2;
+    let grid_score = x_score.min(y_score) * if periods_align { 1.0 } else { 0.65 };
+    ChromaGridArtifactReport {
+        candidate_fraction,
+        grid_score,
+        period_x,
+        period_y,
+        needs_cleanup: candidate_fraction >= 0.035 && grid_score >= 0.58,
+    }
+}
 
-    // Red-zone mask: dilate the warm mask so the halftone transition band
-    // (where dots fade into the surroundings) is fully covered.
-    let warm_u8: Vec<u8> = warm.iter().map(|&v| if v { 255u8 } else { 0u8 }).collect();
-    let red_zone = mask_dilate(&warm_u8, w, h, 4);
-
-    // Ink line mask: dark pixels or locally-dark outliers, noise-eroded
-    // then dilated for a 3px protection zone.
+/// Remove dense square color noise without blurring the whole page. The
+/// page-level periodicity detector must opt in first, then only local
+/// opponent-chroma outliers are pulled toward an adaptive median. A bounded
+/// amount of luma descreening is applied to those same pixels so colored
+/// squares do not survive as bright/dark stamps; black ink, white paper,
+/// speech text and all pixels outside the artifact mask remain untouched.
+pub fn remove_chroma_grid_artifacts(image: &mut RgbImage) -> ChromaGridCleanupReport {
+    let before = detect_chroma_grid_artifacts(image);
+    if !before.needs_cleanup {
+        return ChromaGridCleanupReport {
+            changed_pixels: 0,
+            before,
+            after: before,
+        };
+    }
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let radius = w.max(h).div_ceil(105).clamp(5, 24);
+    let mut luma = Vec::with_capacity(w * h);
+    let mut saturation = Vec::with_capacity(w * h);
+    let mut cr = Vec::with_capacity(w * h);
+    let mut cb = Vec::with_capacity(w * h);
+    for p in image.pixels() {
+        let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let mx = r.max(g).max(b);
+        let mn = r.min(g).min(b);
+        luma.push(l);
+        saturation.push(if mx > 0.0 { (mx - mn) / mx } else { 0.0 });
+        cr.push(
+            ((r - l) * CR_SCALE + CHROMA_OFFSET)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+        );
+        cb.push(
+            ((b - l) * CB_SCALE + CHROMA_OFFSET)
+                .round()
+                .clamp(0.0, 255.0) as u8,
+        );
+    }
+    let cr_median = median_filter_plane(&cr, w, h, radius);
+    let cb_median = median_filter_plane(&cb, w, h, radius);
     let luma_u8: Vec<u8> = luma
         .iter()
-        .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+        .map(|value| value.round().clamp(0.0, 255.0) as u8)
         .collect();
-    let bg = median_filter_plane(&luma_u8, w, h, 2); // ~local background (5x5)
-    let mut line = vec![0u8; w * h];
+    let luma_median = median_filter_plane(&luma_u8, w, h, radius);
+    let mut changed_pixels = 0u64;
+    let mut output = image.clone();
     for i in 0..w * h {
-        let l = luma[i];
-        let is_line = l < 60.0 || (l < bg[i] as f32 - 20.0 && l < 130.0);
-        line[i] = if is_line { 255u8 } else { 0u8 };
-    }
-    line = mask_erode(&line, w, h, 1);
-    line = mask_dilate(&line, w, h, 3);
-
-    // Median planes (13x13), only meaningful inside the zone.
-    let cr_u8: Vec<u8> = cr
-        .iter()
-        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
-        .collect();
-    let cb_u8: Vec<u8> = cb
-        .iter()
-        .map(|&v| (v + 128.0).round().clamp(0.0, 255.0) as u8)
-        .collect();
-    let luma_med = median_filter_plane(&luma_u8, w, h, MEDIAN_RADIUS);
-    let cr_med = median_filter_plane(&cr_u8, w, h, MEDIAN_RADIUS);
-    let cb_med = median_filter_plane(&cb_u8, w, h, MEDIAN_RADIUS);
-
-    // Blend inside the zone, keeping line art and everything outside.
-    let mut changed = 0u64;
-    let mut work = image.clone();
-    for y in 0..h {
-        for x in 0..w {
-            let i = idx(x, y);
-            if red_zone[i] == 0 || line[i] != 0 {
-                continue;
-            }
-            let l_s = luma_med[i] as f32;
-            let cr_s = cr_med[i] as f32 - 128.0;
-            let cb_s = cb_med[i] as f32 - 128.0;
-            let nr = (l_s + cr_s).round().clamp(0.0, 255.0) as u8;
-            let nb = (l_s + cb_s).round().clamp(0.0, 255.0) as u8;
-            let ng = ((l_s - 0.2126 * nr as f32 - 0.0722 * nb as f32) / 0.7152)
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            let p = work.get_pixel_mut(x as u32, y as u32);
-            if p[0] != nr || p[1] != ng || p[2] != nb {
-                changed += 1;
-            }
-            *p = Rgb([nr, ng, nb]);
+        let dr = (cr[i] as f32 - cr_median[i] as f32) / CR_SCALE;
+        let db = (cb[i] as f32 - cb_median[i] as f32) / CB_SCALE;
+        let residual = (dr * dr + db * db).sqrt();
+        if residual <= 8.0 || saturation[i] <= 0.14 || luma[i] <= 40.0 || luma[i] >= 245.0 {
+            continue;
+        }
+        let alpha = ((residual - 5.0) / 14.0).clamp(0.0, 1.0);
+        let corrected_luma = luma[i] * (1.0 - alpha * 0.72) + luma_median[i] as f32 * alpha * 0.72;
+        let source_cr = (cr[i] as f32 - CHROMA_OFFSET) / CR_SCALE;
+        let source_cb = (cb[i] as f32 - CHROMA_OFFSET) / CB_SCALE;
+        let median_cr = (cr_median[i] as f32 - CHROMA_OFFSET) / CR_SCALE;
+        let median_cb = (cb_median[i] as f32 - CHROMA_OFFSET) / CB_SCALE;
+        let corrected_cr = source_cr * (1.0 - alpha) + median_cr * alpha;
+        let corrected_cb = source_cb * (1.0 - alpha) + median_cb * alpha;
+        let corrected_r = corrected_luma + corrected_cr;
+        let corrected_b = corrected_luma + corrected_cb;
+        let corrected_g = (corrected_luma - 0.2126 * corrected_r - 0.0722 * corrected_b) / 0.7152;
+        let corrected = Rgb([
+            corrected_r.round().clamp(0.0, 255.0) as u8,
+            corrected_g.round().clamp(0.0, 255.0) as u8,
+            corrected_b.round().clamp(0.0, 255.0) as u8,
+        ]);
+        let x = (i % w) as u32;
+        let y = (i / w) as u32;
+        if output.get_pixel(x, y) != &corrected {
+            output.put_pixel(x, y, corrected);
+            changed_pixels += 1;
         }
     }
-    *image = work;
-    changed
+    *image = output;
+    ChromaGridCleanupReport {
+        changed_pixels,
+        before,
+        after: detect_chroma_grid_artifacts(image),
+    }
+}
+
+/// Compatibility wrapper used by existing callers.
+pub fn descreen_halftone_regions(image: &mut RgbImage) -> u64 {
+    remove_chroma_grid_artifacts(image).changed_pixels
 }
 
 /// Adaptive line restoration: stronger in dark ink areas, gentler near edges,
@@ -2582,6 +2630,111 @@ mod tests {
         );
         // The line stays dark.
         assert!(pixel.iter().all(|c| *c < 110), "line stays dark: {pixel:?}");
+    }
+
+    #[test]
+    fn median_filter_replicates_boundaries_without_zero_bias() {
+        let plane = vec![73u8; 25];
+        let filtered = median_filter_plane(&plane, 5, 5, 2);
+
+        assert_eq!(filtered, plane);
+
+        let varied: Vec<u8> = (0..42)
+            .map(|i| ((i * 37 + (i / 7) * 19) % 251) as u8)
+            .collect();
+        let actual = median_filter_plane(&varied, 7, 6, 2);
+        let mut expected = vec![0u8; varied.len()];
+        for y in 0..6usize {
+            for x in 0..7usize {
+                let mut window = Vec::with_capacity(25);
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let xx = (x as i32 + dx).clamp(0, 6) as usize;
+                        let yy = (y as i32 + dy).clamp(0, 5) as usize;
+                        window.push(varied[yy * 7 + xx]);
+                    }
+                }
+                window.sort_unstable();
+                expected[y * 7 + x] = window[12];
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn periodic_chroma_squares_are_removed_without_ink_or_paper_damage() {
+        let mut image = RgbImage::from_pixel(384, 384, Rgb([204, 96, 104]));
+        // A dense 16px-period decoder grid, matching the colored-square
+        // failure after scaling to the detector's bounded preview.
+        for y0 in (4..384).step_by(16) {
+            for x0 in (4..384).step_by(16) {
+                for y in y0..(y0 + 6).min(384) {
+                    for x in x0..(x0 + 6).min(384) {
+                        // Exact orange family from the reported page. Its
+                        // B-Y value falls below -128, which the old raw-u8
+                        // opponent encoding clipped and therefore missed.
+                        image.put_pixel(x, y, Rgb([235, 125, 4]));
+                    }
+                }
+            }
+        }
+        // Representative ink and paper must remain byte-for-byte stable.
+        for y in 0..384 {
+            image.put_pixel(190, y, Rgb([18, 18, 18]));
+        }
+        for y in 300..360 {
+            for x in 250..350 {
+                image.put_pixel(x, y, Rgb([252, 252, 252]));
+            }
+        }
+        let original = image.clone();
+        let before = detect_chroma_grid_artifacts(&image);
+        assert!(before.needs_cleanup, "expected grid detection: {before:?}");
+
+        let cleanup = remove_chroma_grid_artifacts(&mut image);
+
+        assert!(
+            cleanup.changed_pixels > 1_000,
+            "cleanup report: {cleanup:?}"
+        );
+        assert!(
+            !cleanup.after.needs_cleanup,
+            "residual grid must block delivery: {cleanup:?}"
+        );
+        assert!(cleanup.after.candidate_fraction < cleanup.before.candidate_fraction);
+        for y in 0..384 {
+            assert_eq!(image.get_pixel(190, y), original.get_pixel(190, y));
+        }
+        for &(x, y) in &[(260, 320), (320, 340)] {
+            assert_eq!(image.get_pixel(x, y), original.get_pixel(x, y));
+        }
+        // The square's brightness is descreened toward its local material,
+        // while the byte-stability checks above protect ink and paper.
+        let before_luma = rgb_luma(original.get_pixel(6, 6));
+        let after_luma = rgb_luma(image.get_pixel(6, 6));
+        let local_luma = rgb_luma(original.get_pixel(2, 2));
+        assert!((after_luma - local_luma).abs() < (before_luma - local_luma).abs());
+        assert!(
+            image.get_pixel(6, 6)[2] > 70,
+            "clipped orange square must recover local blue chroma: {:?}",
+            image.get_pixel(6, 6)
+        );
+    }
+
+    #[test]
+    fn coherent_color_regions_do_not_trigger_grid_cleanup() {
+        let mut image = RgbImage::from_pixel(256, 256, Rgb([224, 174, 142]));
+        for y in 0..256 {
+            for x in 128..256 {
+                image.put_pixel(x, y, Rgb([42, 105, 190]));
+            }
+        }
+        let original = image.clone();
+        let report = remove_chroma_grid_artifacts(&mut image);
+
+        assert!(!report.before.needs_cleanup, "false grid: {report:?}");
+        assert_eq!(report.changed_pixels, 0);
+        assert_eq!(image, original);
     }
 
     #[test]

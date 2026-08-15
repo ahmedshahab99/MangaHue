@@ -19,8 +19,8 @@ use mangahue_inference::{ColorizationBackend, MockColorizationBackend, ModelInpu
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ProjectMemory};
 use mangahue_postprocess::{
-    cross_tile_coherence, finalize, reconstruct_full_resolution, remove_color_specks,
-    PostprocessInput,
+    cross_tile_coherence, finalize, reconstruct_full_resolution, remove_chroma_grid_artifacts,
+    remove_color_specks, ChromaGridCleanupReport, PostprocessInput,
 };
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
@@ -277,24 +277,34 @@ impl MangaHueEngine {
                 // user; clean them before delivery. Black line art and large
                 // colored regions are untouched.
                 let mut halftone_dots_removed = 0u64;
-                let mut descreened_pixels = 0u64;
+                let mut grid_cleanup = ChromaGridCleanupReport::default();
                 if config.postprocess.descreen_halftone {
+                    grid_cleanup = remove_chroma_grid_artifacts(&mut output);
+                    // Run the tiny-component sweep after the periodic field
+                    // has been normalized; doing it first converted square
+                    // edges into colored rings that survived the grid pass.
                     halftone_dots_removed = mangahue_postprocess::remove_halftone_dots(&mut output);
-                    // The colored scan's PRINT texture (dense halftone in
-                    // the red/orange zones, the "red dots / like squares")
-                    // survives the isolated-dot sweep because it is one
-                    // interconnected field: median-descreen the warm zones
-                    // (luma + chroma), keeping ink line art untouched.
-                    descreened_pixels =
-                        mangahue_postprocess::descreen_halftone_regions(&mut output);
                 }
                 report.add_stage_report(
                     StageReport::new("halftone_descreen")
                         .metric("dot_pixels_removed", halftone_dots_removed as f64)
-                        .metric("descreened_pixels", descreened_pixels as f64)
-                        .note(if halftone_dots_removed > 0 || descreened_pixels > 0 {
+                        .metric("grid_pixels_changed", grid_cleanup.changed_pixels as f64)
+                        .metric(
+                            "grid_candidate_fraction_before",
+                            grid_cleanup.before.candidate_fraction as f64,
+                        )
+                        .metric(
+                            "grid_candidate_fraction_after",
+                            grid_cleanup.after.candidate_fraction as f64,
+                        )
+                        .metric("grid_score_before", grid_cleanup.before.grid_score as f64)
+                        .metric("grid_score_after", grid_cleanup.after.grid_score as f64)
+                        .metric("grid_period_x", grid_cleanup.before.period_x as f64)
+                        .metric("grid_period_y", grid_cleanup.before.period_y as f64)
+                        .note(if halftone_dots_removed > 0 || grid_cleanup.changed_pixels > 0 {
                             format!(
-                                "removed {halftone_dots_removed} halftone dots, descreened {descreened_pixels} warm-zone pixels on colored page"
+                                "removed {halftone_dots_removed} isolated dots and corrected {} periodic chroma-grid pixels on colored page",
+                                grid_cleanup.changed_pixels
                             )
                         } else {
                             "no halftone artifacts found".to_string()
@@ -303,7 +313,10 @@ impl MangaHueEngine {
                 save_rgb(&request.output_path, &output)?;
                 emit_progress(&progress, "done", 6, 6, None);
                 report.total_ms = total_start.elapsed().as_millis();
-                report.director_verdict = Some("already colored".to_string());
+                report.director_verdict = Some(final_verdict_with_chroma_grid(
+                    "already colored",
+                    &grid_cleanup,
+                ));
                 report.add_stage_report(
                     StageReport::new("postprocess")
                         .note("skipped: page already colored, original passed through"),
@@ -1204,23 +1217,43 @@ impl MangaHueEngine {
                 remove_color_specks(&mut final_image, &full_line_mask);
             }
         }
-        // Printed-halftone-style dot cleanup at final resolution: the
-        // despeckle's size/density gates skip specks riding large warm
-        // components (measured: short warm chains inside shaded fields),
-        // so sweep small strong-warm components once more — luma (line
-        // art, shading, screentones) is never touched.
+        // Periodic-grid cleanup at final resolution: the ordinary despeckle
+        // skips dense square fields riding large warm components. Detect the
+        // repeated two-axis pattern, repair only its local chroma/luma
+        // outliers, then sweep any remaining isolated warm components.
         if config.postprocess.descreen_halftone {
+            let grid_cleanup = remove_chroma_grid_artifacts(&mut final_image);
             let halftone_dots_removed =
                 mangahue_postprocess::remove_halftone_dots(&mut final_image);
-            if halftone_dots_removed > 0 {
-                report.add_stage_report(
-                    StageReport::new("halftone_descreen")
-                        .metric("dot_pixels_removed", halftone_dots_removed as f64)
-                        .note(format!(
-                            "removed {halftone_dots_removed} halftone dot pixels at final resolution"
-                        )),
-                );
-            }
+            report.add_stage_report(
+                StageReport::new("halftone_descreen")
+                    .metric("dot_pixels_removed", halftone_dots_removed as f64)
+                    .metric("grid_pixels_changed", grid_cleanup.changed_pixels as f64)
+                    .metric(
+                        "grid_candidate_fraction_before",
+                        grid_cleanup.before.candidate_fraction as f64,
+                    )
+                    .metric(
+                        "grid_candidate_fraction_after",
+                        grid_cleanup.after.candidate_fraction as f64,
+                    )
+                    .metric("grid_score_before", grid_cleanup.before.grid_score as f64)
+                    .metric("grid_score_after", grid_cleanup.after.grid_score as f64)
+                    .metric("grid_period_x", grid_cleanup.before.period_x as f64)
+                    .metric("grid_period_y", grid_cleanup.before.period_y as f64)
+                    .note(format!(
+                        "removed {halftone_dots_removed} isolated dots and corrected {} periodic chroma-grid pixels at final resolution",
+                        grid_cleanup.changed_pixels
+                    )),
+            );
+            let current_verdict = report
+                .director_verdict
+                .as_deref()
+                .unwrap_or("production_ready_preview");
+            report.director_verdict = Some(final_verdict_with_chroma_grid(
+                current_verdict,
+                &grid_cleanup,
+            ));
         }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
 
@@ -1700,6 +1733,17 @@ fn director_verdict(
     "production_ready_preview".to_string()
 }
 
+fn final_verdict_with_chroma_grid(current: &str, cleanup: &ChromaGridCleanupReport) -> String {
+    // Preserve an earlier hard invariant failure; otherwise residual periodic
+    // chroma noise is itself delivery-blocking. A cleaned page keeps its
+    // original ready/already-colored classification.
+    if cleanup.after.needs_cleanup && !current.starts_with("needs_") {
+        "needs_chroma_grid_cleanup".to_string()
+    } else {
+        current.to_string()
+    }
+}
+
 fn build_director_overlay(
     preprocess: &mangahue_preprocess::PreprocessResult,
     hint_map: &RgbImage,
@@ -2098,6 +2142,31 @@ mod tests {
         assert_eq!(
             director_verdict(&quality, &preprocess, &EngineConfig::default()),
             "production_ready_with_bubble_cleanup_warning"
+        );
+    }
+
+    #[test]
+    fn residual_chroma_grid_blocks_delivery_after_cleanup() {
+        let mut cleanup = ChromaGridCleanupReport::default();
+        cleanup.after.needs_cleanup = true;
+
+        assert_eq!(
+            final_verdict_with_chroma_grid("production_ready_preview", &cleanup),
+            "needs_chroma_grid_cleanup"
+        );
+        assert_eq!(
+            final_verdict_with_chroma_grid("already colored", &cleanup),
+            "needs_chroma_grid_cleanup"
+        );
+        assert_eq!(
+            final_verdict_with_chroma_grid("needs_line_preservation_attention", &cleanup),
+            "needs_line_preservation_attention"
+        );
+
+        cleanup.after.needs_cleanup = false;
+        assert_eq!(
+            final_verdict_with_chroma_grid("production_ready_preview", &cleanup),
+            "production_ready_preview"
         );
     }
 
