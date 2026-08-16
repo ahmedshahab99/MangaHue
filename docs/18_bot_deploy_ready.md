@@ -1,4 +1,10 @@
-# MangaHue Telegram Bot — Deploy & Operations Runbook
+# MangaHue Telegram Bot — Legacy Deploy & Operations Runbook
+
+> **Retired production procedure:** this file is kept for historical and
+> troubleshooting context only. Production deploys now use SHA-addressed
+> immutable releases under `/opt/MangaHue-releases`, with
+> `/opt/MangaHue-current` promoted only after CI gates pass. Follow
+> `README-DEPLOY.md`; do not run the mutable-host deployment commands below.
 
 Target host: **153.75.251.215** — 2 vCPU, ~5.4 GB RAM, Ubuntu (22.04/24.04).
 Service: **`mangahue-pro.service`**. Binary: `/opt/MangaHue-release/bin/mangahue-telegram`.

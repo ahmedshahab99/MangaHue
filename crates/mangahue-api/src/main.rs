@@ -46,6 +46,12 @@ struct Args {
         env = "MANGAHUE_DEFAULT_CONFIG"
     )]
     default_config: PathBuf,
+    #[arg(
+        long,
+        default_value = "configs/styles/soft_cel_anime_v2.yaml",
+        env = "MANGAHUE_DEFAULT_STYLE"
+    )]
+    default_style: PathBuf,
 }
 
 #[tokio::main]
@@ -73,6 +79,7 @@ async fn main() -> Result<()> {
         job_retention_hours: args.job_retention_hours,
         default_model_path: args.default_model,
         default_config_path: args.default_config,
+        default_style_path: args.default_style,
     })
     .await
 }

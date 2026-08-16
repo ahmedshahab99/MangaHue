@@ -2,28 +2,29 @@
 
 ## Live Deployment (current, 2026)
 
-The production bot runs as a **systemd service on the VPS** (no Docker):
+The production bot runs as a **systemd service on the VPS** (no Docker). The
+release is immutable and identified by its full Git commit SHA:
 
 ```
-VPS (153.75.251.215, 2-core / 5.4GB RAM)
-  mangahue-pro.service  →  /opt/MangaHue-release/bin/mangahue-telegram
+VPS (2-core / 5.4GB RAM)
+  mangahue-pro.service  →  /opt/MangaHue-current/bin/mangahue-telegram
+  /opt/MangaHue-current →  /opt/MangaHue-releases/<40-char-SHA>
      --model  .../models/ddcolor-full/ddcolor-full-fp32.onnx
      --preset .../configs/engine.telegram-pure-model-v2.yaml
      --style  .../configs/styles/soft_cel_anime_v2.yaml
      --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
-     --max-concurrent-jobs 2
+     --max-concurrent-jobs 1 --max-queued-jobs 16
+     --max-queued-jobs-per-chat 1 --daily-limit 0
+     --retention-hours 24
 ```
 
-**Deploy a change (one command):**
+**Deploy a change:** merge a reviewed pull request into `main`. `MangaHue CI`
+must pass formatting, clippy, Rust tests, Python tests, and the container smoke
+test. Only then does `Immutable production release` build the exact successful
+SHA, upload its checksummed archive, and atomically promote it on the VPS.
 
-```bash
-python scripts/vps_build.py
-```
-
-This uploads `main.rs` (+ watermark, inference) to `/opt/mangahue` and
-`/opt/MangaHue-release`, runs `cargo test` + `cargo build --release` on the
-VPS, and on success copies the fresh binary into `/opt/MangaHue-release/bin/`
-and restarts the service. A failed build leaves the running bot untouched.
+Do not use the legacy mutable `scripts/vps_build.py` path for production.
+A failed release gate leaves the active symlink and running bot untouched.
 
 ### Telegram delivery resilience
 
@@ -140,14 +141,14 @@ does not write the token to disk and clears the process environment afterward.
 | `/help` | Show all commands |
 | `/status` | Check active job progress |
 | `/cancel` | Cancel current job |
-| `/style` | List available color styles |
-| `/style <name>` | Set color style |
 | `/batch` | Show current batch size |
 | `/batch <N>` | Set batch size (1-10) |
 | `/stats` | Show daily usage |
 | `/clean` | Delete all job data |
 
-Just send a manga chapter URL to start colorization.
+Just send a manga chapter URL to start colorization. There is one automatic
+colorization pipeline; references and Color Bible corrections are constraints
+inside that pipeline, not separate modes.
 
 ## Docker Profiles
 

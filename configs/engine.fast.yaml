@@ -1,5 +1,4 @@
 engine:
-  mode: fast
   parallel_jobs: 0
   pyramid_enabled: false
 layout:

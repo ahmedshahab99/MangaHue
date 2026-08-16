@@ -583,11 +583,9 @@ fn extract_manganato(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Str
                 }
             }
         }
-        if !urls.is_empty() {
-            break;
-        }
     }
 
+    sort_by_page_hint_if_complete(&mut urls);
     Ok(urls.into_iter().take(max_pages).collect())
 }
 
@@ -664,6 +662,7 @@ fn extract_ehentai(
         }
     }
 
+    sort_by_page_hint_if_complete(&mut urls);
     Ok(urls.into_iter().take(max_pages).collect())
 }
 
@@ -700,12 +699,34 @@ fn extract_imhentai(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Stri
                 }
             }
         }
-        if !urls.is_empty() {
-            break;
-        }
     }
 
+    sort_by_page_hint_if_complete(&mut urls);
     Ok(urls.into_iter().take(max_pages).collect())
+}
+
+/// Selector/script/DOM unioning can discover page 3 before a script-only page
+/// 2. When every candidate exposes a trailing page number, restore natural
+/// chapter order. If any URL has no reliable hint, preserve discovery order.
+fn sort_by_page_hint_if_complete(urls: &mut [String]) {
+    if urls.len() >= 2 && urls.iter().all(|url| trailing_page_number(url).is_some()) {
+        urls.sort_by_key(|url| trailing_page_number(url).unwrap_or(u64::MAX));
+    }
+}
+
+fn trailing_page_number(value: &str) -> Option<u64> {
+    let parsed = Url::parse(value).ok()?;
+    let file = parsed.path().rsplit('/').next()?;
+    let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file);
+    let reversed = stem
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if reversed.is_empty() {
+        return None;
+    }
+    reversed.chars().rev().collect::<String>().parse().ok()
 }
 
 // ── Madara / wp-manga theme sites (allporncomic.com, ilikecomix.com) ─────
@@ -894,17 +915,9 @@ fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Strin
         &mut reader,
         &mut reader_seen,
     );
-    if reader.len() >= 2 {
-        return Ok(reader.into_iter().take(max_pages).collect());
-    }
-
     let mut scripts = Vec::new();
     let mut script_seen = HashSet::new();
     collect_script_images(&document, base, &mut scripts, &mut script_seen);
-    if scripts.len() >= 2 {
-        return Ok(scripts.into_iter().take(max_pages).collect());
-    }
-
     let mut dom = Vec::new();
     let mut dom_seen = HashSet::new();
     collect_dom_images(
@@ -935,6 +948,7 @@ fn extract_generic(html: &str, base: &Url, max_pages: usize) -> Result<Vec<Strin
         );
     }
 
+    sort_by_page_hint_if_complete(&mut urls);
     Ok(urls.into_iter().take(max_pages).collect())
 }
 
@@ -1169,6 +1183,66 @@ fn is_likely_content_image(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manganato_merges_pages_from_all_reader_selectors() {
+        let base = Url::parse("https://chapmanganato.example/chapter/1").unwrap();
+        let html = r#"
+            <div class="container-chapter-reader"><img src="/page-1.jpg"></div>
+            <div class="reading-content"><img data-src="/page-2.jpg"></div>
+        "#;
+        let urls = extract_manganato(html, &base, 10).unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].ends_with("/page-1.jpg"));
+        assert!(urls[1].ends_with("/page-2.jpg"));
+    }
+
+    #[test]
+    fn imhentai_merges_pages_from_all_gallery_selectors() {
+        let base = Url::parse("https://imhentai.example/gallery/1").unwrap();
+        let html = r#"
+            <div class="gallery"><img src="/page-1.jpg"></div>
+            <img class="gallery-img" data-full="/page-2.jpg">
+        "#;
+        let urls = extract_imhentai(html, &base, 10).unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].ends_with("/page-1.jpg"));
+        assert!(urls[1].ends_with("/page-2.jpg"));
+    }
+
+    #[test]
+    fn generic_extractor_merges_reader_script_and_dom_pages() {
+        let base = Url::parse("https://reader.example/chapter/1").unwrap();
+        let html = r#"
+            <div id="readerarea"><img src="/page-1.jpg"></div>
+            <script>window.pages = ["/page-2.jpg"];</script>
+            <img src="/page-3.jpg">
+        "#;
+        let urls = extract_generic(html, &base, 10).unwrap();
+        assert_eq!(urls.len(), 3);
+        assert!(urls.iter().any(|url| url.ends_with("/page-1.jpg")));
+        assert!(urls.iter().any(|url| url.ends_with("/page-2.jpg")));
+        assert!(urls.iter().any(|url| url.ends_with("/page-3.jpg")));
+    }
+
+    #[test]
+    fn generic_merge_restores_natural_order_for_partial_sources() {
+        let base = Url::parse("https://reader.example/chapter/1").unwrap();
+        let html = r#"
+            <div id="readerarea">
+                <img src="/page-001.jpg">
+                <img src="/page-003.jpg">
+            </div>
+            <script>window.pages = ["/page-002.jpg"];</script>
+        "#;
+        let urls = extract_generic(html, &base, 10).unwrap();
+        assert_eq!(
+            urls.iter()
+                .map(|url| url.rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["page-001.jpg", "page-002.jpg", "page-003.jpg"]
+        );
+    }
 
     #[test]
     fn detects_nhentai_url() {

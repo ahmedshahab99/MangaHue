@@ -249,6 +249,7 @@ pub struct ApiState {
     pub job_retention_hours: u64,
     pub default_model_path: PathBuf,
     pub default_config_path: PathBuf,
+    pub default_style_path: PathBuf,
     pub production: ProductionStore,
     /// Root directory that /api/file and sandboxed job paths resolve under.
     pub file_root: PathBuf,
@@ -278,6 +279,8 @@ pub struct ApiServerConfig {
     pub default_model_path: PathBuf,
     #[serde(default = "default_server_config_path")]
     pub default_config_path: PathBuf,
+    #[serde(default = "default_server_style_path")]
+    pub default_style_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +621,18 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
             config.default_config_path.display()
         )
     })?;
+    let default_style_path = config.default_style_path.canonicalize().with_context(|| {
+        format!(
+            "default style profile is unavailable at {}",
+            config.default_style_path.display()
+        )
+    })?;
+    load_style_profile(&default_style_path).with_context(|| {
+        format!(
+            "default style profile is invalid at {}",
+            default_style_path.display()
+        )
+    })?;
     validate_default_inference_runtime(&default_model_path)?;
     let production = ProductionStore::open(&config.production_db)?;
     let file_root = config.file_root.clone();
@@ -634,6 +649,7 @@ pub async fn serve(config: ApiServerConfig) -> Result<()> {
         job_retention_hours: config.job_retention_hours,
         default_model_path,
         default_config_path,
+        default_style_path,
         production,
         file_root,
         sandbox_jobs,
@@ -671,7 +687,6 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
     // authenticated caller can neither read nor write files outside the job
     // workspace and can never make the engine load arbitrary checkpoints.
     let user_routes = Router::new()
-        .route("/api/styles", get(list_styles))
         .route("/api/file", get(get_local_file))
         .route(
             "/api/upload",
@@ -690,6 +705,7 @@ pub fn router_with_mode(state: ApiState, public_api: bool) -> Router {
     // corrections take host paths by design and are trusted-admin tools.
     let admin_routes = Router::new()
         .route("/metrics", get(metrics))
+        .route("/api/styles", get(list_styles))
         .route("/api/batch", post(create_batch_job))
         .route("/api/link/ingest", post(ingest_link))
         .route("/api/chapter/import", post(import_chapter))
@@ -970,6 +986,10 @@ async fn health(State(state): State<ApiState>) -> Json<serde_json::Value> {
             "ready": state.default_model_path.is_file(),
             "name": state.default_model_path.file_name().and_then(|name| name.to_str()),
         },
+        "style": {
+            "ready": state.default_style_path.is_file(),
+            "name": state.default_style_path.file_name().and_then(|name| name.to_str()),
+        },
     }))
 }
 
@@ -1013,6 +1033,11 @@ async fn create_durable_job(
     // trusted operator credentials.
     if user.tier != mangahue_production::UserTier::Admin {
         if let Err(error) = sanitize_job_payload(&mut payload.payload) {
+            return Err(ApiError::with_status(StatusCode::BAD_REQUEST, error));
+        }
+        if let Err(error) =
+            enforce_public_durable_engine_policy(&payload.kind, &mut payload.payload, &state)
+        {
             return Err(ApiError::with_status(StatusCode::BAD_REQUEST, error));
         }
         payload.priority = payload.priority.clamp(0, 100);
@@ -1098,9 +1123,13 @@ fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.model_path = None;
     request.reference_image_path = None;
     request.ensemble_model_paths.clear();
+    request.enable_ensemble = false;
     request.config_path = None;
     request.preset_path = None;
+    request.style_path = None;
     request.palette_path = None;
+    request.palette_override = None;
+    request.auto_palette = false;
     request.draft_path = None;
     request.cache_dir = None;
     request.debug_dir = None;
@@ -1112,15 +1141,53 @@ fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.character_ids.clear();
     request.idempotency_key = None;
     request.use_mock_backend = false;
+    request.pyramid_enabled = false;
+    request.hint_propagation_enabled = false;
+    request.legacy_grade = false;
+    request.color_bible_consistency_threshold = None;
+}
+
+fn enforce_public_durable_engine_policy(
+    kind: &str,
+    payload: &mut serde_json::Value,
+    state: &ApiState,
+) -> Result<()> {
+    match kind {
+        "colorize" => {
+            let mut request: ColorizeRequest =
+                serde_json::from_value(payload.clone()).context("invalid colorize job payload")?;
+            pin_public_engine_defaults(&mut request, state);
+            *payload = serde_json::to_value(request)?;
+        }
+        "chapter" => {
+            let mut request: ChapterJobRequest =
+                serde_json::from_value(payload.clone()).context("invalid chapter job payload")?;
+            pin_public_engine_defaults(&mut request.colorize_template, state);
+            *payload = serde_json::to_value(request)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn pin_public_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) {
+    sandbox_engine_paths(request);
+    request.model_path = Some(state.default_model_path.clone());
+    request.config_path = Some(state.default_config_path.clone());
+    request.style_path = Some(state.default_style_path.clone());
 }
 
 fn apply_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) -> Result<()> {
     if state.sandbox_jobs {
-        request.style_path = request
-            .style_path
-            .as_deref()
-            .map(|path| resolve_trusted_style(&state.styles_dir, path))
-            .transpose()?;
+        // There is one public colorization mode. Remote requests cannot
+        // select a style or alter the rendering pipeline; the server-owned
+        // canonical profile is always applied.
+        pin_public_engine_defaults(request, state);
+    } else if request.style_path.is_none() {
+        // Local/admin operators keep the ability to select research
+        // profiles explicitly, while omitted values use production's
+        // canonical style.
+        request.style_path = Some(state.default_style_path.clone());
     }
     if request.model_path.is_none() {
         request.model_path = Some(state.default_model_path.clone());
@@ -1129,27 +1196,6 @@ fn apply_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) -> Res
         request.config_path = Some(state.default_config_path.clone());
     }
     Ok(())
-}
-
-fn resolve_trusted_style(styles_dir: &Path, requested: &Path) -> Result<PathBuf> {
-    let root = styles_dir
-        .canonicalize()
-        .with_context(|| format!("failed to resolve style directory {}", styles_dir.display()))?;
-    let mut candidates = vec![requested.to_path_buf()];
-    if !requested.is_absolute() {
-        candidates.push(root.join(requested));
-    }
-    for candidate in candidates {
-        if let Ok(resolved) = candidate.canonicalize() {
-            if resolved.starts_with(&root)
-                && resolved.extension().and_then(|value| value.to_str()) == Some("yaml")
-                && resolved.is_file()
-            {
-                return Ok(resolved);
-            }
-        }
-    }
-    anyhow::bail!("style must be one of the server-provided YAML profiles")
 }
 
 /// Public-mode sandbox for a single-page colorize request: the input must
@@ -3297,7 +3343,11 @@ fn default_model_path() -> PathBuf {
 }
 
 fn default_server_config_path() -> PathBuf {
-    PathBuf::from("configs/engine.studio.yaml")
+    PathBuf::from("configs/engine.default.yaml")
+}
+
+fn default_server_style_path() -> PathBuf {
+    PathBuf::from("configs/styles/soft_cel_anime_v2.yaml")
 }
 
 fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
@@ -3926,12 +3976,13 @@ mod tests {
     }
 
     #[test]
-    fn public_engine_policy_forces_trusted_model_and_config() {
+    fn public_engine_policy_pins_one_server_owned_mode() {
         let dir = tempfile::tempdir().unwrap();
         let styles_dir = dir.path().join("styles");
         std::fs::create_dir_all(&styles_dir).unwrap();
         let style = styles_dir.join("trusted.yaml");
         std::fs::write(&style, "id: trusted\nname: Trusted\n").unwrap();
+        let default_style_path = style.canonicalize().unwrap();
         let state = ApiState {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             jobs_dir: dir.path().join("jobs"),
@@ -3943,6 +3994,7 @@ mod tests {
             job_retention_hours: 168,
             default_model_path: dir.path().join("trusted.onnx"),
             default_config_path: dir.path().join("trusted.yaml"),
+            default_style_path: default_style_path.clone(),
             production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
             file_root: dir.path().join("jobs"),
             sandbox_jobs: true,
@@ -3951,7 +4003,16 @@ mod tests {
         let mut request = ColorizeRequest {
             model_path: Some(PathBuf::from("attacker.pkl")),
             config_path: Some(PathBuf::from("attacker.yaml")),
-            style_path: Some(style),
+            preset_path: Some(PathBuf::from("attacker-preset.yaml")),
+            style_path: Some(PathBuf::from("attacker-style.yaml")),
+            palette_path: Some(PathBuf::from("attacker-palette.yaml")),
+            palette_override: Some(vec![ColorRgb { r: 1, g: 2, b: 3 }]),
+            auto_palette: true,
+            ensemble_model_paths: vec![PathBuf::from("attacker-ensemble.pkl")],
+            enable_ensemble: true,
+            pyramid_enabled: true,
+            hint_propagation_enabled: true,
+            legacy_grade: true,
             use_mock_backend: true,
             ..ColorizeRequest::default()
         };
@@ -3967,11 +4028,140 @@ mod tests {
             request.config_path.as_deref(),
             Some(state.default_config_path.as_path())
         );
+        assert_eq!(
+            request.style_path.as_deref(),
+            Some(default_style_path.as_path())
+        );
+        assert!(request.preset_path.is_none());
+        assert!(request.palette_path.is_none());
+        assert!(request.palette_override.is_none());
+        assert!(!request.auto_palette);
+        assert!(request.ensemble_model_paths.is_empty());
+        assert!(!request.enable_ensemble);
+        assert!(!request.pyramid_enabled);
+        assert!(!request.hint_propagation_enabled);
+        assert!(!request.legacy_grade);
         assert!(!request.use_mock_backend);
-        assert!(request
-            .style_path
-            .unwrap()
-            .starts_with(state.styles_dir.canonicalize().unwrap()));
+
+        let mut durable_payload = serde_json::to_value(ColorizeRequest {
+            model_path: Some(PathBuf::from("user-model.pkl")),
+            config_path: Some(PathBuf::from("user-config.yaml")),
+            preset_path: Some(PathBuf::from("user-preset.yaml")),
+            style_path: Some(PathBuf::from("user-style.yaml")),
+            palette_path: Some(PathBuf::from("user-palette.yaml")),
+            enable_ensemble: true,
+            ensemble_model_paths: vec![PathBuf::from("user-ensemble.pkl")],
+            pyramid_enabled: true,
+            legacy_grade: true,
+            ..ColorizeRequest::default()
+        })
+        .unwrap();
+        enforce_public_durable_engine_policy("colorize", &mut durable_payload, &state).unwrap();
+        let durable_request: ColorizeRequest = serde_json::from_value(durable_payload).unwrap();
+        assert_eq!(
+            durable_request.model_path.as_deref(),
+            Some(state.default_model_path.as_path())
+        );
+        assert_eq!(
+            durable_request.config_path.as_deref(),
+            Some(state.default_config_path.as_path())
+        );
+        assert_eq!(
+            durable_request.style_path.as_deref(),
+            Some(state.default_style_path.as_path())
+        );
+        assert!(durable_request.preset_path.is_none());
+        assert!(durable_request.palette_path.is_none());
+        assert!(!durable_request.enable_ensemble);
+        assert!(durable_request.ensemble_model_paths.is_empty());
+        assert!(!durable_request.pyramid_enabled);
+        assert!(!durable_request.legacy_grade);
+
+        let mut chapter_payload = serde_json::to_value(ChapterJobRequest {
+            input_path: PathBuf::from("chapter.cbz"),
+            work_dir: PathBuf::from("work"),
+            output_dir: PathBuf::from("out"),
+            export_path: None,
+            gallery_path: None,
+            manifest_path: None,
+            brain_report_path: None,
+            locked_style_path: None,
+            palette_memory_path: None,
+            palette_memory_style_path: None,
+            safety_report_path: None,
+            colorize_template: ColorizeRequest {
+                style_path: Some(PathBuf::from("chapter-style.yaml")),
+                palette_path: Some(PathBuf::from("chapter-palette.yaml")),
+                enable_ensemble: true,
+                pyramid_enabled: true,
+                legacy_grade: true,
+                ..ColorizeRequest::default()
+            },
+            import_options: ChapterImportOptions::default(),
+            safety_gate: ChapterSafetyGateConfig::default(),
+            consistency_retry: ChapterConsistencyRetry::default(),
+            resume: false,
+        })
+        .unwrap();
+        enforce_public_durable_engine_policy("chapter", &mut chapter_payload, &state).unwrap();
+        let chapter_request: ChapterJobRequest = serde_json::from_value(chapter_payload).unwrap();
+        assert_eq!(
+            chapter_request.colorize_template.style_path.as_deref(),
+            Some(state.default_style_path.as_path())
+        );
+        assert!(chapter_request.colorize_template.palette_path.is_none());
+        assert!(!chapter_request.colorize_template.enable_ensemble);
+        assert!(!chapter_request.colorize_template.pyramid_enabled);
+        assert!(!chapter_request.colorize_template.legacy_grade);
+    }
+
+    #[test]
+    fn local_operator_engine_policy_preserves_explicit_research_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit_style = dir.path().join("research-style.yaml");
+        let state = ApiState {
+            jobs: Arc::new(RwLock::new(HashMap::new())),
+            jobs_dir: dir.path().join("jobs"),
+            styles_dir: dir.path().join("styles"),
+            cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
+            event_channels: Arc::new(RwLock::new(HashMap::new())),
+            job_slots: Arc::new(Semaphore::new(1)),
+            max_concurrent_jobs: 1,
+            job_retention_hours: 168,
+            default_model_path: dir.path().join("trusted.onnx"),
+            default_config_path: dir.path().join("trusted.yaml"),
+            default_style_path: dir.path().join("default-style.yaml"),
+            production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
+            file_root: dir.path().join("jobs"),
+            sandbox_jobs: false,
+            allowed_origins: vec![],
+        };
+        let mut request = ColorizeRequest {
+            style_path: Some(explicit_style.clone()),
+            palette_path: Some(dir.path().join("research-palette.yaml")),
+            enable_ensemble: true,
+            pyramid_enabled: true,
+            legacy_grade: true,
+            ..ColorizeRequest::default()
+        };
+
+        apply_engine_defaults(&mut request, &state).unwrap();
+
+        assert_eq!(
+            request.style_path.as_deref(),
+            Some(explicit_style.as_path())
+        );
+        assert!(request.palette_path.is_some());
+        assert!(request.enable_ensemble);
+        assert!(request.pyramid_enabled);
+        assert!(request.legacy_grade);
+
+        let mut defaulted_request = ColorizeRequest::default();
+        apply_engine_defaults(&mut defaulted_request, &state).unwrap();
+        assert_eq!(
+            defaulted_request.style_path.as_deref(),
+            Some(state.default_style_path.as_path())
+        );
     }
 
     #[test]
@@ -4021,10 +4211,40 @@ mod tests {
     #[tokio::test]
     async fn public_router_exposes_health_but_hides_local_operator_routes() {
         let dir = tempfile::tempdir().unwrap();
+        let styles_dir = dir.path().join("styles");
+        std::fs::create_dir_all(&styles_dir).unwrap();
+        std::fs::write(
+            styles_dir.join("canonical.yaml"),
+            "id: canonical\nname: Canonical\nsaturation: 1.0\ncontrast: 1.0\nbrightness: 0.0\nshadow_strength: 0.4\nhighlight_strength: 0.3\nline_strength: 1.0\npalette: ['#446688']\nprotected_colors: ['#ffffff', '#000000']\nnotes: null\n",
+        )
+        .unwrap();
+        let production = ProductionStore::open(dir.path().join("production.db")).unwrap();
+        let user = production
+            .create_user(
+                "reader@example.com",
+                "Reader",
+                mangahue_production::UserTier::Free,
+            )
+            .unwrap();
+        let user_token = production
+            .issue_token(&user.id, "test user", None)
+            .unwrap()
+            .token;
+        let admin = production
+            .create_user(
+                "admin@example.com",
+                "Admin",
+                mangahue_production::UserTier::Admin,
+            )
+            .unwrap();
+        let admin_token = production
+            .issue_token(&admin.id, "test admin", None)
+            .unwrap()
+            .token;
         let state = ApiState {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             jobs_dir: dir.path().join("jobs"),
-            styles_dir: dir.path().join("styles"),
+            styles_dir,
             cancel_tokens: Arc::new(RwLock::new(HashMap::new())),
             event_channels: Arc::new(RwLock::new(HashMap::new())),
             job_slots: Arc::new(Semaphore::new(1)),
@@ -4032,7 +4252,8 @@ mod tests {
             job_retention_hours: 168,
             default_model_path: dir.path().join("model.onnx"),
             default_config_path: dir.path().join("engine.yaml"),
-            production: ProductionStore::open(dir.path().join("production.db")).unwrap(),
+            default_style_path: dir.path().join("style.yaml"),
+            production,
             file_root: dir.path().join("jobs"),
             sandbox_jobs: true,
             allowed_origins: vec![],
@@ -4091,6 +4312,32 @@ mod tests {
                 "{path} must not be anonymously accessible in public mode"
             );
         }
+
+        let styles_as_user = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/styles")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(styles_as_user.status(), StatusCode::FORBIDDEN);
+
+        let styles_as_admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/styles")
+                    .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(styles_as_admin.status(), StatusCode::OK);
 
         let root = app
             .clone()

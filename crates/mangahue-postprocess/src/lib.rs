@@ -926,6 +926,28 @@ fn restore_protected_paper_and_ink(
     restored
 }
 
+/// Re-apply the non-negotiable ink, text, bubble-paper, and bright-paper
+/// invariants after full-resolution reconstruction and any delivery-time
+/// region locks. This wrapper is intentionally narrow: protected midtone
+/// artwork is left colored unless it is evidenced as paper or ink.
+pub fn restore_delivery_protected_regions(
+    image: &mut RgbImage,
+    original_gray: &GrayImage,
+    line_mask: &GrayImage,
+    bubble_mask: &GrayImage,
+    protected_mask: &GrayImage,
+) -> u64 {
+    let restored = restore_protected_paper_and_ink(
+        image,
+        original_gray,
+        line_mask,
+        bubble_mask,
+        protected_mask,
+    );
+    enforce_strong_ink(image, line_mask);
+    restored
+}
+
 /// Strong manga ink is an invariant, not a style choice. The adaptive pass
 /// keeps anti-aliased edges, while this final floor removes residual colored
 /// ink left by inference or sharpening.
@@ -1904,14 +1926,13 @@ pub fn remove_color_specks(image: &mut RgbImage, line_mask: &GrayImage) {
     *image = work;
 }
 
-/// Remove printed halftone dot artifacts from already-colored pages: small
+/// Remove printed halftone dot artifacts from colorized/printed pages: small
 /// saturated warm-color components (dark red/orange print dots on lighter
 /// paper, measured on the user's colored scan: 1-8px clusters, hue 0-60 /
 /// 250-360, strongly saturated) are replaced with the local background
-/// (median RGB of the 9x9 neighborhood). This is the pass-through path's
-/// dot cleanup: the engine's own despeckle handles model noise on grayscale
-/// pages, but already-colored pages ship untouched and carry their print
-/// dots to the user. Black ink carries no strong chroma so it is never in
+/// (median RGB of the 9x9 neighborhood). The engine's ordinary despeckle
+/// handles sparse model noise; this pass handles source print dots that can
+/// survive inference. Black ink carries no strong chroma so it is never in
 /// the mask; large colored regions (solid fills, gradients) are not small
 /// components and survive exactly. Returns the number of replaced pixels.
 pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {

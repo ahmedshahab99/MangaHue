@@ -2,9 +2,9 @@
 
 Status of this document: live plan, updated 2026-08-11. The bot is in launch
 state: chapters from nhentai, mangadex, manganato, e-hentai, imhentai,
-allporncomic.com and ilikecomix.com, with already-colored pass-through,
+allporncomic.com and ilikecomix.com, with mandatory per-page inference,
 DDColor-full native inference (f32 chroma pipeline), smart color governor and
-per-page metrics.
+per-page delivery proofs.
 
 ---
 
@@ -17,7 +17,7 @@ comics — the benchmark set itself must be created first, from real chapters
 users send).
 
 1. **Benchmark harness** — pin a fixed chapter set + expected verdicts
-   (already-colored vs colorized) + quality targets (sat band, colorfulness
+   (production-ready vs explicitly withheld) + quality targets (sat band, colorfulness
    band, warmth band). Every engine change must move a metric toward target
    without regressing another. Without this, "improvements" are vibes.
 2. **Wire the remaining dead knobs** — `engine.preserve_lines`,
@@ -34,9 +34,8 @@ users send).
    the stage off. Same for `protected_colors` (parse + honor).
 5. **Reference-photo grading v2** — the `ref` feature exists; make it
    per-series automatic: when a chat colorizes chapters of the same series,
-   remember the series' palette (from colored pages that pass through!) and
-   auto-grade subsequent B&W pages toward that palette. The pass-through
-   feature makes colored chapters a free palette source.
+   remember the series' palette from approved references/corrections and
+   auto-grade subsequent B&W pages toward that palette.
 
 ## Phase 2 — Model upgrades (after Phase 1; ~1-2 weeks)
 
@@ -81,14 +80,16 @@ users send).
 ## Metrics we track (per page, already in reports)
 
 - avg_saturation / colorfulness / brightness / contrast (color_metrics stage)
-- director verdict (already colored / needs_* / ok)
+- director verdict (production_ready* / needs_*)
 - inference_ms / postprocess_ms / total_ms
-- Already-colored detection: mean sat + colored share (thresholds in preset)
+- Delivery colorization proof: completed inference + visible chroma +
+  input/output transformation; no already-colored pass-through
 
 ## Ground rules
 
 - Every engine change ships with a unit test + the 20-page benchmark check.
 - Never regress line preservation (1.0 today) or bubble cleanliness.
 - Config changes are the first dial, code the last.
-- All deploys go through scripts/vps_build.py (test → build → install →
-  restart; a failed build never touches the running service).
+- All deploys go through the immutable GitHub release workflow (test → build
+  → checksummed artifact → atomic promotion; a failed gate never touches the
+  running service).

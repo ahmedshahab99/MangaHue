@@ -1,15 +1,7 @@
 engine:
-  mode: fast
   parallel_jobs: 1
   pyramid_enabled: true
   hint_propagation_enabled: true
-  # Pages the publisher shipped in color pass through untouched (full-color
-  # western comics are common): re-colorizing them wastes inference and
-  # distorts the artist's palette. Mean HSV saturation over non-paper pixels
-  # plus the share of pixels carrying real color (sat > 0.15).
-  skip_already_colored: true
-  already_colored_sat_threshold: 0.08
-  already_colored_colored_fraction: 0.05
 
 preprocess:
   denoise_enabled: false
@@ -23,7 +15,9 @@ layout:
   tile_overlap: 0
 
 inference:
-  model_path: models/ddcolor-full-fp16.onnx
+  # Canonical model family. Production passes its external, checksum-pinned
+  # absolute path explicitly; this relative path keeps local runs portable.
+  model_path: models/ddcolor-full-fp32.onnx
   model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
   device: cpu
   batch_size: 1

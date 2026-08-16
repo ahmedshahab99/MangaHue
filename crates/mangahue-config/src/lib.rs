@@ -8,15 +8,6 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EngineMode {
-    Fast,
-    Balanced,
-    Quality,
-    Debug,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ReadingDirection {
     LeftToRight,
     RightToLeft,
@@ -24,7 +15,6 @@ pub enum ReadingDirection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineSection {
-    pub mode: EngineMode,
     pub preserve_lines: bool,
     pub protect_speech_bubbles: bool,
     pub save_debug_outputs: bool,
@@ -34,30 +24,6 @@ pub struct EngineSection {
     pub pyramid_enabled: bool,
     #[serde(default)]
     pub hint_propagation_enabled: bool,
-    /// Pass already-colored pages through untouched instead of re-colorizing
-    /// them (full-color western comics are common).
-    #[serde(default = "default_skip_already_colored")]
-    pub skip_already_colored: bool,
-    /// Mean HSV saturation (over non-paper pixels) above which a page counts
-    /// as already colored.
-    #[serde(default = "default_already_colored_sat_threshold")]
-    pub already_colored_sat_threshold: f32,
-    /// Minimum share of non-paper pixels carrying real color (sat > 0.15)
-    /// for the already-colored verdict (rejects warm-tinted grayscale).
-    #[serde(default = "default_already_colored_colored_fraction")]
-    pub already_colored_colored_fraction: f32,
-}
-
-fn default_skip_already_colored() -> bool {
-    true
-}
-
-fn default_already_colored_sat_threshold() -> f32 {
-    0.08
-}
-
-fn default_already_colored_colored_fraction() -> f32 {
-    0.05
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +132,7 @@ pub struct PostprocessSection {
     /// blends such pixels toward their neighborhood.
     #[serde(default = "default_despeckle_color_specks")]
     pub despeckle_color_specks: bool,
-    /// Remove printed halftone dot artifacts on already-colored pages:
+    /// Remove printed halftone dot artifacts and periodic chroma noise:
     /// small saturated warm-color clusters (dark red/orange print dots on
     /// lighter paper — the "red dots" on colored scans) are replaced with
     /// the local background color. Black ink and large colored regions are
@@ -417,9 +383,33 @@ pub struct OutputSection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalSection {
     pub line_preservation_threshold: f32,
+    /// Below this score the page is delivery-blocking (`needs_*`); between
+    /// this and `line_preservation_threshold` the page is delivered with a
+    /// non-blocking warning. Real model outputs routinely lighten hard
+    /// anti-aliased or fine line work enough to miss the historic strict
+    /// threshold without any visible damage.
+    #[serde(default = "default_line_preservation_block_threshold")]
+    pub line_preservation_block_threshold: f32,
     pub protected_region_violation_threshold: f32,
+    /// Below this score the page is delivery-blocking (`needs_*`); between
+    /// this and `protected_region_violation_threshold` the page is delivered
+    /// with a non-blocking warning. Real manga pages routinely score
+    /// 0.55-0.75 here because the protected mask is deliberately dilated
+    /// around glyphs while the last-mile restore preserves midtone material
+    /// color, so the historical single threshold caused valid chapters to
+    /// lose pages.
+    #[serde(default = "default_protected_region_block_threshold")]
+    pub protected_region_block_threshold: f32,
     pub hint_adherence_threshold: f32,
     pub screen_tone_warning_threshold: f32,
+}
+
+fn default_line_preservation_block_threshold() -> f32 {
+    0.55
+}
+
+fn default_protected_region_block_threshold() -> f32 {
+    0.45
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -464,7 +454,9 @@ impl Default for EvalSection {
     fn default() -> Self {
         Self {
             line_preservation_threshold: 0.92,
+            line_preservation_block_threshold: default_line_preservation_block_threshold(),
             protected_region_violation_threshold: 0.96,
+            protected_region_block_threshold: default_protected_region_block_threshold(),
             hint_adherence_threshold: 0.72,
             screen_tone_warning_threshold: 0.18,
         }
@@ -519,7 +511,6 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             engine: EngineSection {
-                mode: EngineMode::Balanced,
                 preserve_lines: true,
                 protect_speech_bubbles: true,
                 save_debug_outputs: false,
@@ -527,9 +518,6 @@ impl Default for EngineConfig {
                 parallel_jobs: 0,
                 pyramid_enabled: false,
                 hint_propagation_enabled: false,
-                skip_already_colored: default_skip_already_colored(),
-                already_colored_sat_threshold: default_already_colored_sat_threshold(),
-                already_colored_colored_fraction: default_already_colored_colored_fraction(),
             },
             preprocess: PreprocessSection {
                 grayscale_mode: "luma".to_string(),
@@ -834,6 +822,23 @@ mod tests {
         assert_eq!(config.layout.tile_size, 512);
         assert_eq!(config.layout.tile_overlap, 64);
         assert!((config.postprocess.line_strength - 1.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn legacy_mode_and_already_colored_keys_cannot_reenable_bypass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-engine.yaml");
+        fs::write(
+            &path,
+            "engine:\n  mode: fast\n  skip_already_colored: true\n  already_colored_sat_threshold: 0.01\n  already_colored_colored_fraction: 0.01\n",
+        )
+        .unwrap();
+
+        // Legacy deployment files remain parseable, but those removed keys
+        // have no representation in EngineConfig and therefore no behavior.
+        let config = EngineConfig::from_path(path).unwrap();
+        assert!(config.engine.preserve_lines);
+        assert!(config.engine.protect_speech_bubbles);
     }
 
     #[test]

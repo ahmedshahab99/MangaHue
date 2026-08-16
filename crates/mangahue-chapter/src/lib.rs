@@ -8,7 +8,7 @@ use mangahue_brain::{
     SafetyGateThresholds,
 };
 use mangahue_config::load_style_profile;
-use mangahue_core::StyleProfile;
+use mangahue_core::{ProcessingReport, StyleProfile};
 use mangahue_image::{
     export_chapter_archive, import_chapter_to_dir, write_chapter_manifest, ChapterImportOptions,
     ChapterManifest,
@@ -403,7 +403,7 @@ fn process_manifest_pages(
         match result {
             Ok(result) => {
                 let verdict = result.report.director_verdict.clone();
-                let approved = delivery_quality_approved(verdict.as_deref());
+                let approved = delivery_quality_approved(&result.report);
                 manifest.pages[index].status = if approved {
                     ChapterPageStatus::Complete
                 } else {
@@ -437,11 +437,8 @@ fn process_manifest_pages(
     }
 
     recompute_counts(&mut manifest);
-    manifest.status = if manifest.failed == 0 {
-        ChapterJobStatus::Complete
-    } else {
-        ChapterJobStatus::Failed
-    };
+    record_partial_delivery_warning(&mut manifest);
+    manifest.status = chapter_job_status(&manifest);
     if let Some(report) = write_chapter_brain_outputs(request, &manifest)? {
         apply_brain_report_to_manifest(&mut manifest, &report);
         save_job_manifest(&mut manifest, manifest_path)?;
@@ -457,11 +454,8 @@ fn process_manifest_pages(
         }
     }
     recompute_counts(&mut manifest);
-    manifest.status = if manifest.failed == 0 {
-        ChapterJobStatus::Complete
-    } else {
-        ChapterJobStatus::Failed
-    };
+    record_partial_delivery_warning(&mut manifest);
+    manifest.status = chapter_job_status(&manifest);
     if let Some(report) = write_chapter_safety_outputs(request, &manifest)? {
         apply_safety_report_to_manifest(&mut manifest, &report);
         if request.safety_gate.enforce && !report.pass {
@@ -628,7 +622,7 @@ fn run_consistency_retry(
         match engine.colorize(colorize) {
             Ok(result) => {
                 let verdict = result.report.director_verdict.clone();
-                let approved = delivery_quality_approved(verdict.as_deref());
+                let approved = delivery_quality_approved(&result.report);
                 manifest.pages[index].status = if approved {
                     ChapterPageStatus::Complete
                 } else {
@@ -694,10 +688,33 @@ fn configure_color_bible_page(
     );
 }
 
-fn delivery_quality_approved(verdict: Option<&str>) -> bool {
-    verdict.is_some_and(|verdict| {
-        verdict == "already colored" || verdict.starts_with("production_ready")
-    })
+fn delivery_quality_approved(report: &ProcessingReport) -> bool {
+    let verdict_ready = report
+        .director_verdict
+        .as_deref()
+        .is_some_and(|verdict| verdict.starts_with("production_ready"));
+    let inference_completed = report.stage_reports.iter().any(|stage| {
+        stage.name == "inference"
+            && stage
+                .metrics
+                .get("tiles_completed")
+                .is_some_and(|tiles| *tiles >= 1.0)
+    });
+    let coverage_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_coverage"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    let transformation_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_transform"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    verdict_ready && inference_completed && coverage_passed && transformation_passed
 }
 
 fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
@@ -874,6 +891,38 @@ fn recompute_counts(manifest: &mut ChapterJobManifest) {
         .count();
 }
 
+/// A chapter delivers per-page: completed pages are real value, so a job
+/// with at least one delivered page completes even when other pages were
+/// withheld. Withheld pages stay visible as `Failed` in the manifest and
+/// gallery and are listed in the job warnings. Only a job that delivered
+/// nothing fails outright.
+fn chapter_job_status(manifest: &ChapterJobManifest) -> ChapterJobStatus {
+    if manifest.failed == 0 || manifest.processed >= 1 {
+        ChapterJobStatus::Complete
+    } else {
+        ChapterJobStatus::Failed
+    }
+}
+
+fn record_partial_delivery_warning(manifest: &mut ChapterJobManifest) {
+    if manifest.failed == 0 || manifest.processed == 0 {
+        return;
+    }
+    let pages = manifest
+        .pages
+        .iter()
+        .filter(|page| page.status == ChapterPageStatus::Failed)
+        .map(|page| page.index)
+        .collect::<Vec<_>>();
+    let message = format!(
+        "{} page(s) withheld ({pages:?}); {}/{} pages delivered",
+        manifest.failed, manifest.processed, manifest.total_pages
+    );
+    if !manifest.warnings.iter().any(|warning| warning == &message) {
+        manifest.warnings.push(message);
+    }
+}
+
 fn image_tag(base_dir: &Path, path: &Path, label: &str) -> String {
     let src = relative_or_original(base_dir, path)
         .to_string_lossy()
@@ -912,6 +961,29 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     #[test]
+    fn delivery_requires_ready_verdict_and_completed_inference() {
+        let mut report = ProcessingReport {
+            director_verdict: Some("production_ready_preview".to_string()),
+            ..ProcessingReport::default()
+        };
+        assert!(!delivery_quality_approved(&report));
+        report.add_stage_report(
+            mangahue_core::StageReport::new("inference").metric("tiles_completed", 1.0),
+        );
+        assert!(!delivery_quality_approved(&report));
+        report.add_stage_report(
+            mangahue_core::StageReport::new("colorization_coverage").metric("passed", 1.0),
+        );
+        assert!(!delivery_quality_approved(&report));
+        report.add_stage_report(
+            mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
+        );
+        assert!(delivery_quality_approved(&report));
+        report.director_verdict = Some("already colored".to_string());
+        assert!(!delivery_quality_approved(&report));
+    }
+
+    #[test]
     fn resolves_page_specific_region_locks_from_directory() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("page_001.region-locks.json");
@@ -933,8 +1005,11 @@ mod tests {
         let work = dir.path().join("work");
         let manifest_path = output.join("job.json");
         fs::create_dir_all(&input).unwrap();
-        write_test_png(&input.join("page2.png"), [20, 20, 20]);
-        write_test_png(&input.join("page1.png"), [10, 10, 10]);
+        // Midtone pages exercise the full mock colorization path. Uniform
+        // near-black fixtures are correctly classified as ink-only and are
+        // therefore not valid evidence for a colorized delivery.
+        write_test_png(&input.join("page2.png"), [180, 180, 180]);
+        write_test_png(&input.join("page1.png"), [160, 160, 160]);
 
         let request = ChapterJobRequest {
             input_path: input,
@@ -977,6 +1052,57 @@ mod tests {
         assert_eq!(resumed.skipped, 2);
         assert_eq!(resumed.pages[0].status, ChapterPageStatus::Skipped);
         assert!(manifest_path.exists());
+    }
+
+    #[test]
+    fn chapter_job_completes_partially_when_some_pages_are_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        let work = dir.path().join("work");
+        let manifest_path = output.join("job.json");
+        fs::create_dir_all(&input).unwrap();
+        // Two midtone pages deliver; the uniform black fixture is classified
+        // as ink-only and is correctly withheld by the delivery gates.
+        write_test_png(&input.join("page1.png"), [180, 180, 180]);
+        write_test_png(&input.join("page2.png"), [0, 0, 0]);
+        write_test_png(&input.join("page3.png"), [160, 160, 160]);
+
+        let request = ChapterJobRequest {
+            input_path: input,
+            work_dir: work,
+            output_dir: output.clone(),
+            export_path: Some(output.join("chapter.cbz")),
+            gallery_path: Some(output.join("gallery.html")),
+            manifest_path: Some(manifest_path.clone()),
+            brain_report_path: Some(output.join("brain.json")),
+            locked_style_path: Some(output.join("locked_style.json")),
+            palette_memory_path: Some(output.join("palette_memory.json")),
+            palette_memory_style_path: Some(output.join("palette_memory_style.json")),
+            safety_report_path: Some(output.join("safety.json")),
+            colorize_template: ColorizeRequest {
+                use_mock_backend: true,
+                ..ColorizeRequest::default()
+            },
+            import_options: ChapterImportOptions::default(),
+            safety_gate: ChapterSafetyGateConfig::default(),
+            consistency_retry: ChapterConsistencyRetry::default(),
+            resume: false,
+        };
+        let manifest = run_chapter_job(request).unwrap();
+
+        // The job completes and exports what was actually delivered instead
+        // of failing the whole chapter because one page was withheld.
+        assert_eq!(manifest.status, ChapterJobStatus::Complete);
+        assert_eq!(manifest.processed, 2);
+        assert_eq!(manifest.failed, 1);
+        assert_eq!(manifest.pages[1].status, ChapterPageStatus::Failed);
+        assert!(manifest
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("withheld")));
+        assert!(output.join("chapter.cbz").exists());
+        assert!(output.join("gallery.html").exists());
     }
 
     fn write_test_png(path: &Path, color: [u8; 3]) {

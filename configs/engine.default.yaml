@@ -1,5 +1,4 @@
 engine:
-  mode: balanced
   preserve_lines: true
   protect_speech_bubbles: true
   save_debug_outputs: false

@@ -97,14 +97,27 @@ services:
       - "/data/telegram"
       - "--max-pages"
       - "${TELEGRAM_MAX_PAGES:-32}"
-      # Soft-cel tier: DDColor-FULL + soft cel-shaded anime grade
-      # (region base colors, specular gloss, warm ambient, controlled sat).
+      - "--max-concurrent-jobs"
+      - "1"
+      - "--max-queued-jobs"
+      - "${TELEGRAM_MAX_QUEUED_JOBS:-16}"
+      - "--max-queued-jobs-per-chat"
+      - "1"
+      - "--batch-size"
+      - "1"
+      - "--retention-hours"
+      - "${CLEANUP_AFTER_HOURS:-24}"
+      # The same single automatic pipeline used by the systemd production
+      # service. User style/palette modes are intentionally unavailable.
       - "--model"
-      - "/app/models/ddcolor-full-fp16.onnx"
+      - "${MANGAHUE_MODEL_PATH:-/app/models/ddcolor-full-fp32.onnx}"
       - "--preset"
-      - "/app/configs/engine.telegram-soft-cel.yaml"
+      - "/app/configs/engine.telegram-pure-model-v2.yaml"
       - "--style"
-      - "/app/configs/styles/soft_cel_anime.yaml"
+      - "/app/configs/styles/soft_cel_anime_v2.yaml"
+      - "--palette-feedback"
+      - "--cache-dir"
+      - "/data/cache"
       - "--daily-limit"
       - "${DAILY_PAGE_LIMIT:-0}"
     environment:
@@ -142,6 +155,8 @@ services:
         max_attempts: 3
         window: 120s
 
+  # Compatibility/research image for constrained local experiments. It is
+  # not the production bot and exposes the same single-mode Telegram UX.
   telegram-small:
     image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${SMALL_TAG:-small}
     pull_policy: always

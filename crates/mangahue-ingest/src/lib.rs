@@ -527,22 +527,28 @@ fn alternate_nhentai_hosts(url: &Url) -> Vec<Url> {
     let Some(num_str) = prefix.strip_prefix('i') else {
         return Vec::new();
     };
-    if num_str.is_empty() || !num_str.chars().all(|c| c.is_ascii_digit()) {
+    if !num_str.chars().all(|c| c.is_ascii_digit()) {
         return Vec::new();
     }
-    let num: u32 = num_str.parse().unwrap_or(0);
+    let current = if num_str.is_empty() {
+        None
+    } else {
+        num_str.parse::<u32>().ok()
+    };
     let mut siblings = Vec::new();
     for n in 1..=4u32 {
-        if n != num {
+        if current != Some(n) {
             let mut sibling = url.clone();
             if sibling.set_host(Some(&format!("i{n}{domain}"))).is_ok() {
                 siblings.push(sibling);
             }
         }
     }
-    let mut canonical = url.clone();
-    if canonical.set_host(Some(&format!("i{domain}"))).is_ok() {
-        siblings.push(canonical);
+    if current.is_some() {
+        let mut canonical = url.clone();
+        if canonical.set_host(Some(&format!("i{domain}"))).is_ok() {
+            siblings.push(canonical);
+        }
     }
     siblings
 }
@@ -792,6 +798,21 @@ mod tests {
                 validate_public_url(&url).is_ok(),
                 "rejected public URL {value}"
             );
+        }
+    }
+
+    #[test]
+    fn canonical_nhentai_host_has_all_numbered_fallbacks() {
+        let url = Url::parse("https://i.nhentai.net/galleries/123/1.jpg").unwrap();
+        let alternatives = alternate_nhentai_hosts(&url);
+        assert_eq!(alternatives.len(), 4);
+        for host in [
+            "i1.nhentai.net",
+            "i2.nhentai.net",
+            "i3.nhentai.net",
+            "i4.nhentai.net",
+        ] {
+            assert!(alternatives.iter().any(|url| url.host_str() == Some(host)));
         }
     }
 }

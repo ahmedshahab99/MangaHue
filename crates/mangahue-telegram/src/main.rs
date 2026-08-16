@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+use mangahue_core::ProcessingReport;
 use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
-use mangahue_ingest::{
-    extract_manga_tags, extract_manga_urls, validate_public_url, SafePublicResolver,
-};
+use mangahue_ingest::{extract_manga_urls, validate_public_url, SafePublicResolver};
 use mangahue_intelligence::{plan_correction_impact, StructureGraph};
 use mangahue_memory::{
     ColorBible, ColorBibleCorrection, ColorBibleReference, ColorSelector, CorrectionScope,
@@ -17,13 +16,11 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-mod mood;
 mod palette_feedback;
 mod watermark;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -45,16 +42,43 @@ const MAX_PHOTO_PIXELS: u64 = 32_000_000;
 const TELEGRAM_MAX_ATTEMPTS: usize = 3;
 /// First retry delay in seconds; each retry doubles it (2s, 4s).
 const TELEGRAM_RETRY_BASE_SECS: u64 = 2;
+/// Retry one transient engine/backend failure before explicitly failing a
+/// page. Quality-gate rejections are repaired inside the engine and are not
+/// blindly re-run with identical inputs.
+const PAGE_COLORIZE_MAX_ATTEMPTS: usize = 2;
 
 /// Telegram Bot API base URL. Defaults to api.telegram.org; the
 /// `--telegram-api-base` flag / `MANGAHUE_TELEGRAM_API` env can point at a
 /// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
 
-fn delivery_quality_approved(verdict: Option<&str>) -> bool {
-    verdict.is_some_and(|verdict| {
-        verdict == "already colored" || verdict.starts_with("production_ready")
-    })
+fn delivery_quality_approved(report: &ProcessingReport) -> bool {
+    let verdict_ready = report
+        .director_verdict
+        .as_deref()
+        .is_some_and(|verdict| verdict.starts_with("production_ready"));
+    let inference_completed = report.stage_reports.iter().any(|stage| {
+        stage.name == "inference"
+            && stage
+                .metrics
+                .get("tiles_completed")
+                .is_some_and(|tiles| *tiles >= 1.0)
+    });
+    let coverage_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_coverage"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    let transformation_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_transform"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    verdict_ready && inference_completed && coverage_passed && transformation_passed
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -62,25 +86,6 @@ enum DeliveryFormat {
     Png,
     Jpeg,
 }
-
-const BUILTIN_STYLES: &[(&str, &str)] = &[
-    ("natural_manga", "Natural Manga (default)"),
-    ("realistic_comic", "Realistic Comic"),
-    ("dark_seinen", "Dark Seinen"),
-    ("watercolor_soft", "Watercolor Soft"),
-    ("retro_90s_anime", "Retro 90s Anime"),
-    // Creative mood rotation: the bot cycles these per job (unless the user
-    // picked a style explicitly) so a channel never shows two identical-
-    // looking pages. Skin hues are identical across all of them.
-    ("creative_warm_sunset", "Creative Warm Sunset"),
-    ("creative_cool_twilight", "Creative Cool Twilight"),
-    ("creative_fresh_sage", "Creative Fresh Sage"),
-    ("creative_soft_pastel", "Creative Soft Pastel"),
-    ("creative_autumn_amber", "Creative Autumn Amber"),
-    ("creative_ocean_teal", "Creative Ocean Teal"),
-    ("creative_violet_dusk", "Creative Violet Dusk"),
-    ("creative_warm_cocoa", "Creative Warm Cocoa"),
-];
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -145,12 +150,6 @@ struct Args {
     hints: Option<PathBuf>,
     #[arg(
         long,
-        default_value = "configs/palettes",
-        help = "Artist palette directory (configs/palettes/*.yaml)"
-    )]
-    palettes_dir: PathBuf,
-    #[arg(
-        long,
         help = "Per-chapter palette feedback: extract the first page's dominant hues and merge them as accent colors for the rest of the chapter (creative variety, model-derived)"
     )]
     palette_feedback: bool,
@@ -203,11 +202,6 @@ struct Args {
         help = "Allow standalone photo colorization (off by default: the launch product is chapter links; references via a photo captioned 'ref' always work)"
     )]
     photos_enabled: bool,
-    #[arg(
-        long,
-        help = "Rotate creative mood styles per job (off by default: every chapter gets the stable professional look; users can still pick any style with /style)"
-    )]
-    creative_rotation: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,13 +286,8 @@ struct DailyUsage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PerChatSettings {
-    style_path: Option<PathBuf>,
     batch_size: usize,
     reference_image: Option<PathBuf>,
-    /// Artist palette (configs/palettes/*.yaml) chosen per chat/series.
-    palette_path: Option<PathBuf>,
-    /// Auto-select the artist palette from the page fingerprint.
-    auto_palette: bool,
     #[serde(default)]
     active_series_id: Option<String>,
     #[serde(default)]
@@ -322,8 +311,6 @@ struct BotState {
     active_jobs: AtomicUsize,
     active_chats: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     per_chat_settings: Mutex<HashMap<i64, PerChatSettings>>,
-    /// Per-chat job counter driving the creative style rotation.
-    job_counter: Mutex<HashMap<i64, u64>>,
     /// FIFO queue of jobs waiting for a worker slot (chat_id, job).
     queue: Mutex<VecDeque<(i64, QueuedJob)>>,
     usage_lock: Mutex<()>,
@@ -331,8 +318,6 @@ struct BotState {
     daily_limit: usize,
     max_queued_jobs: usize,
     max_queued_jobs_per_chat: usize,
-    styles_dir: Option<PathBuf>,
-    palettes_dir: PathBuf,
 }
 
 /// Lock that recovers from poisoning: a panic in a worker thread must never
@@ -504,27 +489,6 @@ impl BotState {
         self.persist_settings_locked(chat_id, &settings);
     }
 
-    fn set_style(&self, chat_id: i64, path: Option<PathBuf>) {
-        let mut settings = lock_or_recover(&self.per_chat_settings);
-        let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            batch_size: DEFAULT_BATCH_SIZE,
-            ..PerChatSettings::default()
-        });
-        entry.style_path = path;
-        self.persist_settings_locked(chat_id, &settings);
-    }
-
-    fn set_palette(&self, chat_id: i64, path: Option<PathBuf>, auto: bool) {
-        let mut settings = lock_or_recover(&self.per_chat_settings);
-        let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
-            batch_size: DEFAULT_BATCH_SIZE,
-            ..PerChatSettings::default()
-        });
-        entry.palette_path = path;
-        entry.auto_palette = auto;
-        self.persist_settings_locked(chat_id, &settings);
-    }
-
     fn set_batch_size(&self, chat_id: i64, size: usize) {
         let mut settings = lock_or_recover(&self.per_chat_settings);
         let entry = settings.entry(chat_id).or_insert_with(|| PerChatSettings {
@@ -557,8 +521,8 @@ impl BotState {
         self.persist_settings_locked(chat_id, &settings);
     }
 
-    /// Settings live in `<work_dir>/settings/chat_<id>.json` so /style,
-    /// /batch, /palette and reference choices survive restarts and deploys.
+    /// Settings live in `<work_dir>/settings/chat_<id>.json` so batch size,
+    /// references, and Color Bible context survive restarts and deploys.
     fn settings_dir(&self) -> PathBuf {
         // usage_path = <work_dir>/usage/daily.json → parent(parent()) is the
         // work dir; the bot is always started with a work_dir.
@@ -704,166 +668,6 @@ impl BotState {
             let _ = std::fs::remove_file(&tmp);
         }
     }
-
-    fn available_styles(&self) -> Vec<(String, String)> {
-        let mut styles: Vec<(String, String)> = Vec::new();
-        styles.extend(
-            BUILTIN_STYLES
-                .iter()
-                .map(|&(id, name)| (id.to_string(), name.to_string())),
-        );
-        if let Some(ref dir) = self.styles_dir {
-            if dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if matches!(
-                            path.extension().and_then(|e| e.to_str()),
-                            Some("json" | "yaml" | "yml")
-                        ) {
-                            let id = path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let name = load_style_name(&path).unwrap_or_else(|| id.clone());
-                            styles.push((id, name));
-                        }
-                    }
-                }
-            }
-        }
-        styles
-    }
-
-    fn resolve_style_path(
-        &self,
-        chat_id: i64,
-        default_style: &Option<PathBuf>,
-        job_override: Option<PathBuf>,
-        creative_rotation: bool,
-    ) -> Option<PathBuf> {
-        let settings = lock_or_recover(&self.per_chat_settings);
-        let explicit = settings.get(&chat_id).and_then(|s| s.style_path.clone());
-        drop(settings);
-        if explicit.is_some() {
-            return explicit;
-        }
-        // Content-aware override (source tags / page mood) wins for THIS job
-        // only — but only when it is a professional style, or when creative
-        // rotation is explicitly enabled. Without the gate, genre tags like
-        // "fantasy" inject violet-dusk palettes into every other chapter.
-        if let Some(override_path) = job_override {
-            if override_path.is_file() {
-                let creative = override_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|id| id.starts_with("creative_"));
-                if creative_rotation || !creative {
-                    return Some(override_path);
-                }
-            }
-        }
-        // Creative rotation: only when explicitly enabled (--creative-rotation).
-        // A channel then varies moods while skin stays natural; off by
-        // default so the output is predictably professional.
-        if creative_rotation {
-            if let Some(creative) = self.next_creative_style(chat_id) {
-                return Some(creative);
-            }
-        }
-        default_style.clone().or_else(|| {
-            self.styles_dir.as_ref().and_then(|dir| {
-                let candidate = dir.join("anime_cel.json");
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            })
-        })
-    }
-
-    /// Deterministically cycle through the creative styles for a chat.
-    /// Each job advances the counter, so consecutive jobs get consecutive
-    /// moods; the cycle restarts after the last style.
-    fn next_creative_style(&self, chat_id: i64) -> Option<PathBuf> {
-        let creative_ids: Vec<&str> = BUILTIN_STYLES
-            .iter()
-            .map(|&(id, _)| id)
-            .filter(|id| id.starts_with("creative_"))
-            .collect();
-        if creative_ids.is_empty() {
-            return None;
-        }
-        let dir = self.styles_dir.as_ref()?;
-        let mut counters = lock_or_recover(&self.job_counter);
-        let counter = counters.entry(chat_id).or_insert(0);
-        let index = (*counter % creative_ids.len() as u64) as usize;
-        *counter = counter.wrapping_add(1);
-        let id = creative_ids[index];
-        for extension in ["yaml", "yml", "json"] {
-            let candidate = dir.join(format!("{id}.{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
-    }
-}
-
-fn load_style_name(path: &Path) -> Option<String> {
-    let data = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = match path.extension().and_then(|value| value.to_str()) {
-        Some("yaml" | "yml") => serde_yaml::from_str(&data).ok()?,
-        _ => serde_json::from_str(&data).ok()?,
-    };
-    v.get("name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.to_string())
-}
-
-/// MarkdownV2-safe " Mood: <style name>" suffix for the scan message.
-/// Only the interpolated name is escaped; the literal markers stay literal.
-fn mood_suffix(mood_name: &str) -> String {
-    if mood_name.is_empty() {
-        String::new()
-    } else {
-        format!(" Mood\\: *{}*\\.", md2_escape(mood_name))
-    }
-}
-
-/// Escape a string for Telegram MarkdownV2 so interpolated user/artist
-/// names can never break the message or inject formatting.
-fn md2_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if matches!(
-            ch,
-            '_' | '*'
-                | '['
-                | ']'
-                | '('
-                | ')'
-                | '~'
-                | '`'
-                | '>'
-                | '#'
-                | '+'
-                | '-'
-                | '='
-                | '|'
-                | '{'
-                | '}'
-                | '.'
-                | '!'
-                | '\\'
-        ) {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 fn main() -> Result<()> {
@@ -937,33 +741,22 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&usage_dir).context("failed to create usage dir")?;
     let usage_path = usage_dir.join("daily.json");
 
-    let styles_dir = resolve_styles_dir(&args.style);
-
-    if let Some(ref dir) = styles_dir {
-        tracing::info!(styles_dir = %dir.display(), "style directory configured");
-    } else {
-        tracing::info!("no custom style directory; using built-in styles only");
-    }
-
     let state = Arc::new(BotState {
         active_jobs: AtomicUsize::new(0),
         active_chats: Mutex::new(HashMap::new()),
         per_chat_settings: Mutex::new(HashMap::new()),
-        job_counter: Mutex::new(HashMap::new()),
         queue: Mutex::new(VecDeque::new()),
         usage_lock: Mutex::new(()),
         usage_path,
         daily_limit: args.daily_limit,
         max_queued_jobs: args.max_queued_jobs.max(1),
         max_queued_jobs_per_chat: args.max_queued_jobs_per_chat.max(1),
-        styles_dir,
-        palettes_dir: args.palettes_dir.clone(),
     });
 
     // Re-hydrate per-chat reference photos after a restart so users keep
     // their saved style reference.
     restore_reference_photos(&state, &args.work_dir.join("references"));
-    // Re-hydrate /style, /batch, /palette choices and queued jobs so a
+    // Re-hydrate batch/reference/Color Bible choices and queued jobs so a
     // deploy never resets user state or silently drops queued work.
     restore_chat_settings(&state);
     let restored_queue = restore_persisted_queue(&state);
@@ -1020,17 +813,6 @@ fn build_fetch_client() -> Result<Client> {
         }))
         .build()
         .context("failed to build fetch client")
-}
-
-fn resolve_styles_dir(style_arg: &Option<PathBuf>) -> Option<PathBuf> {
-    let path = style_arg.as_ref()?;
-    if path.is_dir() {
-        Some(path.clone())
-    } else if path.is_file() {
-        path.parent().map(|p| p.to_path_buf())
-    } else {
-        None
-    }
 }
 
 fn poll_once(
@@ -1419,8 +1201,7 @@ fn handle_command(
         "/status" => cmd_status(client, token, state, chat_id),
         "/queue" => cmd_queue(client, token, state, chat_id),
         "/cancel" => cmd_cancel(client, token, state, chat_id),
-        "/style" => cmd_style(client, token, state, chat_id, &arg),
-        "/palette" => cmd_palette(client, token, state, chat_id, &arg),
+        "/style" | "/palette" => cmd_unified_mode(client, token, chat_id),
         "/batch" => cmd_batch(client, token, state, chat_id, &arg, args.batch_size),
         "/stats" => cmd_stats(client, token, state, chat_id),
         "/clean" => cmd_clean(client, token, state, args, chat_id),
@@ -2041,12 +1822,10 @@ fn handle_photo(
     }
 
     let settings = state.get_settings(chat_id, args.batch_size);
-    // Content-aware mood: pick the style from the photo's own lighting
-    // (dark ink-heavy pages -> dark styles, bright airy pages -> pastels).
-    let mood_override = mood::select_style_for_scene(&image.to_luma8())
-        .and_then(|id| resolve_style_file(state, id));
-    let style_path =
-        state.resolve_style_path(chat_id, &args.style, mood_override, args.creative_rotation);
+    // One production colorization mode: the server-pinned style is identical
+    // for photos and chapter pages. Scene lighting, references, Color Bible
+    // constraints, and palette feedback remain automatic internal stages.
+    let style_path = args.style.clone();
     let reference_image = settings
         .reference_image
         .clone()
@@ -2134,8 +1913,8 @@ fn handle_photo(
         use_mock_backend: args.mock,
         pyramid_enabled: args.pyramid,
         hint_propagation_enabled: args.hint_propagate,
-        palette_path: settings.palette_path.clone(),
-        auto_palette: settings.auto_palette,
+        palette_path: None,
+        auto_palette: false,
         cache_dir: args.cache_dir.clone(),
         cancel_token: Some(Arc::clone(&cancel_token)),
         progress_sender: Some(progress_sender),
@@ -2151,7 +1930,7 @@ fn handle_photo(
                 return Ok(());
             }
             let verdict = colorize_result.report.director_verdict.as_deref();
-            if !delivery_quality_approved(verdict) {
+            if !delivery_quality_approved(&colorize_result.report) {
                 tracing::warn!(
                     verdict = verdict.unwrap_or("missing"),
                     "delivery blocked by quality gate"
@@ -2261,8 +2040,6 @@ fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -
                 /help \\- Show this help message\n\
                 /status \\- Check if a job is running for this chat\n\
                 /cancel \\- Cancel the currently running job\n\
-                /style \\- List available color styles and choose one\n\
-                /style _name_ \\- Set a specific style by ID\n\
                 /batch \\- Show current batch size\n\
                 /batch _N_ \\- Set batch size \\(1\\-10, default 10\\)\n\
                 /stats \\- Show your daily page usage\n\
@@ -2275,7 +2052,7 @@ fn cmd_help(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64) -
                 /color _x y radius hex_ \\- Add a correction for future pages\n\
                 /rate _1\\-5 note_ \\- Record a blind beta quality rating\n\n\
                 *How it works:*\n\
-                Send a photo, a manga chapter URL, or a direct image link\\. The bot colorizes it in soft cel\\-shaded anime style and sends the result back\\.\n\n\
+                Send a photo, a manga chapter URL, or a direct image link\\. Every page runs through one automatic colorization pipeline; pages are never passed through as already colored\\.\n\n\
                 *Optional reference style:*\n\
                 Send a \\(colored\\) photo with caption \\`ref\\` to grade future pages toward that look\\. Use /resetref to clear it\\. Without it, pages get the default soft cel style\\.\n\n\
                 *Supported URL types:*\n\
@@ -2348,212 +2125,15 @@ fn cmd_cancel(client: &Client, token: &str, state: &Arc<BotState>, chat_id: i64)
     Ok(())
 }
 
-/// /palette — choose the artist color palette for this chat (per-series
-/// color memory). "auto" picks the palette from each page's fingerprint.
-fn cmd_palette(
-    client: &Client,
-    token: &str,
-    state: &Arc<BotState>,
-    chat_id: i64,
-    arg: &str,
-) -> Result<()> {
-    let arg = arg.trim();
-    let dir = &state.palettes_dir;
-    if !arg.is_empty() {
-        match arg.to_ascii_lowercase().as_str() {
-            "default" | "off" | "reset" => {
-                state.set_palette(chat_id, None, false);
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    "Palette reset to the style default.",
-                    None,
-                )?;
-                return Ok(());
-            }
-            "auto" => {
-                state.set_palette(chat_id, None, true);
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    "Auto palette enabled: each page's fingerprint picks its artist palette (seinen/shonen/shojo/fantasy/webtoon).",
-                    None,
-                )?;
-                return Ok(());
-            }
-            _ => {
-                // Only plain artist-palette ids are accepted: anything with
-                // separators could walk out of the palette directory.
-                if !arg
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-                {
-                    send_message(
-                        client,
-                        token,
-                        chat_id,
-                        "Palette names may only contain letters, digits, '-' and '_'. Use /palette to see available palettes.",
-                        None,
-                    )?;
-                    return Ok(());
-                }
-                let candidate = dir.join(format!("{arg}.yaml"));
-                if candidate.is_file() {
-                    state.set_palette(chat_id, Some(candidate), false);
-                    send_message(
-                        client,
-                        token,
-                        chat_id,
-                        &format!(
-                            "Artist palette set to *{}* for this series.",
-                            md2_escape(arg)
-                        ),
-                        Some("MarkdownV2"),
-                    )?;
-                    return Ok(());
-                }
-                send_message(
-                    client,
-                    token,
-                    chat_id,
-                    &format!("Palette '{arg}' not found. Use /palette to see available palettes."),
-                    None,
-                )?;
-                return Ok(());
-            }
-        }
-    }
-
-    // List the artist palettes from the palette directory.
-    let mut names: Vec<String> = Vec::new();
-    if dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map(|e| e == "yaml").unwrap_or(false) {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        names.push(stem.to_string());
-                    }
-                }
-            }
-        }
-    }
-    names.sort();
-    if names.is_empty() {
-        send_message(
-            client,
-            token,
-            chat_id,
-            "No artist palettes configured.",
-            None,
-        )?;
-        return Ok(());
-    }
-    let text = format!(
-        "Available artist palettes (each series has its own color vision):\n{}\n\nUse /palette <name> to set it for this series, /palette auto for automatic selection, /palette default to reset.",
-        names.iter().map(|n| format!("- {n}")).collect::<Vec<_>>().join("\n")
-    );
-    send_message(client, token, chat_id, &text, None)?;
-    Ok(())
-}
-
-fn cmd_style(
-    client: &Client,
-    token: &str,
-    state: &Arc<BotState>,
-    chat_id: i64,
-    arg: &str,
-) -> Result<()> {
-    let styles = state.available_styles();
-
-    if styles.is_empty() {
-        send_message(
-            client,
-            token,
-            chat_id,
-            "No custom styles configured. The bot is using the default Anime Cel style.",
-            None,
-        )?;
-        return Ok(());
-    }
-
-    if !arg.is_empty() {
-        if let Some((_id, name)) = styles.iter().find(|(id, _)| id == arg) {
-            let path = resolve_style_file(state, arg);
-            state.set_style(chat_id, path);
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!("Style set to *{}*.", md2_escape(name)),
-                Some("MarkdownV2"),
-            )?;
-            return Ok(());
-        }
-        send_message(
-            client,
-            token,
-            chat_id,
-            &format!("Style '{arg}' not found. Use /style to see available styles."),
-            None,
-        )?;
-        return Ok(());
-    }
-
-    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
-    for chunk in styles.chunks(2) {
-        let row: Vec<InlineKeyboardButton> = chunk
-            .iter()
-            .map(|(id, name)| {
-                InlineKeyboardButton::new(name).callback_data(format!("style:{}", id))
-            })
-            .collect();
-        rows.push(row);
-    }
-
-    let settings = state.get_settings(chat_id, DEFAULT_BATCH_SIZE);
-    let current = settings
-        .style_path
-        .as_ref()
-        .and_then(|p| p.file_stem())
-        .and_then(|s| s.to_str())
-        .unwrap_or("anime_cel");
-
+fn cmd_unified_mode(client: &Client, token: &str, chat_id: i64) -> Result<()> {
     send_message(
         client,
         token,
         chat_id,
-        &format!("Choose a color style (current: *{}*):", current),
-        Some("MarkdownV2"),
-    )
-    .map(|_| ())?;
-
-    let reply_markup = InlineKeyboardMarkup {
-        inline_keyboard: rows,
-    };
-    send_message(
-        client,
-        token,
-        chat_id,
-        "Select a style:",
-        Some(&serde_json::to_string(&reply_markup).unwrap_or_default()),
+        "MangaHue now uses one automatic colorization mode for every page. Scene lighting, Color Bible consistency, references, protection, and correction memory are applied inside that single pipeline.",
+        None,
     )?;
-
     Ok(())
-}
-
-fn resolve_style_file(state: &Arc<BotState>, style_id: &str) -> Option<PathBuf> {
-    if let Some(ref dir) = state.styles_dir {
-        for extension in ["yaml", "yml", "json"] {
-            let candidate = dir.join(format!("{style_id}.{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 fn cmd_batch(
@@ -2765,19 +2345,10 @@ fn handle_callback(
         return Ok(());
     }
 
-    if let Some(style_id) = data.strip_prefix("style:") {
-        let styles = state.available_styles();
-        if let Some((_id, name)) = styles.iter().find(|(id, _)| id == style_id) {
-            let path = resolve_style_file(state, style_id);
-            state.set_style(chat_id, path);
-            send_message(
-                client,
-                token,
-                chat_id,
-                &format!("Style set to *{}*.", md2_escape(name)),
-                Some("MarkdownV2"),
-            )?;
-        }
+    if data.starts_with("style:") {
+        // Old keyboards can remain in Telegram clients after deployment.
+        // Treat them as a no-op so stale callbacks cannot re-enable a mode.
+        cmd_unified_mode(client, token, chat_id)?;
         return Ok(());
     }
 
@@ -2867,6 +2438,19 @@ fn is_direct_image_url(url: &url::Url) -> bool {
     DIRECT_IMAGE_EXTENSIONS
         .iter()
         .any(|ext| path.ends_with(&format!(".{ext}")))
+}
+
+fn fallback_after_html_fetch_failure(
+    source_url: &url::Url,
+    fetch_url: &str,
+) -> Result<Vec<String>> {
+    if is_direct_image_url(source_url) {
+        Ok(vec![fetch_url.to_string()])
+    } else {
+        anyhow::bail!(
+            "the chapter reader could not be downloaded after retries; refusing to mistake it for a one-page image job"
+        )
+    }
 }
 
 /// Madara sites (allporncomic.com, ilikecomix.com) offer a "paged" reader
@@ -3063,27 +2647,17 @@ fn handle_link(
         mangahue_ingest::fetch_html_cloudflare_safe(fetch_client, &fetch_url, 16 * 1024 * 1024);
 
     let all_image_urls: Vec<String> = match &page_html {
-        None => vec![fetch_url.clone()],
-        Some(html) => {
-            extract_manga_urls(fetch_client, &source_url, html, &source_url, args.max_pages)?
-        }
+        None => fallback_after_html_fetch_failure(&source_url, &fetch_url)?,
+        Some(html) => extract_manga_urls(
+            fetch_client,
+            &source_url,
+            html,
+            &source_url,
+            args.max_pages.saturating_add(1),
+        )?,
     };
 
-    // Content-aware mood: the source's genre tags pick the palette for this
-    // chapter (dark/horror -> dark, romance -> pastel, fantasy -> vibrant).
-    // Falls back to creative rotation when no tags are available.
-    let tags = page_html
-        .as_deref()
-        .map(|html| extract_manga_tags(fetch_client, &source_url, html))
-        .unwrap_or_default();
-    let mood_style =
-        mood::select_style_for_tags(&tags).and_then(|id| resolve_style_file(state, id));
-    let mood_name = mood_style
-        .as_deref()
-        .and_then(load_style_name)
-        .unwrap_or_default();
-    let style_path =
-        state.resolve_style_path(chat_id, &args.style, mood_style, args.creative_rotation);
+    let style_path = args.style.clone();
 
     // Job diagnostics: URL, extracted page count and chosen style are logged
     // so "the output was rubbish" cases can be traced to extraction or
@@ -3092,8 +2666,6 @@ fn handle_link(
         url = %url,
         pages = all_image_urls.len(),
         style = %style_path.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "default".into()),
-        mood = %mood_name,
-        tags = tags.len(),
         "chapter scan complete"
     );
 
@@ -3120,6 +2692,12 @@ fn handle_link(
     if all_image_urls.is_empty() {
         anyhow::bail!("no page images were found at that URL");
     }
+    if all_image_urls.len() > args.max_pages {
+        anyhow::bail!(
+            "chapter contains more than the configured {}-page safety limit; no pages were silently skipped",
+            args.max_pages
+        );
+    }
 
     let total = all_image_urls.len();
     if cancel_token.load(Ordering::Acquire) {
@@ -3142,17 +2720,15 @@ fn handle_link(
     let status_text = if remaining < total {
         // Never hide quota truncation: the user must know pages are skipped.
         format!(
-            "Found all *{}* page\\(s\\)\\. Daily quota allows *{}* today\\. *{}* page\\(s\\) will be skipped\\.{}",
+            "Found all *{}* page\\(s\\)\\. Daily quota allows *{}* today\\. *{}* page\\(s\\) will be skipped\\.",
             total,
             effective_total,
-            total - effective_total,
-            mood_suffix(&mood_name)
+            total - effective_total
         )
     } else {
         format!(
-            "Found all *{}* page\\(s\\)\\. Coloring them one by one in chapter order\\.{}",
-            effective_total,
-            mood_suffix(&mood_name)
+            "Found all *{}* page\\(s\\)\\. Coloring every page one by one in chapter order\\.",
+            effective_total
         )
     };
     let status_msg_id = send_message(client, token, chat_id, &status_text, Some("MarkdownV2"))?;
@@ -3180,9 +2756,22 @@ fn handle_link(
     struct PageCounters {
         sent: usize,
         failed: usize,
-        quality_rejected: Vec<usize>,
-        failed_pages: Vec<PathBuf>,
+        delivered_pages: BTreeSet<usize>,
+        failures: BTreeMap<usize, String>,
         page_times: Vec<f32>,
+    }
+    impl PageCounters {
+        fn record_failure(&mut self, page: usize, reason: impl Into<String>) {
+            if self.failures.insert(page, reason.into()).is_none() {
+                self.failed += 1;
+            }
+        }
+
+        fn record_delivery(&mut self, page: usize) {
+            if self.delivered_pages.insert(page) {
+                self.sent += 1;
+            }
+        }
     }
     let counters = std::rc::Rc::new(std::cell::RefCell::new(PageCounters::default()));
     // Per-chapter palette feedback: the first successful page seeds the
@@ -3251,37 +2840,55 @@ fn handle_link(
             }
         });
 
-        let result = engine.colorize(ColorizeRequest {
-            input_path: local_path.clone(),
-            output_path: output_path.clone(),
-            model_path: args.model.clone(),
-            reference_image_path: reference_image.clone(),
-            enable_ensemble: !args.ensemble_models.is_empty(),
-            ensemble_model_paths: args.ensemble_models.clone(),
-            config_path: args.config.clone(),
-            preset_path: args.preset.clone(),
-            style_path: style_path.clone(),
-            project_path: args.project.clone(),
-            region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
-            series_id: Some(series_id.clone()),
-            chapter_id: Some(chapter_id.clone()),
-            page_id: Some(page_id.clone()),
-            color_bible_path: Some(color_bible_path.clone()),
-            structure_graph_output_path: Some(structure_graph_path.clone()),
-            color_bible_consistency_threshold: Some(0.62),
-            user_hints_path: resolve_user_hints(args, chat_id, stem),
-            use_mock_backend: args.mock,
-            pyramid_enabled: args.pyramid,
-            hint_propagation_enabled: args.hint_propagate,
-            palette_path: settings.palette_path.clone(),
-            auto_palette: settings.auto_palette,
-            palette_override: chapter_palette.borrow().clone(),
-            cache_dir: args.cache_dir.clone(),
-            cancel_token: Some(Arc::clone(&cancel_token)),
-            progress_sender: Some(progress_sender),
-            ..ColorizeRequest::default()
-        });
-
+        let mut colorize_attempt = 0usize;
+        let result = loop {
+            colorize_attempt += 1;
+            let attempt_result = engine.colorize(ColorizeRequest {
+                input_path: local_path.clone(),
+                output_path: output_path.clone(),
+                model_path: args.model.clone(),
+                reference_image_path: reference_image.clone(),
+                enable_ensemble: !args.ensemble_models.is_empty(),
+                ensemble_model_paths: args.ensemble_models.clone(),
+                config_path: args.config.clone(),
+                preset_path: args.preset.clone(),
+                style_path: style_path.clone(),
+                project_path: args.project.clone(),
+                region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
+                series_id: Some(series_id.clone()),
+                chapter_id: Some(chapter_id.clone()),
+                page_id: Some(page_id.clone()),
+                color_bible_path: Some(color_bible_path.clone()),
+                structure_graph_output_path: Some(structure_graph_path.clone()),
+                color_bible_consistency_threshold: Some(0.62),
+                user_hints_path: resolve_user_hints(args, chat_id, stem),
+                use_mock_backend: args.mock,
+                pyramid_enabled: args.pyramid,
+                hint_propagation_enabled: args.hint_propagate,
+                palette_path: None,
+                auto_palette: false,
+                palette_override: chapter_palette.borrow().clone(),
+                cache_dir: args.cache_dir.clone(),
+                cancel_token: Some(Arc::clone(&cancel_token)),
+                progress_sender: Some(progress_sender.clone()),
+                ..ColorizeRequest::default()
+            });
+            if attempt_result.is_err()
+                && colorize_attempt < PAGE_COLORIZE_MAX_ATTEMPTS
+                && !cancel_token.load(Ordering::Acquire)
+            {
+                tracing::warn!(
+                    page = position + 1,
+                    attempt = colorize_attempt,
+                    "engine attempt failed; retrying page once"
+                );
+                let _ = std::fs::remove_file(&output_path);
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            break attempt_result;
+        };
+        drop(progress_sender);
         let _ = progress_thread.join();
         let elapsed = page_start.elapsed().as_secs_f32();
         let mut c = counters.borrow_mut();
@@ -3290,14 +2897,19 @@ fn handle_link(
         match result {
             Ok(colorize_result) => {
                 let quality_verdict = colorize_result.report.director_verdict.as_deref();
-                if !delivery_quality_approved(quality_verdict) {
+                if !delivery_quality_approved(&colorize_result.report) {
                     tracing::warn!(
                         page = position + 1,
                         verdict = quality_verdict.unwrap_or("missing"),
                         "chapter page blocked by quality gate"
                     );
-                    c.failed += 1;
-                    c.quality_rejected.push(position + 1);
+                    c.record_failure(
+                        position + 1,
+                        format!(
+                            "quality gate: {}",
+                            quality_verdict.unwrap_or("missing verdict")
+                        ),
+                    );
                     let _ = std::fs::remove_file(&output_path);
                     let _ = std::fs::remove_file(local_path);
                     return Ok(args.fail_fast);
@@ -3378,10 +2990,33 @@ fn handle_link(
                     // PNG round-trip is lossless; prepare_delivery below
                     // performs the single PNG->JPEG encode with the
                     // configured quality.
-                    rgb.save(&output_path)?;
+                    if let Err(error) = rgb.save(&output_path) {
+                        tracing::error!(
+                            page = position + 1,
+                            error = %error,
+                            "failed to write watermarked page; continuing chapter"
+                        );
+                        c.record_failure(position + 1, format!("watermark write: {error}"));
+                        let _ = std::fs::remove_file(&output_path);
+                        let _ = std::fs::remove_file(local_path);
+                        return Ok(args.fail_fast);
+                    }
                 }
                 let delivery_path =
-                    prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality)?;
+                    match prepare_delivery(&output_path, args.delivery_format, args.jpeg_quality) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            tracing::error!(
+                                page = position + 1,
+                                error = format!("{error:#}"),
+                                "failed to prepare page for Telegram; continuing chapter"
+                            );
+                            c.record_failure(position + 1, format!("delivery encoding: {error:#}"));
+                            let _ = std::fs::remove_file(&output_path);
+                            let _ = std::fs::remove_file(local_path);
+                            return Ok(args.fail_fast);
+                        }
+                    };
                 // Keep a copy of the EXACT file the user receives under
                 // <work_dir>/delivered/YYYY-MM-DD/ so quality complaints can
                 // be traced to the actual delivered bytes (the scratch space
@@ -3399,9 +3034,9 @@ fn handle_link(
                 let _ = send_chat_action(client, token, chat_id, "upload_document");
                 if let Err(e) = send_document(client, token, chat_id, &delivery_path, &caption) {
                     tracing::error!(error = %e, "send failed");
-                    c.failed += 1;
+                    c.record_failure(position + 1, format!("Telegram delivery: {e:#}"));
                 } else {
-                    c.sent += 1;
+                    c.record_delivery(position + 1);
                     state.set_color_context(
                         chat_id,
                         series_id.clone(),
@@ -3450,8 +3085,7 @@ fn handle_link(
                     error = format!("{error:#}"),
                     "page colorization failed, continuing"
                 );
-                c.failed += 1;
-                c.failed_pages.push(local_path.clone());
+                c.record_failure(position + 1, format!("engine: {error:#}"));
                 if args.fail_fast {
                     return Err(error);
                 }
@@ -3558,7 +3192,9 @@ fn handle_link(
                 }
                 Err(e) => {
                     tracing::warn!(url = %img_url, error = %e, "retry download failed, skipping");
-                    counters.borrow_mut().failed += 1;
+                    counters
+                        .borrow_mut()
+                        .record_failure(*pos + 1, format!("download after retry: {e:#}"));
                 }
             }
         }
@@ -3570,6 +3206,20 @@ fn handle_link(
         for (_, path) in &recovered {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    // End-to-end accounting invariant: every admitted page must finish as
+    // delivered or carry an explicit failure record. Any future control-flow
+    // hole becomes visible instead of silently dropping a page.
+    {
+        let mut c = counters.borrow_mut();
+        let missing = (1..=effective_total)
+            .filter(|page| !c.delivered_pages.contains(page) && !c.failures.contains_key(page))
+            .collect::<Vec<_>>();
+        for page in missing {
+            c.record_failure(page, "unaccounted pipeline state");
+        }
+        debug_assert_eq!(c.sent + c.failed, effective_total);
     }
 
     let elapsed = total_start.elapsed().as_secs_f32();
@@ -3584,25 +3234,18 @@ fn handle_link(
         elapsed,
         counters.borrow().sent
     );
-    let quality_rejected = counters.borrow().quality_rejected.clone();
-    let other_failures = counters
-        .borrow()
-        .failed
-        .saturating_sub(quality_rejected.len());
-    if !quality_rejected.is_empty() {
-        let pages = quality_rejected
-            .iter()
+    let failures = counters.borrow().failures.clone();
+    if !failures.is_empty() {
+        let pages = failures
+            .keys()
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(", ");
+        for (page, reason) in &failures {
+            tracing::warn!(page, reason, "chapter page explicitly failed");
+        }
         final_text.push_str(&format!(
-            " The safety gate withheld page\\(s\\) `{pages}` because measured line or protected\\-region damage remained\\."
-        ));
-    }
-    if other_failures > 0 {
-        final_text.push_str(&format!(
-            " *{}* page\\(s\\) failed\\. Send the URL again to retry failed pages\\.",
-            other_failures
+            " Page\\(s\\) `{pages}` were explicitly withheld or failed after retries; none were passed through unchanged\\. Send the URL again to retry those pages\\."
         ));
     }
 
@@ -4096,19 +3739,25 @@ fn alternate_nhentai_hosts(url: &str) -> Vec<String> {
     let Some(num_str) = prefix.strip_prefix('i') else {
         return Vec::new();
     };
-    if num_str.is_empty() || !num_str.chars().all(|c| c.is_ascii_digit()) {
+    if !num_str.chars().all(|c| c.is_ascii_digit()) {
         return Vec::new();
     }
-    let num: u32 = num_str.parse().unwrap_or(0);
+    let current = if num_str.is_empty() {
+        None
+    } else {
+        num_str.parse::<u32>().ok()
+    };
     let mut siblings = Vec::new();
     for n in 1..=4u32 {
-        if n != num {
+        if current != Some(n) {
             let _ = parsed.set_host(Some(&format!("i{n}{domain}")));
             siblings.push(parsed.to_string());
         }
     }
-    let _ = parsed.set_host(Some(&format!("i{domain}")));
-    siblings.push(parsed.to_string());
+    if current.is_some() {
+        let _ = parsed.set_host(Some(&format!("i{domain}")));
+        siblings.push(parsed.to_string());
+    }
     siblings
 }
 
@@ -4199,8 +3848,8 @@ fn restore_reference_photos(state: &BotState, references_dir: &Path) {
     }
 }
 
-/// After a restart, reload per-chat settings (/style, /batch, /palette,
-/// reference photo) from `<work_dir>/settings/chat_<id>.json`.
+/// After a restart, reload per-chat batch/reference/Color Bible context from
+/// `<work_dir>/settings/chat_<id>.json`.
 fn restore_chat_settings(state: &BotState) {
     let dir = state.settings_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -4359,7 +4008,6 @@ fn configure_bot(client: &Client, token: &str) -> Result<BotIdentity> {
                     {"command": "help", "description": "Show all commands and usage"},
                     {"command": "status", "description": "Check the active chapter job"},
                     {"command": "cancel", "description": "Cancel the active chapter job"},
-                    {"command": "style", "description": "List and choose color styles"},
                     {"command": "batch", "description": "Show or set batch size (1-10)"},
                     {"command": "stats", "description": "Show daily page usage"},
                     {"command": "clean", "description": "Delete all your job data"}
@@ -4679,6 +4327,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_chapter_html_fetch_never_becomes_a_one_page_job() {
+        let chapter = url::Url::parse("https://reader.example/series/chapter-12/").unwrap();
+        assert!(fallback_after_html_fetch_failure(&chapter, chapter.as_str()).is_err());
+
+        let image = url::Url::parse("https://cdn.example/page-001.jpg").unwrap();
+        assert_eq!(
+            fallback_after_html_fetch_failure(&image, image.as_str()).unwrap(),
+            vec![image.to_string()]
+        );
+    }
+
+    #[test]
+    fn legacy_saved_style_and_palette_cannot_change_the_unified_engine() {
+        let settings: PerChatSettings = serde_json::from_str(
+            r#"{
+                "batch_size": 7,
+                "reference_image": null,
+                "style_path": "configs/styles/legacy.yaml",
+                "palette_path": "configs/palettes/legacy.yaml",
+                "auto_palette": true
+            }"#,
+        )
+        .unwrap();
+
+        // Serde ignores the retired selector keys. Only the supported
+        // non-mode settings survive a restart.
+        assert_eq!(settings.batch_size, 7);
+        assert!(settings.reference_image.is_none());
+    }
+
+    #[test]
     fn chapter_urls_share_a_series_bible_but_not_a_chapter_id() {
         let first = url::Url::parse("https://reader.test/manga/hero/chapter-1/").unwrap();
         let second = url::Url::parse("https://reader.test/manga/hero/chapter-2/").unwrap();
@@ -4728,68 +4407,17 @@ mod tests {
     }
 
     #[test]
-    fn creative_rotation_cycles_deterministically_per_chat() {
-        // Build a BotState with a styles dir containing the creative styles.
-        let dir = tempfile::tempdir().unwrap();
-        let creative_ids: Vec<&str> = BUILTIN_STYLES
-            .iter()
-            .map(|&(id, _)| id)
-            .filter(|id| id.starts_with("creative_"))
-            .collect();
-        assert_eq!(creative_ids.len(), 8, "expected 8 creative styles");
-        for id in &creative_ids {
-            std::fs::write(dir.path().join(format!("{id}.yaml")), "id: {id}\n").unwrap();
-        }
-        let state = BotState {
-            active_jobs: AtomicUsize::new(0),
-            active_chats: Mutex::new(HashMap::new()),
-            per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
-            queue: Mutex::new(VecDeque::new()),
-            usage_lock: Mutex::new(()),
-            usage_path: dir.path().join("usage.json"),
-            daily_limit: 0,
-            max_queued_jobs: 16,
-            max_queued_jobs_per_chat: 1,
-            styles_dir: Some(dir.path().to_path_buf()),
-            palettes_dir: dir.path().join("palettes"),
-        };
-
-        // Consecutive jobs cycle through all 8 moods, then repeat.
-        let mut seen: Vec<String> = Vec::new();
-        for _ in 0..16 {
-            let path = state.next_creative_style(42).unwrap();
-            let file = path.file_stem().unwrap().to_str().unwrap().to_string();
-            seen.push(file);
-        }
-        for i in 0..8 {
-            assert_eq!(seen[i], creative_ids[i]);
-            assert_eq!(seen[i + 8], seen[i], "cycle repeats after 8 jobs");
-        }
-
-        // A different chat starts its own cycle at the first mood.
-        let first_other = state.next_creative_style(7).unwrap();
-        assert_eq!(
-            first_other.file_stem().unwrap().to_str().unwrap(),
-            creative_ids[0]
-        );
-    }
-
-    #[test]
     fn bot_state_bounds_jobs_and_supports_cancellation() {
         let state = BotState {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
             max_queued_jobs: 16,
             max_queued_jobs_per_chat: 1,
-            styles_dir: None,
-            palettes_dir: PathBuf::from("configs/palettes"),
         };
 
         // No job can start when the pool is full.
@@ -4810,15 +4438,12 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 100,
             max_queued_jobs: 4,
             max_queued_jobs_per_chat: 2,
-            styles_dir: None,
-            palettes_dir: PathBuf::from("configs/palettes"),
         };
         assert_eq!(state.enqueue(1, QueuedJob::Link { url: "a".into() }), Ok(1));
         assert_eq!(state.enqueue(2, QueuedJob::Link { url: "b".into() }), Ok(2));
@@ -4840,19 +4465,70 @@ mod tests {
 
     #[test]
     fn delivery_gate_fails_closed() {
-        assert!(delivery_quality_approved(Some("production_ready_preview")));
-        assert!(delivery_quality_approved(Some(
-            "production_ready_with_tone_training_warning"
+        let report = |verdict: Option<&str>, inference: bool, coverage: bool, transformed: bool| {
+            let mut report = ProcessingReport {
+                director_verdict: verdict.map(str::to_string),
+                ..ProcessingReport::default()
+            };
+            if inference {
+                report.add_stage_report(
+                    mangahue_core::StageReport::new("inference").metric("tiles_completed", 1.0),
+                );
+            }
+            if coverage {
+                report.add_stage_report(
+                    mangahue_core::StageReport::new("colorization_coverage").metric("passed", 1.0),
+                );
+            }
+            if transformed {
+                report.add_stage_report(
+                    mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
+                );
+            }
+            report
+        };
+        assert!(delivery_quality_approved(&report(
+            Some("production_ready_preview"),
+            true,
+            true,
+            true
         )));
-        assert!(delivery_quality_approved(Some(
-            "production_ready_with_bubble_detection_warning"
+        assert!(delivery_quality_approved(&report(
+            Some("production_ready_with_tone_training_warning"),
+            true,
+            true,
+            true
         )));
-        assert!(delivery_quality_approved(Some(
-            "production_ready_with_bubble_cleanup_warning"
+        assert!(!delivery_quality_approved(&report(
+            Some("production_ready_preview"),
+            false,
+            true,
+            true
         )));
-        assert!(!delivery_quality_approved(None));
-        assert!(!delivery_quality_approved(Some(
-            "needs_protected_region_cleanup"
+        assert!(!delivery_quality_approved(&report(
+            Some("production_ready_preview"),
+            true,
+            false,
+            true
+        )));
+        assert!(!delivery_quality_approved(&report(
+            Some("production_ready_preview"),
+            true,
+            true,
+            false
+        )));
+        assert!(!delivery_quality_approved(&report(
+            Some("already colored"),
+            false,
+            false,
+            false
+        )));
+        assert!(!delivery_quality_approved(&report(None, true, true, true)));
+        assert!(!delivery_quality_approved(&report(
+            Some("needs_protected_region_cleanup"),
+            true,
+            true,
+            true
         )));
     }
 
@@ -4952,15 +4628,12 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: dir.path().join("usage.json"),
             daily_limit: 0,
             max_queued_jobs: 16,
             max_queued_jobs_per_chat: 1,
-            styles_dir: None,
-            palettes_dir: PathBuf::from("configs/palettes"),
         };
 
         // No daily limit means unlimited page usage.
@@ -4982,33 +4655,6 @@ mod tests {
     }
 
     #[test]
-    fn loads_yaml_style_names_and_resolves_style_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let style = dir.path().join("natural_manga.yaml");
-        std::fs::write(&style, "id: natural_manga\nname: Natural Manga\n").unwrap();
-        let state = Arc::new(BotState {
-            active_jobs: AtomicUsize::new(0),
-            active_chats: Mutex::new(HashMap::new()),
-            per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
-            queue: Mutex::new(VecDeque::new()),
-            usage_lock: Mutex::new(()),
-            usage_path: dir.path().join("usage.json"),
-            daily_limit: 100,
-            max_queued_jobs: 16,
-            max_queued_jobs_per_chat: 1,
-            styles_dir: Some(dir.path().to_path_buf()),
-            palettes_dir: dir.path().to_path_buf(),
-        });
-
-        assert_eq!(load_style_name(&style).as_deref(), Some("Natural Manga"));
-        assert_eq!(
-            resolve_style_file(&state, "natural_manga").as_deref(),
-            Some(style.as_path())
-        );
-    }
-
-    #[test]
     fn validates_direct_image_urls() {
         let v = validate_user_url("https://example.com/page.png", true);
         assert!(v.error.is_none());
@@ -5024,6 +4670,20 @@ mod tests {
 
         let v = validate_user_url("http://127.0.0.1/page.png", true);
         assert!(v.error.is_some());
+    }
+
+    #[test]
+    fn canonical_nhentai_host_has_all_numbered_fallbacks() {
+        let alternatives = alternate_nhentai_hosts("https://i.nhentai.net/galleries/123/1.jpg");
+        assert_eq!(alternatives.len(), 4);
+        for host in [
+            "i1.nhentai.net",
+            "i2.nhentai.net",
+            "i3.nhentai.net",
+            "i4.nhentai.net",
+        ] {
+            assert!(alternatives.iter().any(|url| url.contains(host)));
+        }
     }
 
     #[test]
@@ -5094,17 +4754,6 @@ mod tests {
     }
 
     #[test]
-    fn md2_escape_handles_all_specials() {
-        assert_eq!(md2_escape("plain name"), "plain name");
-        assert_eq!(md2_escape("a_b*c(d)"), "a\\_b\\*c\\(d\\)");
-        assert_eq!(
-            md2_escape("Natural Manga (default)"),
-            "Natural Manga \\(default\\)"
-        );
-        assert_eq!(md2_escape("x~y.z!"), "x\\~y\\.z\\!");
-    }
-
-    #[test]
     fn madara_paged_url_is_normalized_to_continuous_reader() {
         let paged =
             url::Url::parse("https://ilikecomix.com/manga/c/some-comic/chapter-1/?style=paged&x=1")
@@ -5128,15 +4777,12 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 0,
             max_queued_jobs: 16,
             max_queued_jobs_per_chat: 1,
-            styles_dir: None,
-            palettes_dir: PathBuf::from("configs/palettes"),
         };
         let mut queue = lock_or_recover(&state.queue);
         queue.push_back((
@@ -5170,15 +4816,12 @@ mod tests {
             active_jobs: AtomicUsize::new(0),
             active_chats: Mutex::new(HashMap::new()),
             per_chat_settings: Mutex::new(HashMap::new()),
-            job_counter: Mutex::new(HashMap::new()),
             queue: Mutex::new(VecDeque::new()),
             usage_lock: Mutex::new(()),
             usage_path: PathBuf::from("test_usage.json"),
             daily_limit: 0,
             max_queued_jobs: 16,
             max_queued_jobs_per_chat: 1,
-            styles_dir: None,
-            palettes_dir: PathBuf::from("configs/palettes"),
         };
         // Chat 1 takes the only slot in a 1-slot pool.
         let cancel = state.try_start(1, 1).unwrap();

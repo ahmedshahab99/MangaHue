@@ -1906,6 +1906,7 @@ fn run_serve(args: ServeArgs) -> Result<()> {
         job_retention_hours: args.job_retention_hours,
         default_model_path: args.default_model,
         default_config_path: args.default_config,
+        default_style_path: PathBuf::from("configs/styles/soft_cel_anime_v2.yaml"),
     }))
 }
 

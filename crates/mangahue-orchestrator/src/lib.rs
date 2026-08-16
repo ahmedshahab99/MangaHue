@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use image::{GrayImage, Luma, Rgb, RgbImage};
+use image::{GrayImage, Luma, Pixel, Rgb, RgbImage};
 use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
@@ -24,7 +24,8 @@ use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ColorBible, ProjectMemory};
 use mangahue_postprocess::{
     cross_tile_coherence, finalize, reconstruct_full_resolution, remove_chroma_grid_artifacts,
-    remove_color_specks, ChromaGridCleanupReport, PostprocessInput,
+    remove_color_specks, restore_delivery_protected_regions, ChromaGridCleanupReport,
+    PostprocessInput,
 };
 use mangahue_preprocess::preprocess_page;
 use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
@@ -37,6 +38,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
+
+const MIN_DELIVERY_MEAN_SATURATION: f32 = 0.025;
+const MIN_DELIVERY_COLORED_FRACTION: f32 = 0.025;
+const MIN_DELIVERY_COLORFULNESS: f32 = 8.0;
+const MIN_DELIVERY_MEAN_RGB_DELTA: f32 = 1.0;
+const MIN_DELIVERY_CHANGED_FRACTION: f32 = 0.01;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ColorizeRequest {
@@ -273,99 +280,6 @@ impl MangaHueEngine {
         };
 
         let manga_image = load_image(&request.input_path)?;
-
-        // Already-colored pass-through: full-color western comics are
-        // common, and re-colorizing them wastes inference time and distorts
-        // the artist's original palette. Measured on the ORIGINAL input
-        // before any preprocessing.
-        if config.engine.skip_already_colored {
-            let (mean_sat, colored_fraction) = measure_page_colorfulness(&manga_image.image);
-            let already_colored = mean_sat >= config.engine.already_colored_sat_threshold
-                && colored_fraction >= config.engine.already_colored_colored_fraction;
-            report.add_stage_report(
-                StageReport::new("color_metrics")
-                    .metric("avg_saturation", mean_sat as f64)
-                    .metric("colorfulness", (colored_fraction * 100.0) as f64)
-                    .metric("already_colored", if already_colored { 1.0 } else { 0.0 }),
-            );
-            if already_colored {
-                report.warn(format!(
-                    "page already colored (mean sat {mean_sat:.3}, colored share {colored_fraction:.3}); passing through untouched"
-                ));
-                info!(
-                    mean_sat,
-                    colored_fraction, "already-colored page passed through without inference"
-                );
-                let mut output = manga_image.image.to_rgb8();
-                // Colored scans carry printed halftone dot artifacts (small
-                // dark red/orange clusters) that read as "red dots" to the
-                // user; clean them before delivery. Black line art and large
-                // colored regions are untouched.
-                let mut halftone_dots_removed = 0u64;
-                let mut grid_cleanup = ChromaGridCleanupReport::default();
-                if config.postprocess.descreen_halftone {
-                    grid_cleanup = remove_chroma_grid_artifacts(&mut output);
-                    // Run the tiny-component sweep after the periodic field
-                    // has been normalized; doing it first converted square
-                    // edges into colored rings that survived the grid pass.
-                    halftone_dots_removed = mangahue_postprocess::remove_halftone_dots(&mut output);
-                }
-                report.add_stage_report(
-                    StageReport::new("halftone_descreen")
-                        .metric("dot_pixels_removed", halftone_dots_removed as f64)
-                        .metric("grid_pixels_changed", grid_cleanup.changed_pixels as f64)
-                        .metric(
-                            "grid_candidate_fraction_before",
-                            grid_cleanup.before.candidate_fraction as f64,
-                        )
-                        .metric(
-                            "grid_candidate_fraction_after",
-                            grid_cleanup.after.candidate_fraction as f64,
-                        )
-                        .metric("grid_score_before", grid_cleanup.before.grid_score as f64)
-                        .metric("grid_score_after", grid_cleanup.after.grid_score as f64)
-                        .metric("grid_period_x", grid_cleanup.before.period_x as f64)
-                        .metric("grid_period_y", grid_cleanup.before.period_y as f64)
-                        .note(if halftone_dots_removed > 0 || grid_cleanup.changed_pixels > 0 {
-                            format!(
-                                "removed {halftone_dots_removed} isolated dots and corrected {} periodic chroma-grid pixels on colored page",
-                                grid_cleanup.changed_pixels
-                            )
-                        } else {
-                            "no halftone artifacts found".to_string()
-                        }),
-                );
-                save_rgb(&request.output_path, &output)?;
-                emit_progress(&progress, "done", 6, 6, None);
-                report.total_ms = total_start.elapsed().as_millis();
-                report.director_verdict = Some(final_verdict_with_chroma_grid(
-                    "already colored",
-                    &grid_cleanup,
-                ));
-                report.add_stage_report(
-                    StageReport::new("postprocess")
-                        .note("skipped: page already colored, original passed through"),
-                );
-                if config.output.write_report {
-                    let path = mangahue_image::sibling_with_suffix(
-                        &request.output_path,
-                        ".report",
-                        "json",
-                    );
-                    fs::write(&path, serde_json::to_string_pretty(&report)?)
-                        .with_context(|| format!("failed to write report {}", path.display()))?;
-                }
-                return Ok(ColorizeResult {
-                    output_path: request.output_path,
-                    report,
-                    quality_report_path: None,
-                    color_bible_consistency_report_path: None,
-                    confidence_map_path: None,
-                    idempotency_key: None,
-                    from_cache: false,
-                });
-            }
-        }
 
         let resized = mangahue_image::resize_to_max(
             &manga_image.image,
@@ -1261,11 +1175,10 @@ impl MangaHueEngine {
                     postprocess_report.unified_pixels_graded as f64,
                 ),
         );
-        // Standard page color metrics (avg RGB, brightness, saturation,
-        // colorfulness, contrast) measured on the final working-res image.
+        // Diagnostic metrics before the bounded recovery/final delivery pass.
         let color_metrics = mangahue_eval::analyze_color_metrics(&final_image);
         report.add_stage_report(
-            StageReport::new("color_metrics")
+            StageReport::new("working_color_metrics")
                 .metric("avg_r", color_metrics.avg_rgb[0] as f64)
                 .metric("avg_g", color_metrics.avg_rgb[1] as f64)
                 .metric("avg_b", color_metrics.avg_rgb[2] as f64)
@@ -1303,12 +1216,101 @@ impl MangaHueEngine {
                 lock_report.colorized_pixels, lock_report.preserved_pixels
             ));
         }
+
+        // If the model/postprocess result still reads as grayscale, run one
+        // automatic palette-directed recovery on the bounded working canvas
+        // (the production preset caps it at 1024 px). This avoids the huge
+        // allocations and multi-billion-neighbor pass that a full-resolution
+        // recovery would cause on the low-memory VPS. It is an internal
+        // repair stage, not a user-selectable colorization mode.
+        let (working_before_sat, working_before_fraction, working_before_colorfulness) =
+            measure_colorization_evidence(&final_image);
+        let mut recovery_attempted = false;
+        let mut recovery_selected = false;
+        let mut recovery_palette_pixels = 0u64;
+        let mut recovery_region_pixels = 0u64;
+        if !colorization_evidence_passes(
+            working_before_sat,
+            working_before_fraction,
+            working_before_colorfulness,
+        ) {
+            recovery_attempted = true;
+            let mut recovery_config = config.postprocess.clone();
+            recovery_config.palette_correction = true;
+            recovery_config.model_first = false;
+            recovery_config.soft_coverage = true;
+            recovery_config.soft_strength = recovery_config.soft_strength.max(1.0);
+            recovery_config.soft_confidence = recovery_config.soft_confidence.max(0.95);
+            recovery_config.region_chroma_separation =
+                recovery_config.region_chroma_separation.max(36.0);
+            recovery_config.palette_harmony_strength =
+                recovery_config.palette_harmony_strength.max(0.35);
+            recovery_config.hint_chroma_strength = recovery_config.hint_chroma_strength.max(0.65);
+            let (mut candidate, recovery_report) = finalize(PostprocessInput {
+                colorized: final_image.clone(),
+                original_grayscale: &preprocess.original_grayscale,
+                line_mask: &preprocess.line_mask,
+                bubble_mask: &bubble_mask,
+                tone_mask: Some(&preprocess.tone_mask),
+                protected_mask: Some(&preprocess.protected_mask),
+                face_mask: face_mask.as_ref(),
+                style: &scene_style,
+                config: &recovery_config,
+                reference_image: reference_image.as_ref(),
+                hint_map: Some(&hints.hint_map),
+                hint_mask: Some(&hints.hint_mask),
+                chroma_signal,
+            })?;
+            recovery_palette_pixels = recovery_report.palette_fill_pixels;
+            recovery_region_pixels = recovery_report.region_pixels_rendered;
+            if let Some(raster) = &color_bible_lock_raster {
+                enforce_region_locks(
+                    &mut candidate,
+                    &preprocess.original_grayscale,
+                    &preprocess.line_mask,
+                    raster,
+                );
+            }
+            if let Some(raster) = &region_lock_raster {
+                enforce_region_locks(
+                    &mut candidate,
+                    &preprocess.original_grayscale,
+                    &preprocess.line_mask,
+                    raster,
+                );
+            }
+            let candidate_evidence = measure_colorization_evidence(&candidate);
+            if colorization_evidence_passes(
+                candidate_evidence.0,
+                candidate_evidence.1,
+                candidate_evidence.2,
+            ) || candidate_evidence.2 > working_before_colorfulness
+            {
+                final_image = candidate;
+                recovery_selected = true;
+            }
+        }
+        let (working_after_sat, working_after_fraction, working_after_colorfulness) =
+            measure_colorization_evidence(&final_image);
+        report.add_stage_report(
+            StageReport::new("colorization_recovery")
+                .metric("attempted", if recovery_attempted { 1.0 } else { 0.0 })
+                .metric("selected", if recovery_selected { 1.0 } else { 0.0 })
+                .metric("palette_fill_pixels", recovery_palette_pixels as f64)
+                .metric("region_pixels_rendered", recovery_region_pixels as f64)
+                .metric("before_mean_saturation", working_before_sat as f64)
+                .metric("before_colored_fraction", working_before_fraction as f64)
+                .metric("before_colorfulness", working_before_colorfulness as f64)
+                .metric("after_mean_saturation", working_after_sat as f64)
+                .metric("after_colored_fraction", working_after_fraction as f64)
+                .metric("after_colorfulness", working_after_colorfulness as f64),
+        );
         // Evaluate quality at WORKING resolution. All guidance masks
         // (line/bubble/protected/hint) are working-resolution; evaluating the
         // full-res image against them produced dimension-mismatched metrics
         // (hint adherence forced to 0.0, misaligned sampling) on every page
         // that exceeded max_input_dimension.
-        let quality = mangahue_eval::evaluate_output_with_guidance(
+        let mut quality = mangahue_eval::evaluate_output_with_guidance(
             &final_image,
             &preprocess.line_mask,
             &preprocess.bubble_mask,
@@ -1404,6 +1406,14 @@ impl MangaHueEngine {
             delivery_size.height,
             image::imageops::FilterType::Nearest,
         );
+        let delivery_bubble_mask = image::imageops::resize(
+            &bubble_mask,
+            delivery_size.width,
+            delivery_size.height,
+            image::imageops::FilterType::Nearest,
+        );
+        let mut canonical_pixels = 0u64;
+        let mut lock_protected_pixels = 0u64;
         if let Some(locks) = color_bible_lock_file.as_ref() {
             let raster = rasterize_region_locks(locks, delivery_size)?;
             let lock_report = enforce_region_locks(
@@ -1412,22 +1422,146 @@ impl MangaHueEngine {
                 &delivery_line_mask,
                 &raster,
             );
-            report.add_stage_report(
-                StageReport::new("protected_compositor")
-                    .metric("canonical_pixels", lock_report.colorized_pixels as f64)
-                    .metric("protected_pixels", lock_report.preserved_pixels as f64),
-            );
+            canonical_pixels = lock_report.colorized_pixels;
+            lock_protected_pixels = lock_report.preserved_pixels;
         }
         // Explicit page locks remain the final operator override.
+        let mut explicit_lock_pixels = 0u64;
         if let Some(locks) = region_lock_file.as_ref() {
             let raster = rasterize_region_locks(locks, delivery_size)?;
-            enforce_region_locks(
+            let lock_report = enforce_region_locks(
                 &mut final_image,
                 &delivery_gray,
                 &delivery_line_mask,
                 &raster,
             );
+            explicit_lock_pixels = lock_report.colorized_pixels;
         }
+        let delivery_protected_restored = restore_delivery_protected_regions(
+            &mut final_image,
+            &delivery_gray,
+            &delivery_line_mask,
+            &delivery_bubble_mask,
+            &delivery_protected_mask,
+        );
+        report.add_stage_report(
+            StageReport::new("protected_compositor")
+                .metric("canonical_pixels", canonical_pixels as f64)
+                .metric("explicit_lock_pixels", explicit_lock_pixels as f64)
+                .metric("lock_protected_pixels", lock_protected_pixels as f64)
+                .metric(
+                    "delivery_protected_pixels_restored",
+                    delivery_protected_restored as f64,
+                ),
+        );
+
+        // Delivery invariant: a successful model call is not enough if the
+        // resulting delivery still reads as grayscale. Recovery has already
+        // run on the bounded working canvas; this final check never performs
+        // a high-memory full-resolution neighborhood pass.
+        let (delivery_sat, delivery_fraction, delivery_colorfulness) =
+            measure_colorization_evidence(&final_image);
+        let colorization_passed =
+            colorization_evidence_passes(delivery_sat, delivery_fraction, delivery_colorfulness);
+        report.add_stage_report(
+            StageReport::new("colorization_coverage")
+                .metric("working_before_mean_saturation", working_before_sat as f64)
+                .metric(
+                    "working_before_colored_fraction",
+                    working_before_fraction as f64,
+                )
+                .metric(
+                    "working_before_colorfulness",
+                    working_before_colorfulness as f64,
+                )
+                .metric("working_mean_saturation", working_after_sat as f64)
+                .metric("working_colored_fraction", working_after_fraction as f64)
+                .metric("working_colorfulness", working_after_colorfulness as f64)
+                .metric("mean_saturation", delivery_sat as f64)
+                .metric("colored_fraction", delivery_fraction as f64)
+                .metric("colorfulness", delivery_colorfulness as f64)
+                .metric("passed", if colorization_passed { 1.0 } else { 0.0 }),
+        );
+        if !colorization_passed {
+            record_blocking_verdict(&mut report, "needs_insufficient_colorization");
+            report.warn(format!(
+                "delivery withheld: insufficient visible color after recovery (saturation {delivery_sat:.3}, colored share {delivery_fraction:.3}, colorfulness {delivery_colorfulness:.1})"
+            ));
+        }
+
+        let (mean_rgb_delta, changed_fraction) = measure_visible_input_output_change(
+            &manga_image.image,
+            &final_image,
+            &delivery_line_mask,
+            &delivery_protected_mask,
+        );
+        let transformation_passed = mean_rgb_delta >= MIN_DELIVERY_MEAN_RGB_DELTA
+            || changed_fraction >= MIN_DELIVERY_CHANGED_FRACTION;
+        report.add_stage_report(
+            StageReport::new("colorization_transform")
+                .metric("mean_rgb_delta", mean_rgb_delta as f64)
+                .metric("changed_fraction", changed_fraction as f64)
+                .metric("passed", if transformation_passed { 1.0 } else { 0.0 }),
+        );
+        if !transformation_passed {
+            record_blocking_verdict(&mut report, "needs_no_visible_transformation");
+            report.warn(
+                "delivery withheld: inference completed but produced no measurable visible change",
+            );
+        }
+
+        // Re-evaluate the actual delivery-resolution pixels after
+        // reconstruction, descreening, deterministic locks, and protected
+        // restoration. The quality artifact below now describes what the
+        // user would receive, not an earlier working-resolution preview.
+        let delivery_quality = mangahue_eval::evaluate_output_with_guidance(
+            &final_image,
+            &delivery_line_mask,
+            &delivery_bubble_mask,
+            Some(&delivery_protected_mask),
+            None,
+            None,
+        );
+        report.add_stage_report(
+            StageReport::new("delivery_quality")
+                .metric(
+                    "line_preservation_score",
+                    delivery_quality.line_preservation_score as f64,
+                )
+                .metric(
+                    "bubble_cleanliness_score",
+                    delivery_quality.bubble_cleanliness_score as f64,
+                )
+                .metric(
+                    "protected_region_violation_score",
+                    delivery_quality.protected_region_violation_score as f64,
+                ),
+        );
+        let delivery_verdict = director_verdict(&delivery_quality, &preprocess.report, &config);
+        if delivery_verdict.starts_with("needs_") {
+            record_blocking_verdict(&mut report, &delivery_verdict);
+        }
+        quality = delivery_quality;
+
+        let delivery_color_metrics = mangahue_eval::analyze_color_metrics(&final_image);
+        report.add_stage_report(
+            StageReport::new("color_metrics")
+                .metric("avg_r", delivery_color_metrics.avg_rgb[0] as f64)
+                .metric("avg_g", delivery_color_metrics.avg_rgb[1] as f64)
+                .metric("avg_b", delivery_color_metrics.avg_rgb[2] as f64)
+                .metric("brightness", delivery_color_metrics.brightness as f64)
+                .metric(
+                    "avg_saturation",
+                    delivery_color_metrics.avg_saturation as f64,
+                )
+                .metric("colorfulness", delivery_color_metrics.colorfulness as f64)
+                .metric("contrast", delivery_color_metrics.contrast as f64)
+                .metric("warmth", delivery_color_metrics.warmth as f64)
+                .metric(
+                    "chroma_signal",
+                    chroma_signal.map(|value| value as f64).unwrap_or(0.0),
+                ),
+        );
 
         let color_bible_consistency: Option<ColorBibleConsistencyReport> = structure_graph
             .as_ref()
@@ -1453,11 +1587,21 @@ impl MangaHueEngine {
                     .metric("passed", if consistency.passed { 1.0 } else { 0.0 }),
             );
             if !consistency.passed {
-                report.director_verdict = Some("needs_color_bible_consistency".to_string());
+                // Canonical palette drift is a chapter-cohesiveness signal, not
+                // page corruption: the page is fully colored and delivers with
+                // a warning instead of disappearing from the chapter.
                 report.warn(format!(
-                    "delivery withheld: canonical color consistency {:.3} is below {:.3}",
+                    "canonical color consistency {:.3} is below {:.3}; delivering with warning",
                     consistency.minimum_score, consistency.threshold
                 ));
+                if !report
+                    .director_verdict
+                    .as_deref()
+                    .is_some_and(|current| current.starts_with("needs_"))
+                {
+                    report.director_verdict =
+                        Some("production_ready_with_canonical_palette_warning".to_string());
+                }
             }
         }
         report.postprocess_ms = postprocess_start.elapsed().as_millis();
@@ -1936,11 +2080,22 @@ fn director_verdict(
     // is common on captions, borderless dialogue, SFX and decorative manga
     // text; treating "text but no closed bubble" as corruption caused valid
     // pages to disappear from chapter delivery.
-    if quality.line_preservation_score < config.eval.line_preservation_threshold {
+    if quality.line_preservation_score < config.eval.line_preservation_block_threshold {
         return "needs_line_preservation_attention".to_string();
     }
-    if quality.protected_region_violation_score < config.eval.protected_region_violation_threshold {
+    if quality.line_preservation_score < config.eval.line_preservation_threshold {
+        return "production_ready_with_line_preservation_warning".to_string();
+    }
+    // Protected-region violation is common and mild on real scans: the
+    // protected mask is deliberately dilated around glyphs, and the
+    // last-mile restore preserves midtone material color inside that halo.
+    // Only severe bleeding is delivery-blocking; everything in between is a
+    // deliverable-with-warning like the other detector uncertainties.
+    if quality.protected_region_violation_score < config.eval.protected_region_block_threshold {
         return "needs_protected_region_cleanup".to_string();
+    }
+    if quality.protected_region_violation_score < config.eval.protected_region_violation_threshold {
+        return "production_ready_with_protected_region_warning".to_string();
     }
     if preprocess.protected_coverage > 0.55 {
         return "production_ready_with_protected_mask_warning".to_string();
@@ -1963,11 +2118,21 @@ fn director_verdict(
 fn final_verdict_with_chroma_grid(current: &str, cleanup: &ChromaGridCleanupReport) -> String {
     // Preserve an earlier hard invariant failure; otherwise residual periodic
     // chroma noise is itself delivery-blocking. A cleaned page keeps its
-    // original ready/already-colored classification.
+    // original quality classification.
     if cleanup.after.needs_cleanup && !current.starts_with("needs_") {
         "needs_chroma_grid_cleanup".to_string()
     } else {
         current.to_string()
+    }
+}
+
+fn record_blocking_verdict(report: &mut ProcessingReport, verdict: &str) {
+    if !report
+        .director_verdict
+        .as_deref()
+        .is_some_and(|current| current.starts_with("needs_"))
+    {
+        report.director_verdict = Some(verdict.to_string());
     }
 }
 
@@ -2048,20 +2213,17 @@ fn is_style2paints_model_name(path: &Path) -> bool {
             .is_some_and(|name| name.to_ascii_lowercase().contains("style2paints"))
 }
 
-/// Measure how colorful a page already is: (mean HSV saturation over
-/// non-paper/non-ink pixels, share of those pixels with real color). A
-/// grayscale scan sits near (0.00-0.03, 0.00); a colored page is typically
-/// (0.15-0.45, 0.4-0.9). Sampled (<= 200k pixels) so the check costs
-/// milliseconds even on huge pages.
-fn measure_page_colorfulness(image: &image::DynamicImage) -> (f32, f32) {
-    let rgb = image.to_rgb8();
-    let (w, h) = rgb.dimensions();
+/// Measure delivery color evidence: mean HSV saturation and the fraction of
+/// truly colored non-paper/non-ink pixels, plus Hasler-Suesstrunk
+/// colorfulness. Sampling keeps this bounded on long chapters.
+fn measure_colorization_evidence(image: &RgbImage) -> (f32, f32, f32) {
+    let (w, h) = image.dimensions();
     let total = w as usize * h as usize;
     let step = (total / 200_000).max(1);
     let mut sat_sum = 0.0f64;
     let mut sat_n = 0u64;
     let mut colored = 0u64;
-    for (x, y, pixel) in rgb.enumerate_pixels() {
+    for (x, y, pixel) in image.enumerate_pixels() {
         let index = y as usize * w as usize + x as usize;
         if !index.is_multiple_of(step) {
             continue;
@@ -2085,12 +2247,78 @@ fn measure_page_colorfulness(image: &image::DynamicImage) -> (f32, f32) {
         }
     }
     if sat_n == 0 {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
     (
         (sat_sum / sat_n as f64) as f32,
         colored as f32 / sat_n as f32,
+        mangahue_eval::analyze_color_metrics(image).colorfulness,
     )
+}
+
+/// Delivery color evidence is satisfied when ANY independent signal proves
+/// real chroma. Uniform soft/pale washes legitimately score low on
+/// Hasler-Suessstrunk colorfulness (3-6 for typical cel palette ranges) but
+/// still carry clear saturation and a large colored share, so requiring
+/// colorfulness unconditionally withheld valid subtle colorizations. A
+/// grayscale page fails all three signals.
+fn colorization_evidence_passes(
+    mean_saturation: f32,
+    colored_fraction: f32,
+    colorfulness: f32,
+) -> bool {
+    colorfulness >= MIN_DELIVERY_COLORFULNESS
+        || mean_saturation >= MIN_DELIVERY_MEAN_SATURATION
+        || colored_fraction >= MIN_DELIVERY_COLORED_FRACTION
+}
+
+/// Compare final delivery pixels with the actual uploaded image while
+/// excluding ink and protected text/paper. This catches identity/pass-through
+/// outputs even if an inference function returned successfully.
+fn measure_visible_input_output_change(
+    input: &image::DynamicImage,
+    output: &RgbImage,
+    line_mask: &GrayImage,
+    protected_mask: &GrayImage,
+) -> (f32, f32) {
+    let (width, height) = output.dimensions();
+    if input.dimensions() != (width, height)
+        || line_mask.dimensions() != (width, height)
+        || protected_mask.dimensions() != (width, height)
+    {
+        return (0.0, 0.0);
+    }
+    let total = width as usize * height as usize;
+    let step = (total / 200_000).max(1);
+    let mut delta_sum = 0.0f64;
+    let mut samples = 0u64;
+    let mut changed = 0u64;
+    for (x, y, pixel) in output.enumerate_pixels() {
+        let index = y as usize * width as usize + x as usize;
+        if !index.is_multiple_of(step)
+            || line_mask.get_pixel(x, y)[0] >= 96
+            || protected_mask.get_pixel(x, y)[0] >= 96
+        {
+            continue;
+        }
+        let original = image::GenericImageView::get_pixel(input, x, y).to_rgb();
+        let dr = pixel[0].abs_diff(original[0]);
+        let dg = pixel[1].abs_diff(original[1]);
+        let db = pixel[2].abs_diff(original[2]);
+        delta_sum += (dr as f64 + dg as f64 + db as f64) / 3.0;
+        if dr.max(dg).max(db) >= 4 {
+            changed += 1;
+        }
+        samples += 1;
+    }
+    if samples == 0 {
+        (0.0, 0.0)
+    } else {
+        (
+            (delta_sum / samples as f64) as f32,
+            changed as f32 / samples as f32,
+        )
+    }
 }
 
 fn build_pool(jobs: usize) -> rayon::ThreadPool {
@@ -2221,13 +2449,6 @@ fn compute_idempotency_key(
         hasher.update(model.to_string_lossy().as_bytes());
         hasher.update(b"\x00");
     }
-    let mode_val: u8 = match config.engine.mode {
-        mangahue_config::EngineMode::Fast => 0,
-        mangahue_config::EngineMode::Balanced => 1,
-        mangahue_config::EngineMode::Quality => 2,
-        mangahue_config::EngineMode::Debug => 3,
-    };
-    hasher.update([mode_val]);
     hasher.update(config.layout.tile_size.to_le_bytes());
     let digest = hasher.finalize();
     base64_encode_hash(&digest)
@@ -2242,7 +2463,7 @@ fn base64_encode_hash(digest: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{GrayImage, Luma};
+    use image::{GrayImage, Luma, Rgb, RgbImage};
     use mangahue_memory::{ColorBibleCorrection, ColorSelector, CorrectionScope};
 
     fn quality_report() -> mangahue_eval::QualityReport {
@@ -2289,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    fn colorfulness_detects_grayscale_vs_colored_pages() {
+    fn delivery_colorization_gate_rejects_grayscale_and_accepts_color() {
         use image::RgbImage;
         // A pure grayscale page: near-zero saturation everywhere.
         let mut gray = RgbImage::new(64, 64);
@@ -2299,10 +2520,14 @@ mod tests {
             p[1] = v;
             p[2] = v;
         }
-        let (mean_sat, colored_fraction) =
-            measure_page_colorfulness(&image::DynamicImage::ImageRgb8(gray));
+        let (mean_sat, colored_fraction, colorfulness) = measure_colorization_evidence(&gray);
         assert!(mean_sat < 0.02, "grayscale mean sat: {mean_sat}");
         assert!(colored_fraction < 0.02);
+        assert!(!colorization_evidence_passes(
+            mean_sat,
+            colored_fraction,
+            colorfulness
+        ));
 
         // A colored page: skin-tone blocks + saturated background.
         let mut colored = RgbImage::new(64, 64);
@@ -2318,13 +2543,56 @@ mod tests {
                 colored.put_pixel(x, y, p);
             }
         }
-        let (mean_sat, colored_fraction) =
-            measure_page_colorfulness(&image::DynamicImage::ImageRgb8(colored));
+        let (mean_sat, colored_fraction, colorfulness) = measure_colorization_evidence(&colored);
         assert!(mean_sat > 0.15, "colored page mean sat: {mean_sat}");
         assert!(
             colored_fraction > 0.5,
             "colored page share: {colored_fraction}"
         );
+        assert!(colorization_evidence_passes(
+            mean_sat,
+            colored_fraction,
+            colorfulness
+        ));
+    }
+
+    #[test]
+    fn subtle_tint_passes_coverage_on_saturation_evidence() {
+        // A uniform subtle warm wash scores low on Hasler-Suessstrunk
+        // colorfulness but carries real saturation and a large colored share;
+        // it must pass delivery coverage exactly like a vivid page.
+        let mut subtle = RgbImage::new(64, 64);
+        for (_, _, p) in subtle.enumerate_pixels_mut() {
+            p[0] = 225;
+            p[1] = 215;
+            p[2] = 205;
+        }
+        let (mean_sat, colored_fraction, colorfulness) = measure_colorization_evidence(&subtle);
+        // The luminance band filter keeps these midtone pixels; sat ~0.09 is
+        // well above the 0.025 floor, so coverage passes on saturation even
+        // though the uniform wash scores low on colorfulness.
+        assert!(
+            colorization_evidence_passes(mean_sat, colored_fraction, colorfulness),
+            "subtle tint rejected: sat {mean_sat}, frac {colored_fraction}, colorful {colorfulness}"
+        );
+    }
+
+    #[test]
+    fn delivery_transform_gate_rejects_identity_output() {
+        let input = RgbImage::from_pixel(64, 64, Rgb([150, 140, 130]));
+        let dynamic = image::DynamicImage::ImageRgb8(input.clone());
+        let line = GrayImage::from_pixel(64, 64, Luma([0]));
+        let protected = GrayImage::from_pixel(64, 64, Luma([0]));
+
+        let (delta, changed) =
+            measure_visible_input_output_change(&dynamic, &input, &line, &protected);
+        assert_eq!((delta, changed), (0.0, 0.0));
+
+        let transformed = RgbImage::from_pixel(64, 64, Rgb([180, 115, 90]));
+        let (delta, changed) =
+            measure_visible_input_output_change(&dynamic, &transformed, &line, &protected);
+        assert!(delta > MIN_DELIVERY_MEAN_RGB_DELTA);
+        assert!(changed > MIN_DELIVERY_CHANGED_FRACTION);
     }
 
     #[test]
@@ -2352,11 +2620,35 @@ mod tests {
             "needs_line_preservation_attention"
         );
 
+        // Moderate ink lightening typical of real model output is
+        // deliverable-with-warning, not delivery-blocking.
+        quality.line_preservation_score = 0.7;
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "production_ready_with_line_preservation_warning"
+        );
+
         quality.line_preservation_score = 1.0;
         quality.protected_region_violation_score = 0.0;
         assert_eq!(
             director_verdict(&quality, &preprocess, &EngineConfig::default()),
             "needs_protected_region_cleanup"
+        );
+
+        // Moderate halo bleed typical of real scans is deliverable-with-
+        // warning, not delivery-blocking.
+        quality.protected_region_violation_score = 0.7;
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "production_ready_with_protected_region_warning"
+        );
+
+        // A clean page still gets the plain ready verdict.
+        quality.bubble_cleanliness_score = 1.0;
+        quality.protected_region_violation_score = 0.97;
+        assert_eq!(
+            director_verdict(&quality, &preprocess, &EngineConfig::default()),
+            "production_ready_preview"
         );
     }
 
@@ -2380,10 +2672,6 @@ mod tests {
 
         assert_eq!(
             final_verdict_with_chroma_grid("production_ready_preview", &cleanup),
-            "needs_chroma_grid_cleanup"
-        );
-        assert_eq!(
-            final_verdict_with_chroma_grid("already colored", &cleanup),
             "needs_chroma_grid_cleanup"
         );
         assert_eq!(
@@ -2426,6 +2714,55 @@ mod tests {
 
         assert!(output.exists());
         assert_eq!(result.report.tiles_count, 1);
+    }
+
+    #[test]
+    fn tinted_input_runs_inference_even_with_legacy_skip_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("warm-tinted-page.png");
+        let output = dir.path().join("out.png");
+        let legacy_config = dir.path().join("legacy-skip.yaml");
+        let mut page = RgbImage::from_pixel(96, 128, Rgb([190, 174, 164]));
+        for x in 8..88 {
+            page.put_pixel(x, 20, Rgb([20, 18, 17]));
+            page.put_pixel(x, 108, Rgb([20, 18, 17]));
+        }
+        for y in 20..109 {
+            page.put_pixel(8, y, Rgb([20, 18, 17]));
+            page.put_pixel(87, y, Rgb([20, 18, 17]));
+        }
+        page.save(&input).unwrap();
+        fs::write(
+            &legacy_config,
+            "engine:\n  mode: fast\n  skip_already_colored: true\n  already_colored_sat_threshold: 0.01\n  already_colored_colored_fraction: 0.01\n",
+        )
+        .unwrap();
+
+        let result = MangaHueEngine::new()
+            .colorize(ColorizeRequest {
+                input_path: input.clone(),
+                output_path: output.clone(),
+                config_path: Some(legacy_config),
+                use_mock_backend: true,
+                ..ColorizeRequest::default()
+            })
+            .unwrap();
+
+        assert!(result.report.stage_reports.iter().any(|stage| {
+            stage.name == "inference"
+                && stage
+                    .metrics
+                    .get("tiles_completed")
+                    .is_some_and(|tiles| *tiles >= 1.0)
+        }));
+        assert_ne!(
+            result.report.director_verdict.as_deref(),
+            Some("already colored")
+        );
+        assert_ne!(
+            image::open(input).unwrap().to_rgb8(),
+            image::open(output).unwrap().to_rgb8()
+        );
     }
 
     #[test]

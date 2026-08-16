@@ -1,11 +1,7 @@
 engine:
-  mode: fast
   parallel_jobs: 1
   pyramid_enabled: true
   hint_propagation_enabled: true
-  skip_already_colored: true
-  already_colored_sat_threshold: 0.08
-  already_colored_colored_fraction: 0.05
 
 preprocess:
   denoise_enabled: false
