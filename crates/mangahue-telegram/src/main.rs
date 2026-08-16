@@ -52,24 +52,19 @@ const PAGE_COLORIZE_MAX_ATTEMPTS: usize = 2;
 /// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
 
+/// Delivery is approved for every page that was actually colored: the
+/// engine ran inference and the output visibly differs from the input
+/// (excluding ink and protected text/paper). Quality verdicts such as
+/// `needs_*` record detector/quality concerns in the report and caption but
+/// never withhold a colored page; only identity/pass-through output or a
+/// failed inference is undeliverable.
 fn delivery_quality_approved(report: &ProcessingReport) -> bool {
-    let verdict_ready = report
-        .director_verdict
-        .as_deref()
-        .is_some_and(|verdict| verdict.starts_with("production_ready"));
     let inference_completed = report.stage_reports.iter().any(|stage| {
         stage.name == "inference"
             && stage
                 .metrics
                 .get("tiles_completed")
                 .is_some_and(|tiles| *tiles >= 1.0)
-    });
-    let coverage_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_coverage"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
     });
     let transformation_passed = report.stage_reports.iter().any(|stage| {
         stage.name == "colorization_transform"
@@ -78,7 +73,7 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("passed")
                 .is_some_and(|passed| *passed >= 1.0)
     });
-    verdict_ready && inference_completed && coverage_passed && transformation_passed
+    inference_completed && transformation_passed
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -4487,6 +4482,8 @@ mod tests {
             }
             report
         };
+        // Every page that was actually colored delivers, regardless of the
+        // quality verdict; the verdict is informational, not a gate.
         assert!(delivery_quality_approved(&report(
             Some("production_ready_preview"),
             true,
@@ -4499,16 +4496,23 @@ mod tests {
             true,
             true
         )));
-        assert!(!delivery_quality_approved(&report(
-            Some("production_ready_preview"),
-            false,
+        assert!(delivery_quality_approved(&report(
+            Some("needs_protected_region_cleanup"),
             true,
+            false,
             true
         )));
-        assert!(!delivery_quality_approved(&report(
-            Some("production_ready_preview"),
+        assert!(delivery_quality_approved(&report(
+            Some("needs_insufficient_colorization"),
             true,
             false,
+            true
+        )));
+        // No inference or no visible transformation stays undeliverable.
+        assert!(!delivery_quality_approved(&report(
+            Some("production_ready_preview"),
+            false,
+            true,
             true
         )));
         assert!(!delivery_quality_approved(&report(
@@ -4523,13 +4527,8 @@ mod tests {
             false,
             false
         )));
-        assert!(!delivery_quality_approved(&report(None, true, true, true)));
-        assert!(!delivery_quality_approved(&report(
-            Some("needs_protected_region_cleanup"),
-            true,
-            true,
-            true
-        )));
+        // A missing verdict does not withhold a page that was colored.
+        assert!(delivery_quality_approved(&report(None, true, true, true)));
     }
 
     #[test]

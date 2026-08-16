@@ -688,24 +688,19 @@ fn configure_color_bible_page(
     );
 }
 
+/// Delivery is approved for every page that was actually colored: the
+/// engine ran inference and the output visibly differs from the input
+/// (excluding ink and protected text/paper). Quality verdicts such as
+/// `needs_*` record detector/quality concerns in the manifest but never
+/// withhold a colored page; only identity/pass-through output or a failed
+/// inference is undeliverable.
 fn delivery_quality_approved(report: &ProcessingReport) -> bool {
-    let verdict_ready = report
-        .director_verdict
-        .as_deref()
-        .is_some_and(|verdict| verdict.starts_with("production_ready"));
     let inference_completed = report.stage_reports.iter().any(|stage| {
         stage.name == "inference"
             && stage
                 .metrics
                 .get("tiles_completed")
                 .is_some_and(|tiles| *tiles >= 1.0)
-    });
-    let coverage_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_coverage"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
     });
     let transformation_passed = report.stage_reports.iter().any(|stage| {
         stage.name == "colorization_transform"
@@ -714,7 +709,7 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("passed")
                 .is_some_and(|passed| *passed >= 1.0)
     });
-    verdict_ready && inference_completed && coverage_passed && transformation_passed
+    inference_completed && transformation_passed
 }
 
 fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
@@ -961,9 +956,12 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     #[test]
-    fn delivery_requires_ready_verdict_and_completed_inference() {
+    fn delivery_approves_colored_pages_regardless_of_quality_verdict() {
+        // The engine ran and the output changed: deliver. A quality verdict
+        // such as needs_* (or none at all) is informational and must not
+        // withhold a colored page.
         let mut report = ProcessingReport {
-            director_verdict: Some("production_ready_preview".to_string()),
+            director_verdict: Some("needs_protected_region_cleanup".to_string()),
             ..ProcessingReport::default()
         };
         assert!(!delivery_quality_approved(&report));
@@ -972,15 +970,23 @@ mod tests {
         );
         assert!(!delivery_quality_approved(&report));
         report.add_stage_report(
-            mangahue_core::StageReport::new("colorization_coverage").metric("passed", 1.0),
-        );
-        assert!(!delivery_quality_approved(&report));
-        report.add_stage_report(
             mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
         );
         assert!(delivery_quality_approved(&report));
-        report.director_verdict = Some("already colored".to_string());
-        assert!(!delivery_quality_approved(&report));
+
+        // An identity pass-through (no visible transformation) is not a
+        // colored page and stays undeliverable.
+        let mut identity = ProcessingReport {
+            director_verdict: Some("production_ready_preview".to_string()),
+            ..ProcessingReport::default()
+        };
+        identity.add_stage_report(
+            mangahue_core::StageReport::new("inference").metric("tiles_completed", 1.0),
+        );
+        identity.add_stage_report(
+            mangahue_core::StageReport::new("colorization_transform").metric("passed", 0.0),
+        );
+        assert!(!delivery_quality_approved(&identity));
     }
 
     #[test]
