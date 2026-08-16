@@ -688,12 +688,12 @@ fn configure_color_bible_page(
     );
 }
 
-/// Delivery is approved for every page that was actually colored: the
-/// engine ran inference and the output visibly differs from the input
-/// (excluding ink and protected text/paper). Quality verdicts such as
+/// Delivery requires proof of actual colorization: inference completed, the
+/// output carries real chromatic coverage, and it visibly differs from the
+/// input (excluding ink and protected text/paper). Quality verdicts such as
 /// `needs_*` record detector/quality concerns in the manifest but never
-/// withhold a colored page; only identity/pass-through output or a failed
-/// inference is undeliverable.
+/// withhold a colored page; uncolored pass-through output, identity output,
+/// and failed inference are undeliverable.
 fn delivery_quality_approved(report: &ProcessingReport) -> bool {
     let inference_completed = report.stage_reports.iter().any(|stage| {
         stage.name == "inference"
@@ -702,6 +702,13 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("tiles_completed")
                 .is_some_and(|tiles| *tiles >= 1.0)
     });
+    let coverage_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_coverage"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
     let transformation_passed = report.stage_reports.iter().any(|stage| {
         stage.name == "colorization_transform"
             && stage
@@ -709,7 +716,7 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("passed")
                 .is_some_and(|passed| *passed >= 1.0)
     });
-    inference_completed && transformation_passed
+    inference_completed && coverage_passed && transformation_passed
 }
 
 fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
@@ -957,9 +964,9 @@ mod tests {
 
     #[test]
     fn delivery_approves_colored_pages_regardless_of_quality_verdict() {
-        // The engine ran and the output changed: deliver. A quality verdict
-        // such as needs_* (or none at all) is informational and must not
-        // withhold a colored page.
+        // The engine ran, real color is present, and the output changed:
+        // deliver. A quality verdict such as needs_* (or none at all) is
+        // informational and must not withhold a colored page.
         let mut report = ProcessingReport {
             director_verdict: Some("needs_protected_region_cleanup".to_string()),
             ..ProcessingReport::default()
@@ -970,9 +977,30 @@ mod tests {
         );
         assert!(!delivery_quality_approved(&report));
         report.add_stage_report(
+            mangahue_core::StageReport::new("colorization_coverage").metric("passed", 1.0),
+        );
+        assert!(!delivery_quality_approved(&report));
+        report.add_stage_report(
             mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
         );
         assert!(delivery_quality_approved(&report));
+
+        // A page without real color (coverage failed) must not ship as a
+        // grayscale pass-through.
+        let mut gray = ProcessingReport {
+            director_verdict: Some("needs_insufficient_colorization".to_string()),
+            ..ProcessingReport::default()
+        };
+        gray.add_stage_report(
+            mangahue_core::StageReport::new("inference").metric("tiles_completed", 1.0),
+        );
+        gray.add_stage_report(
+            mangahue_core::StageReport::new("colorization_coverage").metric("passed", 0.0),
+        );
+        gray.add_stage_report(
+            mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
+        );
+        assert!(!delivery_quality_approved(&gray));
 
         // An identity pass-through (no visible transformation) is not a
         // colored page and stays undeliverable.
@@ -982,6 +1010,9 @@ mod tests {
         };
         identity.add_stage_report(
             mangahue_core::StageReport::new("inference").metric("tiles_completed", 1.0),
+        );
+        identity.add_stage_report(
+            mangahue_core::StageReport::new("colorization_coverage").metric("passed", 1.0),
         );
         identity.add_stage_report(
             mangahue_core::StageReport::new("colorization_transform").metric("passed", 0.0),

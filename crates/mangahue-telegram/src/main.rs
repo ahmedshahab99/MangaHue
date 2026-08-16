@@ -52,12 +52,12 @@ const PAGE_COLORIZE_MAX_ATTEMPTS: usize = 2;
 /// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
 
-/// Delivery is approved for every page that was actually colored: the
-/// engine ran inference and the output visibly differs from the input
-/// (excluding ink and protected text/paper). Quality verdicts such as
+/// Delivery requires proof of actual colorization: inference completed, the
+/// output carries real chromatic coverage, and it visibly differs from the
+/// input (excluding ink and protected text/paper). Quality verdicts such as
 /// `needs_*` record detector/quality concerns in the report and caption but
-/// never withhold a colored page; only identity/pass-through output or a
-/// failed inference is undeliverable.
+/// never withhold a colored page; uncolored pass-through output, identity
+/// output, and failed inference are undeliverable.
 fn delivery_quality_approved(report: &ProcessingReport) -> bool {
     let inference_completed = report.stage_reports.iter().any(|stage| {
         stage.name == "inference"
@@ -66,6 +66,13 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("tiles_completed")
                 .is_some_and(|tiles| *tiles >= 1.0)
     });
+    let coverage_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_coverage"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
     let transformation_passed = report.stage_reports.iter().any(|stage| {
         stage.name == "colorization_transform"
             && stage
@@ -73,7 +80,7 @@ fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("passed")
                 .is_some_and(|passed| *passed >= 1.0)
     });
-    inference_completed && transformation_passed
+    inference_completed && coverage_passed && transformation_passed
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -4499,16 +4506,18 @@ mod tests {
         assert!(delivery_quality_approved(&report(
             Some("needs_protected_region_cleanup"),
             true,
-            false,
+            true,
             true
         )));
-        assert!(delivery_quality_approved(&report(
+        // A page with no real color (coverage failed) must not ship as a
+        // grayscale pass-through, and identity/unchanged output must not
+        // ship either.
+        assert!(!delivery_quality_approved(&report(
             Some("needs_insufficient_colorization"),
             true,
             false,
             true
         )));
-        // No inference or no visible transformation stays undeliverable.
         assert!(!delivery_quality_approved(&report(
             Some("production_ready_preview"),
             false,
