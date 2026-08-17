@@ -397,11 +397,6 @@ pub(crate) fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-pub(crate) fn skin_hue_range(h: f32) -> bool {
-    // Warm skin hues: 0.0-0.12 (orange/peach) and 0.90-1.0 (pink/red).
-    (0.90..=1.0).contains(&h) || (0.0..=0.12).contains(&h)
-}
-
 pub(crate) fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let r = r as f32 / 255.0;
     let g = g as f32 / 255.0;

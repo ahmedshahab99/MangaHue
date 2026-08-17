@@ -453,7 +453,7 @@ impl LearningAgent {
 
             // Top color shifts
             let mut shifts: Vec<(([u8; 3], [u8; 3]), usize)> = color_shifts.into_iter().collect();
-            shifts.sort_by(|a, b| b.1.cmp(&a.1));
+            shifts.sort_by_key(|b| std::cmp::Reverse(b.1));
             let top_shifts: Vec<ColorShift> = shifts
                 .iter()
                 .take(5)
