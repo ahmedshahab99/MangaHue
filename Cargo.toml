@@ -26,6 +26,7 @@ members = [
   "crates/mangahue-worker",
   "crates/mangahue-intelligence",
   "crates/mangahue-export",
+  "crates/mangahue-learning",
 ]
 
 [workspace.package]

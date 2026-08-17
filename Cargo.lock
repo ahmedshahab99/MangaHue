@@ -1693,6 +1693,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangahue-learning"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "mangahue-brain",
+ "mangahue-intelligence",
+ "mangahue-memory",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "mangahue-memory"
 version = "0.1.0"
 dependencies = [
