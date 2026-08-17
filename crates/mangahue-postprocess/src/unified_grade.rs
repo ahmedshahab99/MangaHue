@@ -246,9 +246,15 @@ pub(crate) fn unified_grade(
             if config.natural_grading {
                 if is_skin {
                     h = h * 0.85 + PEACH_HUE * 0.15;
-                    // Wider band (0.28-0.62) allows more natural skin
-                    // variety across different lighting and skin tones.
-                    s = s.clamp(0.28, 0.62);
+                    // Only apply the saturation floor when the pixel
+                    // already carries meaningful model chroma (s > 0.12).
+                    // Near-gray pixels — averaged screentone dots, dark
+                    // shading, or model noise — must not be pushed to a
+                    // visible 28% floor; the gain in sub-pass B would
+                    // further amplify them into colored dot artifacts.
+                    if s > 0.12 {
+                        s = s.clamp(0.28, 0.62);
+                    }
                     v = (v + 0.02).clamp(0.0, 1.0);
                 } else if s > 0.68 {
                     // Keep rich colors from going neon.

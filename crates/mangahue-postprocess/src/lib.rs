@@ -1600,8 +1600,16 @@ pub fn preserve_screentones(
             }
         }
         let gamut_scale = gamut_scale.clamp(0.0, 1.0);
+        // For grayscale manga the original has zero chroma in screentone
+        // regions.  Dampen the coloured image's chroma proportionally to
+        // the luma-restoration strength so model-invented colour noise
+        // (dots, squares) fades toward the original grey while strong
+        // legitimate chroma from dense coloured regions survives at
+        // reduced intensity.  The 0.45 factor keeps the dampening gentle
+        // (at max tone_strength 0.72 the chroma is reduced by ~32 %).
+        let chroma_scale = 1.0 - tone_strength.clamp(0.0, 0.72) * 0.45;
         for channel in 0..3 {
-            pixel[channel] = (target_luma + chroma[channel] * gamut_scale)
+            pixel[channel] = (target_luma + chroma[channel] * gamut_scale * chroma_scale)
                 .round()
                 .clamp(0.0, 255.0) as u8;
         }

@@ -1737,6 +1737,7 @@ dependencies = [
  "mangahue-inference",
  "mangahue-intelligence",
  "mangahue-layout",
+ "mangahue-learning",
  "mangahue-memory",
  "mangahue-postprocess",
  "mangahue-preprocess",
