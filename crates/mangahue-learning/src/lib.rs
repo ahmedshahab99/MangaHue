@@ -809,6 +809,12 @@ mod tests {
     #[test]
     fn triggers_retrain_after_many_corrections() {
         let mut agent = test_agent();
+        // Need enough approvals to keep correction rate below research threshold
+        for i in 0..200 {
+            agent
+                .record_approval(&format!("page{}", i), "ch1", 0.9, 0.4, 12.0, "ddcolor-tiny")
+                .unwrap();
+        }
         for i in 0..120 {
             agent
                 .record_correction(
