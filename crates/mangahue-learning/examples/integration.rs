@@ -40,6 +40,7 @@ pub fn on_page_colorized(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 /// Hook this when a user corrects a color.
 pub fn on_user_correction(
     agent: &mut LearningAgent,
