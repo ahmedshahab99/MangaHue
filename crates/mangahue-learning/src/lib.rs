@@ -266,6 +266,7 @@ impl Default for LearningConfig {
 /// The persistent learning agent.
 pub struct LearningAgent {
     config: LearningConfig,
+    #[allow(dead_code)]
     project_path: PathBuf,
     events: Vec<LearningEvent>,
     event_store_path: PathBuf,
@@ -342,6 +343,7 @@ impl LearningAgent {
     }
 
     /// Record that a user corrected a specific region.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_correction(
         &mut self,
         page_id: &str,
@@ -464,7 +466,7 @@ impl LearningAgent {
                     from_color: *from,
                     to_color: *to,
                     count: *count,
-                    mean_distance: mean_distance,
+                    mean_distance,
                 })
                 .collect();
 
