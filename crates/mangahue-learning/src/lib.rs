@@ -139,6 +139,9 @@ pub struct ColorShift {
     pub mean_distance: f32,
 }
 
+/// (predicted_color, corrected_color) -> frequency
+pub type ColorShiftEntry = (([u8; 3], [u8; 3]), usize);
+
 /// Pattern analysis result for a batch of corrections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatternAnalysis {
@@ -423,7 +426,7 @@ impl LearningAgent {
             .iter()
             .map(|(k, v)| (k.clone(), v.len()))
             .collect();
-        class_counts.sort_by(|a, b| b.1.cmp(&a.1));
+        class_counts.sort_by_key(|k| std::cmp::Reverse(k.1));
 
         // Detect patterns for each failing class
         let mut patterns = Vec::new();
@@ -452,7 +455,7 @@ impl LearningAgent {
             let mean_distance = total_distance / class_events.len() as f32;
 
             // Top color shifts
-            let mut shifts: Vec<(([u8; 3], [u8; 3]), usize)> = color_shifts.into_iter().collect();
+            let mut shifts: Vec<ColorShiftEntry> = color_shifts.into_iter().collect();
             shifts.sort_by_key(|b| std::cmp::Reverse(b.1));
             let top_shifts: Vec<ColorShift> = shifts
                 .iter()
