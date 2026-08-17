@@ -33,7 +33,7 @@ use image::{GrayImage, Rgb, RgbImage};
 use mangahue_config::PostprocessSection;
 use serde::{Deserialize, Serialize};
 
-use super::natural_grade::{hsv_to_rgb, rgb_to_hsv, skin_hue_range, smoothstep, PEACH_HUE};
+use super::natural_grade::{hsv_to_rgb, rgb_to_hsv, smoothstep, PEACH_HUE};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UnifiedGradeReport {
@@ -113,9 +113,10 @@ pub(crate) fn unified_grade(
             if (280.0..360.0).contains(&hue_deg) {
                 // Authoritative cap, not a factor: the gain (measured on
                 // the shaped page) would otherwise re-amplify the loudest
-                // mauve back over the visibility threshold. A saturated
-                // legit purple keeps a muted 0.28.
-                s = s.min(0.28);
+                // mauve back over the visibility threshold. Raised from 0.28
+                // to 0.45 so purple hair ribbons, clothing, and backgrounds
+                // retain natural variety instead of being flattened.
+                s = s.min(0.45);
             }
             if s <= 0.001 {
                 continue; // nothing to shape
@@ -220,29 +221,34 @@ pub(crate) fn unified_grade(
             s = s.clamp(0.0, 1.0);
             // Mauve cap AFTER the shaping: the pull toward the midtone
             // target (0.35) would otherwise raise the capped band back over
-            // the visibility threshold (0.28 + pull ≈ 0.30). The top-of-loop
-            // cap stays for the hint write path.
+            // the visibility threshold. Raised from 0.28 to 0.45 so purple
+            // tones retain natural saturation variety.
             let hue_deg = h * 360.0;
             if (280.0..360.0).contains(&hue_deg) {
-                s = s.min(0.28);
+                s = s.min(0.45);
             }
 
             // 3. Hue + value: the merged shaping decisions, each gated by
             // its own legacy flag so a natural-only or muted-only config
             // keeps exactly its intended look.
             let (pr, pg, pb) = (pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
-            // Skin warm-up (natural grade's peach shift): red dominance
-            // plus a blue floor so orange/gold hair is NOT peached.
-            let is_skin = config.natural_grading
-                && (0.40..=0.97).contains(&gray)
-                && skin_hue_range(h)
-                && pr > pg + 6.0
-                && pb > pr * 0.35
-                && pb < pg;
+            // Skin warm-up (natural grade's peach shift): YCbCr-based
+            // detection works better across diverse skin tones than RGB
+            // thresholds alone.
+            let is_skin = config.natural_grading && (0.40..=0.97).contains(&gray) && {
+                let y = 0.299 * pr + 0.587 * pg + 0.114 * pb;
+                let cb = 128.0 - 0.168736 * pr - 0.331264 * pg + 0.5 * pb;
+                let cr = 128.0 + 0.5 * pr - 0.418688 * pg - 0.081312 * pb;
+                (77.0..=127.0).contains(&cb)    // Cb range for skin
+                        && (133.0..=173.0).contains(&cr)   // Cr range for skin
+                        && y > 80.0 // not too dark
+            };
             if config.natural_grading {
                 if is_skin {
                     h = h * 0.85 + PEACH_HUE * 0.15;
-                    s = s.clamp(0.30, 0.55);
+                    // Wider band (0.28-0.62) allows more natural skin
+                    // variety across different lighting and skin tones.
+                    s = s.clamp(0.28, 0.62);
                     v = (v + 0.02).clamp(0.0, 1.0);
                 } else if s > 0.68 {
                     // Keep rich colors from going neon.
@@ -270,7 +276,14 @@ pub(crate) fn unified_grade(
             }
             v = v.clamp(0.0, 1.0);
 
-            let (r, g, b) = hsv_to_rgb(h, s, v);
+            let (mut r, g, mut b) = hsv_to_rgb(h, s, v);
+            // Warm shadow tint: push shadows below 0.45 luma toward
+            // red/orange color temperature for a professional look.
+            if gray < 0.45 && config.natural_grading {
+                let shadow_warmth = ((0.45 - gray) * 0.08).clamp(0.0, 0.025);
+                r = (r + shadow_warmth * 255.0).clamp(0.0, 255.0);
+                b = (b - shadow_warmth * 200.0).clamp(0.0, 255.0);
+            }
             image.put_pixel(
                 x,
                 y,
@@ -397,7 +410,10 @@ pub(crate) fn unified_grade(
         };
         report.measured_warmth = shaped_warmth;
         let err = (config.governor_target_warmth - shaped_warmth).clamp(-30.0, 30.0);
-        warmth_shift = if err.abs() >= 2.0 { err * 0.35 } else { 0.0 };
+        // Stronger warmth shift (0.50 vs 0.35) with lower dead zone
+        // (1.0 vs 2.0) pushes shadows toward warm red/orange like
+        // professional manga grading.
+        warmth_shift = if err.abs() >= 1.0 { err * 0.50 } else { 0.0 };
         report.warmth_shift = warmth_shift;
     }
     if governor && ((gain - 1.0).abs() >= 0.01 || warmth_shift.abs() >= 2.0) {

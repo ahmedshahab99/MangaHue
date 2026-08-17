@@ -70,14 +70,21 @@ pub(crate) fn natural_grade(
             // requires red dominance plus a blue floor so orange/gold hair
             // and strongly blue-deficient materials are NOT peached.
             let (pr, pg, pb) = (pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
-            let is_skin = (0.40..=0.97).contains(&gray)
-                && skin_hue_range(h)
-                && pr > pg + 6.0
-                && pb > pr * 0.35
-                && pb < pg;
+            // YCbCr skin detection works better across diverse skin tones
+            // than RGB thresholds alone.
+            let is_skin = (0.40..=0.97).contains(&gray) && {
+                let y = 0.299 * pr + 0.587 * pg + 0.114 * pb;
+                let cb = 128.0 - 0.168736 * pr - 0.331264 * pg + 0.5 * pb;
+                let cr = 128.0 + 0.5 * pr - 0.418688 * pg - 0.081312 * pb;
+                (77.0..=127.0).contains(&cb)    // Cb range for skin
+                        && (133.0..=173.0).contains(&cr)   // Cr range for skin
+                        && y > 80.0 // not too dark
+            };
             if is_skin {
                 h = h * 0.85 + PEACH_HUE * 0.15;
-                s = s.clamp(0.32, 0.62);
+                // Wider band (0.28-0.62) allows more natural skin variety
+                // across different lighting and skin tones.
+                s = s.clamp(0.28, 0.62);
                 v = (v + 0.02).clamp(0.0, 1.0);
             } else if s > 0.68 {
                 // Keep rich colors from going neon (raised from 0.6).
@@ -233,8 +240,11 @@ pub(crate) fn smart_color_governor(
     // Lab-ish units per pass so a wrong target can never invert a page.
     if target_warmth > 0.0 {
         let warmth_err = (target_warmth - measured_warmth).clamp(-30.0, 30.0);
-        if warmth_err.abs() >= 2.0 {
-            let shift = warmth_err * 0.35;
+        if warmth_err.abs() >= 1.0 {
+            // Stronger warmth shift (0.50 vs 0.35) with lower dead zone
+            // (1.0 vs 2.0) pushes shadows toward warm red/orange like
+            // professional manga grading.
+            let shift = warmth_err * 0.50;
             for (x, y, pixel) in image.enumerate_pixels_mut() {
                 if is_hint_pixel(x, y) {
                     continue;
