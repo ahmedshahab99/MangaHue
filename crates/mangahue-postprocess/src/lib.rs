@@ -953,8 +953,16 @@ pub fn restore_delivery_protected_regions(
 /// ink left by inference or sharpening.
 fn enforce_strong_ink(image: &mut RgbImage, line_mask: &GrayImage) {
     for (x, y, pixel) in image.enumerate_pixels_mut() {
-        if line_mask.get_pixel(x, y)[0] >= 96 {
-            *pixel = Rgb([32, 32, 32]);
+        let ink = line_mask.get_pixel(x, y)[0] as f32 / 255.0;
+        if ink >= 0.37 {
+            // Proportional enforcement: solid ink (ink=1.0) → full black,
+            // soft edges (ink=0.37) → partially darkened, anti-aliased look preserved
+            let blend = (ink * 1.5).clamp(0.0, 1.0);
+            let target = 32.0 + (1.0 - ink) * 180.0;
+            for c in 0..3 {
+                let v = pixel[c] as f32;
+                pixel[c] = (v * (1.0 - blend) + target * blend).round() as u8;
+            }
         }
     }
 }

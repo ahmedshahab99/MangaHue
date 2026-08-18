@@ -264,7 +264,15 @@ pub(crate) fn finish_reference_style(
                         // near-white faces get the full base, faces the model
                         // already colored keep their own hue. face_paint_strength
                         // scales the ceiling (model-first presets lower it).
-                        let chroma_gate = 1.0 - smoothstep(0.035, 0.10, chroma);
+                        // Use HSV saturation instead of linear RGB chroma for more accurate gating.
+                        // Pixels already well-saturated with real skin color → lower gate (don't override).
+                        // Pixels near-white or grayscale → higher gate (inject skin color).
+                        let (_, msat, _) = rgb_to_hsv(
+                            (rgb[0] * 255.0) as u8,
+                            (rgb[1] * 255.0) as u8,
+                            (rgb[2] * 255.0) as u8,
+                        );
+                        let chroma_gate = 1.0 - smoothstep(0.10, 0.35, msat);
                         let k = (fm * config.face_paint_strength * chroma_gate)
                             .min(config.face_paint_strength);
                         centered[0] = centered[0] * (1.0 - k) + (base[0] - base_luma) * k;
@@ -574,6 +582,28 @@ fn bell(value: f32, center: f32, radius: f32) -> f32 {
     // banding-free shading transitions.
     let d = ((value - center) / radius.max(0.001)).abs();
     (1.0 - d * d).clamp(0.0, 1.0)
+}
+
+fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let d = mx - mn;
+    let v = mx;
+    let s = if mx == 0.0 { 0.0 } else { d / mx };
+    let h = if d == 0.0 {
+        0.0
+    } else if mx == r {
+        60.0 * (((g - b) / d) % 6.0)
+    } else if mx == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    let h = ((h % 360.0) + 360.0) % 360.0;
+    (h / 360.0, s, v) // Return h in 0-1 range
 }
 
 #[cfg(test)]
