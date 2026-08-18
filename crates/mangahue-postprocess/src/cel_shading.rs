@@ -25,7 +25,7 @@
 //! Ink, speech bubbles, and explicitly protected regions are never
 //! touched, so line art and text stay clean.
 
-use image::{GenericImageView, GrayImage, Luma, Rgb, RgbImage};
+use image::{GrayImage, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -95,16 +95,25 @@ pub fn apply_cel_shading(
                 continue;
             }
             let base_luma = 0.299 * br + 0.587 * bg + 0.114 * bb;
-            // Skip near-paper and near-ink: the cel pass is meaningless there.
-            if base_luma < 0.06 || base_luma > 0.94 {
-                continue;
-            }
-
+            // Skip the PIXEL if it's near-paper or near-ink: the cel pass is
+            // meaningless there. We rely on the pixel's own luma, not the
+            // local mean — the base_luma is the local mean which is often
+            // diluted by surrounding paper and would wrongly drop colored
+            // pixels whose window is mostly paper. When the base_luma is
+            // high, the band ratio will be near 1.0 and the cel pass will
+            // be a no-op on those pixels — naturally quiet on paper-adjacent
+            // colored regions.
             let orig = image.get_pixel(x, y);
             let orig_luma = 0.299 * orig[0] as f32
                 + 0.587 * orig[1] as f32
                 + 0.114 * orig[2] as f32;
-            let ratio = orig_luma / base_luma.max(0.001);
+            // base_luma and orig_luma are in 0..255 (channel sums). Normalize
+            // for the skip test so the threshold is a clean 0..1 quantity.
+            if orig_luma / 255.0 < 0.06 || orig_luma / 255.0 > 0.94 {
+                continue;
+            }
+
+            let ratio = (orig_luma / 255.0) / (base_luma / 255.0).max(0.001);
 
             // Map ratio to a band factor with smoothstep edges so the
             // transition between bands is painterly, not hard.
@@ -113,7 +122,15 @@ pub fn apply_cel_shading(
             // Construct the cel pixel: the local base hue, scaled to the
             // band brightness. Channels are scaled together so the hue is
             // preserved while the value moves to the chosen band.
-            let (cr, cg, cb) = scaled_channels(br, bg, bb, base_luma, band, shadow_factor, highlight_factor);
+            let (cr, cg, cb) = scaled_channels(
+                br,
+                bg,
+                bb,
+                base_luma,
+                band,
+                shadow_factor,
+                highlight_factor,
+            );
 
             // Blend with the original so the model keeps detail.
             let r = lerp(orig[0] as f32, cr, strength);
@@ -252,6 +269,42 @@ mod tests {
         );
         // All pixels are paper or ink; the cel pass should skip both.
         assert_eq!(report.pixels_shaded, 0);
+    }
+
+    #[test]
+    fn cel_pass_quantizes_brightness_on_colored_region() {
+        // Build a 20x20 image with a smooth gradient band (luma 100-150).
+        // The cel pass should quantize the brightness into bands.
+        let mut img = RgbImage::from_pixel(20, 20, Rgb([0, 0, 0]));
+        for x in 0..20u32 {
+            let r = 100 + (x * 3) as u8;
+            img.put_pixel(x, 10, Rgb([r, 60, 80]));
+        }
+        let lines = GrayImage::from_pixel(20, 20, Luma([0]));
+        let bubbles = GrayImage::from_pixel(20, 20, Luma([0]));
+        let original_red: Vec<u8> = (0..20u32).map(|x| img.get_pixel(x, 10)[0]).collect();
+        let report = apply_cel_shading(
+            &mut img,
+            &lines,
+            &bubbles,
+            None,
+            0.7,
+            1.15,
+            0.58,
+            1.18,
+            0.18,
+            0.7,
+            4,
+        );
+        assert!(report.pixels_shaded > 0, "cel pass should shade the colored band");
+        // After cel quantization at least some red values should change.
+        let new_red: Vec<u8> = (0..20u32).map(|x| img.get_pixel(x, 10)[0]).collect();
+        let changed = original_red
+            .iter()
+            .zip(new_red.iter())
+            .filter(|(a, b)| **a != **b)
+            .count();
+        assert!(changed > 0, "cel pass should modify at least some pixels");
     }
 
     #[test]

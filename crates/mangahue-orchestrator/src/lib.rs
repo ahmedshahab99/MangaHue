@@ -1283,6 +1283,10 @@ impl MangaHueEngine {
                 .metric(
                     "unified_pixels_graded",
                     postprocess_report.unified_pixels_graded as f64,
+                )
+                .metric(
+                    "cel_pixels_shaded",
+                    postprocess_report.cel_pixels_shaded as f64,
                 ),
         );
         // Diagnostic metrics before the bounded recovery/final delivery pass.
