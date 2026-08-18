@@ -1,0 +1,125 @@
+# MangaHue Natural v3 - production preset for the unified single-mode bot.
+#
+# Audit-driven (Aug 18): the previous pure-model-v2 preset over-shaped the
+# model's output. Measured root causes of unnatural colors:
+#
+#   1. muted_hue_shift_deg 16 + muted_yellow_shift_deg 18 rotated every hue
+#      in the 20-85 deg band toward red-orange (total -34 deg on yellows):
+#      vegetation, yellow clothing and gold accents all turned orange.
+#      Tuned to one reference page; wrong for everything else.
+#   2. The muted grade's per-luma saturation targets (dark 0.24 / mid 0.35 /
+#      bright 0.33) pulled every pixel toward a uniform saturation band,
+#      destroying the model's natural chroma variety (poster-flat look).
+#   3. The warmth governor (target 40, shift x0.5) plus the shadow warm tint
+#      (+8 R / -5 B near blacks) forced every page warm regardless of scene.
+#   4. hint_chroma_strength 0.85 snapped weak-chroma pixels hard onto flat
+#      palette colors, and grading skipped hint pixels, so agent-painted
+#      regions kept flat color with no ambient integration.
+#
+# v3 fixes: no hue rotation, no saturation flattening, no shadow warm tint,
+# a gentle bounded gain, and a softer hint snap. The model's own color
+# relationships are preserved; grading only measures and trims.
+engine:
+  parallel_jobs: 1
+  # One canonical mode: single inference pass (the unified bot pins the
+  # pyramid off; the config must not silently re-enable it).
+  pyramid_enabled: false
+  hint_propagation_enabled: true
+
+preprocess:
+  denoise_enabled: false
+  denoise_strength: 0
+  max_input_dimension: 1024
+  line_sharpening: 0.35
+
+layout:
+  tiling_enabled: false
+  tile_size: 1024
+  tile_overlap: 0
+
+inference:
+  model_path: models/ddcolor-full-fp32.onnx
+  model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
+  device: cpu
+  batch_size: 1
+  input_size: 1024
+  fp16_enabled: false
+  resize_policy: fit
+
+hints:
+  user_hints_enabled: false
+  character_memory_enabled: false
+  style_hints_enabled: true
+  hint_blur_radius: 4.0
+  hint_strength: 1.0
+  region_style_hints_enabled: true
+  region_style_hint_budget: 18
+
+postprocess:
+  restore_lines: true
+  line_strength: 1.0
+  bubble_cleanup: true
+  bleeding_correction: true
+  palette_correction: true
+  region_chroma_separation: 28.0
+  final_sharpening: 0.03
+  reference_finishing: true
+  # Finishing stays luma-focused (gloss/shadow) at a whisper.
+  target_colorfulness: 0.18
+  midtone_depth: 0.05
+  local_contrast: 0.08
+  semantic_relighting: false
+  relighting_strength: 0.0
+  # NO hue-band rotation and NO saturation flattening: the muted target
+  # grade and the natural grade both stay off. Grading is now the smart
+  # governor only (bounded measured gain, no hue edits).
+  natural_grading: false
+  muted_target_grade: false
+  muted_strength: 0.0
+  muted_hue_shift_deg: 0.0
+  muted_yellow_shift_deg: 0.0
+  muted_dark_pull: 1.0
+  muted_dark_sat: 0.24
+  muted_mid_sat: 0.35
+  muted_bright_sat: 0.33
+  muted_paper_sat: 0.02
+  muted_vivid_preserve: 0.9
+  soft_coverage: true
+  soft_strength: 0.85
+  soft_confidence: 0.8
+  model_first: true
+  seed_chroma_bar_bright: 22.0
+  seed_chroma_bar_mid: 12.0
+  model_chroma_bar_bright: 18.0
+  model_chroma_bar_mid: 10.0
+  model_chroma_gain: 1.0
+  palette_harmony_strength: 0.08
+  face_paint_strength: 0.55
+  ambient_occlusion_strength: 0.7
+  # Smart governor: gentle bounded gain only. min 0.9 / max 1.15 means the
+  # page can never be boosted more than 15% or cut more than 10% - the
+  # model's chroma relationships survive. Warmth target 20 with a light
+  # shift only removes extreme casts; no forced warmth.
+  smart_governor: true
+  governor_target_saturation: 0.18
+  governor_target_colorfulness: 36.0
+  governor_min_gain: 0.9
+  governor_max_gain: 1.15
+  governor_target_warmth: 20.0
+  # Gentle hint snap: weak-chroma pixels move only halfway toward the
+  # material hue so the model's own shading and variation survive.
+  hint_chroma_strength: 0.5
+  unified_grade: true
+  despeckle_color_specks: true
+
+output:
+  format: png
+  quality: 95
+  write_report: true
+  write_intermediates: false
+
+eval:
+  line_preservation_threshold: 0.88
+  protected_region_violation_threshold: 0.92
+  hint_adherence_threshold: 0.62
+  screen_tone_warning_threshold: 0.18
