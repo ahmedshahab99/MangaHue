@@ -60,7 +60,14 @@ postprocess:
   line_strength: 1.0
   bubble_cleanup: true
   bleeding_correction: true
-  palette_correction: true
+  # Audit finding (measured on real pages): the palette correction chain
+  # (LUT + harmony + material chroma completion + region renderer) turned
+  # the model's balanced hues (21% orange / 35% yellow / 16% blue) into
+  # 78% orange. The palette prior is warm-skewed and repaints pages it
+  # should leave alone. The model's own colors now survive; the finishing
+  # pass still guarantees face paint, and the hint/agent guidance still
+  # feeds the model pre-inference.
+  palette_correction: false
   region_chroma_separation: 28.0
   final_sharpening: 0.03
   reference_finishing: true
@@ -106,9 +113,9 @@ postprocess:
   governor_min_gain: 0.9
   governor_max_gain: 1.15
   governor_target_warmth: 20.0
-  # Gentle hint snap: weak-chroma pixels move only halfway toward the
+  # Gentle hint snap: weak-chroma pixels move only partway toward the
   # material hue so the model's own shading and variation survive.
-  hint_chroma_strength: 0.5
+  hint_chroma_strength: 0.35
   unified_grade: true
   despeckle_color_specks: true
 

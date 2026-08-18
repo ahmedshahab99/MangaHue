@@ -349,21 +349,32 @@ impl ColoringAgent for SceneContextAgent {
             ),
         }];
 
-        // Scene-adapted background proposal per background node.
-        let background_proposals: Vec<ProposedColor> = context
-            .structure_graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind.semantic() == Some("background"))
-            .map(|node| ProposedColor {
-                region_id: node.id.clone(),
-                color: scene.background_color,
-                semantic: "background".to_string(),
-                confidence: (scene.confidence * node.confidence)
-                    .min(0.75)
-                    .max(0.25),
-            })
-            .collect();
+        // Scene-adapted background proposal per background node. Day and
+        // bright scenes leave backgrounds to the model (measured: flat
+        // background paint erased blue skies and turned them warm). Only
+        // night/dusk/indoor scenes - where the model's background chroma
+        // is genuinely weak - receive a luma-matched proposal, at reduced
+        // confidence so the model keeps final say.
+        let scene_dark = matches!(
+            scene.time_of_day,
+            TimeOfDay::Night | TimeOfDay::Dusk | TimeOfDay::Indoor
+        );
+        let background_proposals: Vec<ProposedColor> = if scene_dark {
+            context
+                .structure_graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind.semantic() == Some("background"))
+                .map(|node| ProposedColor {
+                    region_id: node.id.clone(),
+                    color: scene.background_color,
+                    semantic: "background".to_string(),
+                    confidence: (scene.confidence * node.confidence).clamp(0.2, 0.45),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !background_proposals.is_empty() {
             messages.push(AgentMessage::ColorProposal {
                 agent_id: self.id.clone(),
@@ -374,7 +385,7 @@ impl ColoringAgent for SceneContextAgent {
                 proposed_colors: background_proposals,
                 confidence: scene.confidence,
                 reasoning: format!(
-                    "background painted from measured luma {:.2}",
+                    "dark-scene background painted from measured luma {:.2}",
                     scene.background_luma
                 ),
             });
