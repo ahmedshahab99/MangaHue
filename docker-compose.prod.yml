@@ -107,8 +107,9 @@ services:
       - "1"
       - "--retention-hours"
       - "${CLEANUP_AFTER_HOURS:-24}"
-      # The same single automatic pipeline used by the systemd production
-      # service. User style/palette modes are intentionally unavailable.
+      # The single canonical pipeline: unified mode pins the multi-agent
+      # deliberation on and all alternate modes off.
+      - "--unified"
       - "--model"
       - "${MANGAHUE_MODEL_PATH:-/app/models/ddcolor-full-fp32.onnx}"
       - "--preset"
@@ -149,64 +150,6 @@ services:
         reservations:
           cpus: "1.0"
           memory: 1024M
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-        window: 120s
-
-  # Compatibility/research image for constrained local experiments. It is
-  # not the production bot and exposes the same single-mode Telegram UX.
-  telegram-small:
-    image: ${REGISTRY:-ghcr.io}/${OWNER:-mangahue}/mangahue:${SMALL_TAG:-small}
-    pull_policy: always
-    restart: unless-stopped
-    profiles: ["telegram-small"]
-    entrypoint: ["mangahue-telegram"]
-    command:
-      - "--work-dir"
-      - "/data/telegram"
-      - "--max-pages"
-      - "${TELEGRAM_MAX_PAGES:-32}"
-      - "--max-concurrent-jobs"
-      - "1"
-      - "--model"
-      - "/app/models/manga-onnx/manga-colorize-fp16.onnx"
-      - "--preset"
-      - "/app/configs/engine.telegram-cpu.yaml"
-      - "--style"
-      - "/app/configs/styles/studio_anime.yaml"
-      - "--daily-limit"
-      - "${DAILY_PAGE_LIMIT:-0}"
-    environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Telegram bot token is required}
-      RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
-      MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
-      MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
-      CLEANUP_AFTER_HOURS: ${CLEANUP_AFTER_HOURS:-24}
-      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
-    volumes:
-      - mangahue-data:/data
-      - mangahue-models:/app/models:ro
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -f mangahue-telegram || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          cpus: "2.0"
-          memory: 1536M
-        reservations:
-          cpus: "1.0"
-          memory: 768M
       restart_policy:
         condition: on-failure
         delay: 5s

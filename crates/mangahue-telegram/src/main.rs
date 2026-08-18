@@ -204,6 +204,11 @@ struct Args {
         help = "Allow standalone photo colorization (off by default: the launch product is chapter links; references via a photo captioned 'ref' always work)"
     )]
     photos_enabled: bool,
+    #[arg(
+        long,
+        help = "Unified production mode: one canonical coloring pipeline. Pins the multi-agent deliberation on, disables ensemble/pyramid/mock alternates, and removes mode switching."
+    )]
+    unified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,7 +678,24 @@ impl BotState {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Unified production mode: one canonical coloring pipeline. All
+    // alternate paths (ensemble, pyramid, hint propagation, mock) are
+    // pinned off and the multi-agent deliberation stays the single
+    // decision stage inside the one pipeline.
+    if args.unified {
+        if args.mock {
+            anyhow::bail!("--unified and --mock are mutually exclusive");
+        }
+        if !args.ensemble_models.is_empty() {
+            anyhow::bail!("--unified and --ensemble-model are mutually exclusive");
+        }
+        args.mock = false;
+        args.ensemble_models.clear();
+        args.pyramid = false;
+        args.hint_propagate = false;
+        tracing::info!("unified production mode: one canonical coloring pipeline");
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter("mangahue=info")
         .try_init();
