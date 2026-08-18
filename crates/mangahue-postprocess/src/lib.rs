@@ -364,7 +364,24 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         );
     }
 
-    edge_aware_smooth(&mut output, input.line_mask);
+    // Adaptive sigma: cel-shading styles use lower sigma (sharper), soft styles use higher
+    let smooth_sigma = if input.style.name.to_lowercase().contains("cel")
+        || input.style.name.to_lowercase().contains("anime")
+    {
+        20.0 // Sharper — preserve hard color boundaries
+    } else if input.style.name.to_lowercase().contains("watercolor")
+        || input.style.name.to_lowercase().contains("soft")
+    {
+        45.0 // Softer — allow more blending
+    } else {
+        35.0 // Default
+    };
+
+    if let Some(tone_mask) = input.tone_mask {
+        apply_atmospheric_perspective(&mut output, tone_mask, input.config);
+    }
+
+    edge_aware_smooth(&mut output, input.line_mask, smooth_sigma);
 
     if input.config.bubble_cleanup {
         clean_speech_bubbles(
@@ -981,7 +998,9 @@ pub fn reduce_color_near_ink(
 
     let source: Vec<Rgb<u8>> = image.pixels().copied().collect();
 
-    let radius: i32 = 3;
+    // Scale bleed radius with image diagonal: 3px at 768px, ~5px at 2000px
+    let diag = ((w as f32).powi(2) + (h as f32).powi(2)).sqrt();
+    let radius: i32 = ((diag / 256.0) as i32).clamp(2, 6);
     let spatial_sigma: f64 = 1.5;
     let range_sigma: f64 = 50.0;
 
@@ -1501,12 +1520,61 @@ fn apply_lut_grading(
     }
 }
 
+// ── Atmospheric Perspective ────────────────────────────────────────────
+/// Apply atmospheric perspective: cool-shift and desaturate distant backgrounds.
+/// Uses screentone density as a depth proxy (light screentones = distant).
+fn apply_atmospheric_perspective(
+    image: &mut RgbImage,
+    tone_mask: &GrayImage,
+    config: &PostprocessSection,
+) {
+    if !config.natural_grading {
+        return;
+    }
+
+    let w = image.width() as i32;
+    let h = image.height() as i32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let tone = tone_mask.get_pixel(x as u32, y as u32)[0] as f32 / 255.0;
+            let p = image.get_pixel_mut(x as u32, y as u32);
+
+            let r = p[0] as f32;
+            let g = p[1] as f32;
+            let b = p[2] as f32;
+
+            // Light screentones (high tone value = near-white) = distant background
+            // Apply cool shift (add blue, reduce red) + desaturate
+            let depth = (1.0 - tone).clamp(0.0, 1.0); // 0=foreground, 1=distant
+
+            if depth > 0.3 {
+                let strength = ((depth - 0.3) / 0.7).clamp(0.0, 1.0) * 0.15;
+
+                // Cool shift: reduce red, boost blue
+                let nr = (r * (1.0 - strength)).clamp(0.0, 255.0);
+                let nb = (b * (1.0 + strength * 0.8)).clamp(0.0, 255.0);
+
+                // Desaturate
+                let luma = 0.299 * nr + 0.587 * g + 0.114 * nb;
+                let desat = 1.0 - strength * 0.5;
+                let fr = (luma + (nr - luma) * desat).clamp(0.0, 255.0);
+                let fg = (luma + (g - luma) * desat).clamp(0.0, 255.0);
+                let fb = (luma + (nb - luma) * desat).clamp(0.0, 255.0);
+
+                p[0] = fr.round() as u8;
+                p[1] = fg.round() as u8;
+                p[2] = fb.round() as u8;
+            }
+        }
+    }
+}
+
 // ── Edge-Aware Color Smoothness ──────────────────────────────────────────
-fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage) {
+fn edge_aware_smooth(image: &mut RgbImage, line_mask: &GrayImage, range_sigma: f32) {
     let (w, h) = image.dimensions();
     let src: Vec<Rgb<u8>> = image.pixels().copied().collect();
     let spatial_sigma = 2.5f32;
-    let range_sigma = 35.0f32;
     let radius: i32 = 3;
 
     let spatial_w: Vec<f32> = (0..=radius)

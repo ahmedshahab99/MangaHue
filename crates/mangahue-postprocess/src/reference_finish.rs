@@ -622,10 +622,13 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 }
 
 fn bell(value: f32, center: f32, radius: f32) -> f32 {
-    // Smooth quadratic falloff (no linear kink at the tent tip) for soft,
-    // banding-free shading transitions.
     let d = ((value - center) / radius.max(0.001)).abs();
-    (1.0 - d * d).clamp(0.0, 1.0)
+    // Smooth hermite interpolation at cutoff: eliminates banding artifacts
+    if d >= 1.0 {
+        0.0
+    } else {
+        (1.0 - d * d).powi(2)
+    }
 }
 
 fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
