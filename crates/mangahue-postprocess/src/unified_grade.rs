@@ -253,7 +253,7 @@ pub(crate) fn unified_grade(
             // Skin warm-up (natural grade's peach shift): YCbCr-based
             // detection works better across diverse skin tones than RGB
             // thresholds alone.
-            let is_skin = config.natural_grading && (0.40..=0.97).contains(&gray) && {
+            let is_skin = config.natural_grading && (0.25..=0.97).contains(&gray) && {
                 let y = 0.299 * pr + 0.587 * pg + 0.114 * pb;
                 let cb = 128.0 - 0.168736 * pr - 0.331264 * pg + 0.5 * pb;
                 let cr = 128.0 + 0.5 * pr - 0.418688 * pg - 0.081312 * pb;

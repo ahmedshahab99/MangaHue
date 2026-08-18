@@ -1615,7 +1615,10 @@ pub fn preserve_screentones(
         // legitimate chroma from dense coloured regions survives at
         // reduced intensity.  The 0.45 factor keeps the dampening gentle
         // (at max tone_strength 0.72 the chroma is reduced by ~32 %).
-        let chroma_scale = 1.0 - tone_strength.clamp(0.0, 0.72) * 0.45;
+        // Dense screentone (dark) → more chroma suppression (model color is noise)
+        // Light screentone → less suppression (might have legitimate color hint)
+        let density = 1.0 - (original_luma / 255.0); // 0=white paper, 1=solid ink
+        let chroma_scale = 1.0 - (tone_strength * density).clamp(0.0, 0.72) * 0.55;
         for channel in 0..3 {
             pixel[channel] = (target_luma + chroma[channel] * gamut_scale * chroma_scale)
                 .round()

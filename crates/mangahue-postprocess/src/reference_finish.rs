@@ -6,6 +6,8 @@ use mangahue_core::StyleProfile;
 // the guaranteed face paint so faces match body skin even when the model
 // outputs near-white.
 const SKIN_LINEAR: [f32; 3] = [0.8715, 0.5774, 0.4125];
+// Fallback shadow tone (unused at runtime — derived from sampled skin_base).
+#[allow(dead_code)]
 const SKIN_SHA_LINEAR: [f32; 3] = [0.5519, 0.2789, 0.1747];
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -79,6 +81,48 @@ pub(crate) fn finish_reference_style(
             })
         })
         .flatten();
+
+    // Style-adaptive skin tones: sample the image's own skin pixels
+    // to derive a style-appropriate base rather than using the fixed
+    // peach constant for every character and every style.
+    let skin_base = if let Some(face_mask) = &face_mask {
+        if face_mask.dimensions() == (width, height) {
+            let mut sum = [0.0f32; 3];
+            let mut count = 0u32;
+            for y in 0..height {
+                for x in 0..width {
+                    if face_mask.get_pixel(x, y)[0] > 128 {
+                        let p = source.get_pixel(x, y);
+                        let luma = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
+                        if luma < 240.0 && luma > 40.0 {
+                            sum[0] += p[0] as f32;
+                            sum[1] += p[1] as f32;
+                            sum[2] += p[2] as f32;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count > 100 {
+                [
+                    sum[0] / count as f32 / 255.0,
+                    sum[1] / count as f32 / 255.0,
+                    sum[2] / count as f32 / 255.0,
+                ]
+            } else {
+                SKIN_LINEAR
+            }
+        } else {
+            SKIN_LINEAR
+        }
+    } else {
+        SKIN_LINEAR
+    };
+    let skin_shadow = [
+        skin_base[0] * 0.65,
+        skin_base[1] * 0.55,
+        skin_base[2] * 0.50,
+    ];
 
     for y in 0..height {
         for x in 0..width {
@@ -202,10 +246,10 @@ pub(crate) fn finish_reference_style(
             let cool_material = centered[2] > centered[0] + 0.008;
             let shadow_tint = shadow_support * style.shadow_strength * 0.008;
             // Skin subsurface scattering: shadows on skin go deep-warm amber,
-            // the lit edge gets a warm bounce. Extended to DEEP shadows
-            // (original > 0.22) so the darkest skin still warms.
+            // the lit edge gets a warm bounce. Extended to deep shadows
+            // (original > 0.10) so dark skin is not excluded.
             let skin_like = warm_material
-                && original > 0.22
+                && original > 0.10
                 && original < 0.80
                 && chroma < 0.28
                 && centered[0] < 0.16;
@@ -255,9 +299,9 @@ pub(crate) fn finish_reference_style(
                         let depth = (1.0 - target_luma).clamp(0.0, 0.9);
                         let w = (depth / 0.35).clamp(0.0, 1.0);
                         let base = [
-                            SKIN_LINEAR[0] * (1.0 - w) + SKIN_SHA_LINEAR[0] * w,
-                            SKIN_LINEAR[1] * (1.0 - w) + SKIN_SHA_LINEAR[1] * w,
-                            SKIN_LINEAR[2] * (1.0 - w) + SKIN_SHA_LINEAR[2] * w,
+                            skin_base[0] * (1.0 - w) + skin_shadow[0] * w,
+                            skin_base[1] * (1.0 - w) + skin_shadow[1] * w,
+                            skin_base[2] * (1.0 - w) + skin_shadow[2] * w,
                         ];
                         let base_luma = 0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2];
                         // The peach injection yields to real model skin chroma:

@@ -72,7 +72,7 @@ pub(crate) fn natural_grade(
             let (pr, pg, pb) = (pixel[0] as f32, pixel[1] as f32, pixel[2] as f32);
             // YCbCr skin detection works better across diverse skin tones
             // than RGB thresholds alone.
-            let is_skin = (0.40..=0.97).contains(&gray) && {
+            let is_skin = (0.25..=0.97).contains(&gray) && {
                 let y = 0.299 * pr + 0.587 * pg + 0.114 * pb;
                 let cb = 128.0 - 0.168736 * pr - 0.331264 * pg + 0.5 * pb;
                 let cr = 128.0 + 0.5 * pr - 0.418688 * pg - 0.081312 * pb;
