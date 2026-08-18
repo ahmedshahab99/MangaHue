@@ -694,11 +694,13 @@ fn main() -> Result<()> {
         args.ensemble_models.clear();
         args.pyramid = false;
         args.hint_propagate = false;
-        tracing::info!("unified production mode: one canonical coloring pipeline");
     }
     let _ = tracing_subscriber::fmt()
         .with_env_filter("mangahue=info")
         .try_init();
+    if args.unified {
+        tracing::info!("unified production mode: one canonical coloring pipeline");
+    }
     // Pre-load the ONNX Runtime shared library before anything else: ort
     // 2.0.0-rc.12 deadlocks on its load-dynamic failure path (pykeio/ort
     // #560/#604), which triggers in long-lived processes with many shared
