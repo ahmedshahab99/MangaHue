@@ -238,6 +238,61 @@ pub struct PostprocessSection {
     /// False restores the legacy cascade exactly as it was.
     #[serde(default = "default_unified_grade")]
     pub unified_grade: bool,
+    /// Soft cel shading: quantize the model's continuous tone into discrete
+    /// brightness bands while preserving the model's local hue. The result
+    /// is painterly flat regions with smooth band transitions instead of
+    /// photo-style smooth gradients. Off by default for photo-natural look.
+    #[serde(default)]
+    pub cel_shading_enabled: bool,
+    /// Number of luminance bands the cel pass reduces to (2 = shadow/mid,
+    /// 3 = shadow/mid/high). Three is the classic soft cel look.
+    #[serde(default = "default_cel_levels")]
+    pub cel_levels: u8,
+    /// Multiplier applied to the localized base color in the shadow band.
+    /// Lower = deeper shadow. Typical 0.50-0.65.
+    #[serde(default = "default_cel_shadow_factor")]
+    pub cel_shadow_factor: f32,
+    /// Multiplier applied to the localized base color in the highlight band.
+    /// Higher = brighter highlight. Typical 1.10-1.25.
+    #[serde(default = "default_cel_highlight_factor")]
+    pub cel_highlight_factor: f32,
+    /// Strength of the cel pass (0 = off, 1 = full band replacement).
+    /// 0.55-0.75 keeps model color drift and soft blending; 0.95+ gives
+    /// crisp bands.
+    #[serde(default = "default_cel_strength")]
+    pub cel_strength: f32,
+    /// Smoothstep width around the band edges so transitions stay painterly
+    /// instead of hard. Typical 0.10-0.25.
+    #[serde(default = "default_cel_smoothing")]
+    pub cel_smoothing: f32,
+    /// Local-mean window radius (pixels) used to compute the "region base
+    /// color" before band quantization. Higher = broader smooth cel.
+    #[serde(default = "default_cel_window_radius")]
+    pub cel_window_radius: u8,
+}
+
+fn default_cel_levels() -> u8 {
+    3
+}
+
+fn default_cel_shadow_factor() -> f32 {
+    0.58
+}
+
+fn default_cel_highlight_factor() -> f32 {
+    1.18
+}
+
+fn default_cel_strength() -> f32 {
+    0.7
+}
+
+fn default_cel_smoothing() -> f32 {
+    0.18
+}
+
+fn default_cel_window_radius() -> u8 {
+    4
 }
 
 fn default_muted_dark_sat() -> f32 {
@@ -605,6 +660,13 @@ impl Default for EngineConfig {
                 despeckle_color_specks: default_despeckle_color_specks(),
                 descreen_halftone: default_descreen_halftone(),
                 unified_grade: default_unified_grade(),
+                cel_shading_enabled: false,
+                cel_levels: default_cel_levels(),
+                cel_shadow_factor: default_cel_shadow_factor(),
+                cel_highlight_factor: default_cel_highlight_factor(),
+                cel_strength: default_cel_strength(),
+                cel_smoothing: default_cel_smoothing(),
+                cel_window_radius: default_cel_window_radius(),
             },
             output: OutputSection {
                 format: "png".to_string(),

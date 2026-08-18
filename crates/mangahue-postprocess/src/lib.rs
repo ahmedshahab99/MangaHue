@@ -1,3 +1,4 @@
+mod cel_shading;
 mod natural_grade;
 mod reference_finish;
 mod region_renderer;
@@ -73,6 +74,9 @@ pub struct PostprocessReport {
     /// hints reaching the DDColor output).
     #[serde(default)]
     pub hint_guided_pixels: u64,
+    /// Pixels whose brightness was quantized into a cel band.
+    #[serde(default)]
+    pub cel_pixels_shaded: u64,
     pub sharpen_radius: f32,
     pub sharpen_amount: f32,
     /// Purity metrics (model-first audit): how much of the model's own
@@ -128,6 +132,7 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
         face_pixels_painted: 0,
         semantic_chroma_restored: 0,
         hint_guided_pixels: 0,
+        cel_pixels_shaded: 0,
         sharpen_radius: 1.0,
         sharpen_amount: input.config.final_sharpening,
         model_pixels_overridden: 0,
@@ -398,6 +403,30 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.line_mask,
             input.config.line_strength * input.style.line_strength,
         );
+    }
+
+    // Soft cel shading: quantize the model's continuous tone into discrete
+    // brightness bands while preserving the model's local hue. Runs after
+    // the unified grade so the measured gain/warmth is applied first, then
+    // the cel pass collapses the painterly continuous tone into bands.
+    // Ink, bubbles, and protected regions are never touched so line art
+    // and text stay clean.
+    if input.config.cel_shading_enabled {
+        let cel = cel_shading::apply_cel_shading(
+            &mut output,
+            input.line_mask,
+            input.bubble_mask,
+            input.protected_mask,
+            0.70,
+            1.15,
+            input.config.cel_shadow_factor,
+            input.config.cel_highlight_factor,
+            input.config.cel_smoothing,
+            input.config.cel_strength,
+            input.config.cel_window_radius,
+        );
+        report.cel_pixels_shaded = cel.pixels_shaded;
+        report.grade_stage = "unified+cel".to_string();
     }
 
     if input.config.final_sharpening > 0.0 {
@@ -2894,6 +2923,13 @@ mod tests {
             governor_target_warmth: 45.0,
             hint_chroma_strength: 0.0,
             unified_grade: true,
+            cel_shading_enabled: false,
+            cel_levels: 3,
+            cel_shadow_factor: 0.58,
+            cel_highlight_factor: 1.18,
+            cel_strength: 0.7,
+            cel_smoothing: 0.18,
+            cel_window_radius: 4,
         };
 
         let (output, report) = finalize(PostprocessInput {

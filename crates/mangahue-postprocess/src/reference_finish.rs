@@ -707,6 +707,13 @@ mod tests {
             despeckle_color_specks: true,
             descreen_halftone: true,
             unified_grade: true,
+            cel_shading_enabled: false,
+            cel_levels: 3,
+            cel_shadow_factor: 0.58,
+            cel_highlight_factor: 1.18,
+            cel_strength: 0.7,
+            cel_smoothing: 0.18,
+            cel_window_radius: 4,
         }
     }
 
