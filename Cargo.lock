@@ -1437,6 +1437,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
+name = "mangahue-agents"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "image",
+ "mangahue-brain",
+ "mangahue-config",
+ "mangahue-core",
+ "mangahue-hints",
+ "mangahue-intelligence",
+ "mangahue-memory",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "mangahue-api"
 version = "0.1.0"
 dependencies = [
@@ -1727,6 +1748,7 @@ dependencies = [
  "anyhow",
  "base64",
  "image",
+ "mangahue-agents",
  "mangahue-cache",
  "mangahue-config",
  "mangahue-core",

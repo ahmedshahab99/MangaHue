@@ -372,6 +372,8 @@ pub struct ProcessingReport {
     pub preprocessing_ms: u128,
     pub layout_ms: u128,
     pub hint_ms: u128,
+    #[serde(default)]
+    pub agent_ms: u128,
     pub inference_ms: u128,
     pub postprocess_ms: u128,
     pub total_ms: u128,

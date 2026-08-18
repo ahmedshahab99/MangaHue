@@ -699,6 +699,74 @@ impl MangaHueEngine {
             }
         }
 
+        // Multi-Agent Deliberation: agents analyze the page and produce a ColorPlan
+        // that enriches hints before inference. This adds deliberation without
+        // changing the model's input contract.
+        let agent_start = Instant::now();
+        let agent_config = mangahue_agents::AgentSystemConfig::default();
+        if agent_config.enabled {
+            let agent_system = mangahue_agents::AgentSystem::new(agent_config);
+            let page_context = mangahue_agents::PageContext {
+                page_id: request
+                    .page_id
+                    .clone()
+                    .unwrap_or_else(|| manga_image.info.id.clone()),
+                input_path: request.input_path.clone(),
+                width: size.width,
+                height: size.height,
+                structure_graph: structure_graph
+                    .clone()
+                    .unwrap_or_else(|| {
+                        // Build a minimal structure graph if none exists
+                        mangahue_intelligence::StructureGraph {
+                            schema_version: 1,
+                            series_id: request.series_id.clone(),
+                            chapter_id: request.chapter_id.clone(),
+                            page_id: request
+                                .page_id
+                                .clone()
+                                .unwrap_or_else(|| manga_image.info.id.clone()),
+                            input_path: request.input_path.clone(),
+                            size,
+                            lighting: scene.lighting.label().to_string(),
+                            nodes: Vec::new(),
+                            edges: Vec::new(),
+                        }
+                    }),
+                color_bible: color_bible.clone(),
+                previous_page_colors: Vec::new(),
+            };
+
+            match tokio::runtime::Handle::current().block_on(agent_system.deliberate(page_context)) {
+                Ok(color_plan) => {
+                    // Apply the ColorPlan to hints
+                    color_plan.apply_to_hints(&mut hints.hint_map, &mut hints.hint_mask);
+                    report.warn(format!(
+                        "agent deliberation: {} adjustments, mood={}, time_of_day={}, confidence={:.2}",
+                        color_plan.hint_adjustments.len(),
+                        color_plan.mood,
+                        color_plan.time_of_day,
+                        color_plan.confidence
+                    ));
+                    report.add_stage_report(
+                        StageReport::new("agent_deliberation")
+                            .metric(
+                                "adjustments",
+                                color_plan.hint_adjustments.len() as f64,
+                            )
+                            .metric("confidence", color_plan.confidence as f64)
+                            .note(format!("mood={}", color_plan.mood))
+                            .note(format!("time_of_day={}", color_plan.time_of_day)),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "agent deliberation failed, continuing without");
+                    report.warn(format!("agent deliberation failed: {err:#}"));
+                }
+            }
+        }
+        report.agent_ms = agent_start.elapsed().as_millis();
+
         let inference_start = Instant::now();
         let parallel_jobs = resolve_parallel_jobs(config.engine.parallel_jobs);
         let use_ensemble = request.enable_ensemble && !request.ensemble_model_paths.is_empty();
