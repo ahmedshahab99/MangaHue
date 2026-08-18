@@ -1978,18 +1978,11 @@ pub fn remove_halftone_dots(image: &mut RgbImage) -> u64 {
         if luma <= MIN_LUMA {
             continue;
         }
-        let delta = mx - mn;
-        let hue = if r == mx {
-            60.0 * (((g - b) / delta) % 6.0)
-        } else if g == mx {
-            60.0 * ((b - r) / delta + 2.0)
-        } else {
-            60.0 * ((r - g) / delta + 4.0)
-        };
-        let hue = hue.rem_euclid(360.0);
-        if !(60.0..=250.0).contains(&hue) {
-            strong[i] = true;
-        }
+        // No hue filter: a speck is a small isolated region of unexpected
+        // color regardless of hue. The spatial checks (component size,
+        // isolation from neighbors) already do the real work; a hue gate
+        // here would only miss blue/green/cyan specks.
+        strong[i] = true;
     }
 
     // Label strong-color components (8-connectivity, BFS).

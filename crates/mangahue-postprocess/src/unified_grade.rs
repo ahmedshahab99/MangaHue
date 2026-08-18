@@ -35,6 +35,24 @@ use serde::{Deserialize, Serialize};
 
 use super::natural_grade::{hsv_to_rgb, rgb_to_hsv, smoothstep, PEACH_HUE};
 
+/// Compute hue in [0, 360) from RGB. Handles negative modulo correctly.
+fn compute_hue_deg(r: f32, g: f32, b: f32) -> f32 {
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let d = mx - mn;
+    if d < 0.001 {
+        return 0.0;
+    }
+    let hue = if mx == r {
+        60.0 * ((g - b) / d)
+    } else if mx == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    ((hue % 360.0) + 360.0) % 360.0
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UnifiedGradeReport {
     pub measured_saturation: f32,
@@ -283,12 +301,14 @@ pub(crate) fn unified_grade(
             v = v.clamp(0.0, 1.0);
 
             let (mut r, g, mut b) = hsv_to_rgb(h, s, v);
-            // Warm shadow tint: push shadows below 0.45 luma toward
-            // red/orange color temperature for a professional look.
-            if gray < 0.45 && config.natural_grading {
-                let shadow_warmth = ((0.45 - gray) * 0.08).clamp(0.0, 0.025);
-                r = (r + shadow_warmth * 255.0).clamp(0.0, 255.0);
-                b = (b - shadow_warmth * 200.0).clamp(0.0, 255.0);
+            // Shadow warm tint: apply proportionally so near-black doesn't get
+            // a huge relative shift. Use red shift of ~6 at the darkest, tapering to 0.
+            if gray < 0.45 && (config.natural_grading || config.muted_target_grade) {
+                let depth = ((0.45 - gray) / 0.45).clamp(0.0, 1.0); // 0 at gray=0.45, 1 at gray=0
+                let warm_r = depth * depth * 8.0; // Quadratic ramp: gentle at dark midtones, stronger at blacks
+                let warm_b = depth * depth * 5.0;
+                r = (r + warm_r).clamp(0.0, 255.0);
+                b = (b - warm_b).clamp(0.0, 255.0);
             }
             image.put_pixel(
                 x,
@@ -455,20 +475,7 @@ pub(crate) fn unified_grade(
                 // pure purple — the cap in sub-pass A already muted it, and
                 // the warmth would undo that.
                 if warmth_shift.abs() >= 2.0 && (61.0..199.0).contains(&luma) {
-                    let mx = r.max(g).max(b);
-                    let mn = r.min(g).min(b);
-                    let hue = if mx > mn {
-                        if mx == r {
-                            60.0 * (((g - b) / (mx - mn)) % 6.0)
-                        } else if mx == g {
-                            60.0 * ((b - r) / (mx - mn) + 2.0)
-                        } else {
-                            60.0 * ((r - g) / (mx - mn) + 4.0)
-                        }
-                    } else {
-                        0.0
-                    };
-                    let hue_deg = ((hue % 360.0) + 360.0) % 360.0;
+                    let hue_deg = compute_hue_deg(r, g, b);
                     if !(280.0..360.0).contains(&hue_deg) {
                         let nr = (r + warmth_shift).clamp(0.0, 255.0);
                         let nb = (b - warmth_shift).clamp(0.0, 255.0);
@@ -485,20 +492,7 @@ pub(crate) fn unified_grade(
                 // below), re-saturating the capped mauve (measured 0.28 ->
                 // 0.51).
                 if (gain - 1.0).abs() >= 0.01 {
-                    let mx = r.max(g).max(b);
-                    let mn = r.min(g).min(b);
-                    let hue = if mx > mn {
-                        if mx == r {
-                            60.0 * (((g - b) / (mx - mn)) % 6.0)
-                        } else if mx == g {
-                            60.0 * ((b - r) / (mx - mn) + 2.0)
-                        } else {
-                            60.0 * ((r - g) / (mx - mn) + 4.0)
-                        }
-                    } else {
-                        0.0
-                    };
-                    let hue_deg = ((hue % 360.0) + 360.0) % 360.0;
+                    let hue_deg = compute_hue_deg(r, g, b);
                     if !(280.0..360.0).contains(&hue_deg) {
                         let gray8 = original_gray.get_pixel(x, y)[0] as f32;
                         let zone_atten = if gray8 < 60.0 { gray8 / 60.0 } else { 1.0 };
