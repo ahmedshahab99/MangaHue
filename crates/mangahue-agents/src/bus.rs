@@ -38,9 +38,14 @@ pub struct ProposedColor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProposalTarget {
+    /// Page-level scene signal: mood, time of day, lighting, palette bias.
+    /// The SceneContextAgent is the authority for this target; other agents
+    /// may propose neutral defaults with lower confidence.
     PagePalette {
         mood: String,
         time_of_day: String,
+        lighting: String,
+        palette_bias: String,
     },
     Region {
         region_id: String,
@@ -79,15 +84,13 @@ pub enum ConflictSeverity {
 
 pub struct AgentBus {
     messages: Vec<AgentMessage>,
-    max_rounds: u32,
     round: u32,
 }
 
 impl AgentBus {
-    pub fn new(max_rounds: u32) -> Self {
+    pub fn new(_max_rounds: u32) -> Self {
         Self {
             messages: Vec::new(),
-            max_rounds,
             round: 0,
         }
     }

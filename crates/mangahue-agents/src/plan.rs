@@ -1,23 +1,37 @@
 use mangahue_core::ColorRgb;
+use mangahue_hints::{
+    RegionCoordinateSpace, RegionLock, RegionLockFile, RegionLockMode, RegionRun, RegionSemantic,
+    RegionShape,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::bus::ProposedColor;
+use crate::conflict::Resolution;
 use crate::PageContext;
 
-/// The unified color plan produced by agent deliberation.
+/// The unified color plan produced by agent deliberation, bound to real
+/// page geometry. Every adjustment references the exact structure-graph
+/// region it belongs to so the engine can paint the right pixels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColorPlan {
-    /// Adjustments to hint maps per region.
+    /// Per-region color adjustments with exact geometry.
     pub hint_adjustments: Vec<HintAdjustment>,
-    /// Target colors for post-inference correction.
+    /// Target colors for post-inference verification.
     pub region_color_targets: Vec<RegionColorTarget>,
     /// Lighting assumptions for postprocessing.
     pub lighting_plan: LightingPlan,
-    /// Overall page mood.
-    pub mood: String,
-    /// Overall time of day.
-    pub time_of_day: String,
+    /// Scene signal agreed by deliberation (SceneContext authority).
+    pub scene: SceneSignal,
     /// Confidence in the plan.
+    pub confidence: f32,
+}
+
+/// The page-level scene signal resolved during deliberation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SceneSignal {
+    pub mood: String,
+    pub time_of_day: String,
+    pub lighting: String,
+    pub palette_bias: String,
     pub confidence: f32,
 }
 
@@ -27,6 +41,14 @@ pub struct HintAdjustment {
     pub semantic: String,
     pub color: ColorRgb,
     pub strength: f32,
+    /// Exact source-resolution run-length mask when the node carries one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mask_runs: Vec<RegionRun>,
+    /// Fallback normalized rectangle when no exact mask exists.
+    pub normalized_bounds: mangahue_memory::NormalizedRegion,
+    /// Source resolution the mask runs refer to.
+    pub source_width: u32,
+    pub source_height: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,21 +78,63 @@ impl Default for LightingPlan {
     }
 }
 
+fn semantic_to_region_semantic(semantic: &str) -> RegionSemantic {
+    match semantic {
+        "skin" => RegionSemantic::Skin,
+        "hair" => RegionSemantic::Hair,
+        "clothing" => RegionSemantic::Clothing,
+        "background" => RegionSemantic::Background,
+        "eyes" => RegionSemantic::Custom,
+        _ => RegionSemantic::Custom,
+    }
+}
+
 impl ColorPlan {
-    pub fn from_resolved(resolved: Vec<ProposedColor>, context: &PageContext) -> Self {
+    /// Bind resolved colors to the real geometry of the structure graph.
+    pub fn from_resolution(resolution: Resolution, context: &PageContext) -> Self {
         let mut hint_adjustments = Vec::new();
         let mut region_color_targets = Vec::new();
         let mut total_confidence = 0.0;
-        let mut count = 0;
+        let mut count = 0u32;
 
-        for color in &resolved {
+        for color in &resolution.colors {
+            // Locate the node this region id belongs to.
+            let node = context
+                .structure_graph
+                .nodes
+                .iter()
+                .find(|node| node.id == color.region_id);
+
+            let (mask_runs, normalized_bounds) = match node {
+                Some(node) => (node.mask_runs.clone(), node.normalized_bounds.clone()),
+                None => (
+                    Vec::new(),
+                    mangahue_memory::NormalizedRegion {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.0,
+                        height: 0.0,
+                    },
+                ),
+            };
+            // Skip proposals that do not map to any real page region.
+            if mask_runs.is_empty()
+                && (normalized_bounds.width <= 0.0 || normalized_bounds.height <= 0.0)
+            {
+                continue;
+            }
+
+            let strength = color.confidence.clamp(0.2, 0.95);
             hint_adjustments.push(HintAdjustment {
                 region_id: color.region_id.clone(),
                 semantic: color.semantic.clone(),
                 color: color.color,
-                strength: color.confidence,
+                strength,
+                mask_runs,
+                normalized_bounds,
+                source_width: context.structure_graph.size.width,
+                source_height: context.structure_graph.size.height,
             });
-
             region_color_targets.push(RegionColorTarget {
                 region_id: color.region_id.clone(),
                 semantic: color.semantic.clone(),
@@ -86,73 +150,85 @@ impl ColorPlan {
             total_confidence /= count as f32;
         }
 
-        // Extract mood and time from page_id hash for variety
-        let hash: u32 = context.page_id.bytes().fold(0u32, |acc, b| acc.wrapping_add(b as u32));
-        let mood = match hash % 5 {
-            0 => "calm".to_string(),
-            1 => "tense".to_string(),
-            2 => "action".to_string(),
-            3 => "romantic".to_string(),
-            _ => "neutral".to_string(),
-        };
-        let time_of_day = match hash % 3 {
-            0 => "morning".to_string(),
-            1 => "afternoon".to_string(),
-            _ => "night".to_string(),
+        // Lighting plan follows the scene signal.
+        let lighting_plan = match resolution.scene.time_of_day.as_str() {
+            "night" | "dusk" => LightingPlan {
+                direction: "top_right".to_string(),
+                shadow_strength: 0.85,
+                highlight_strength: 0.15,
+                ambient_strength: 0.35,
+            },
+            "indoor" => LightingPlan {
+                direction: "top".to_string(),
+                shadow_strength: 0.55,
+                highlight_strength: 0.25,
+                ambient_strength: 0.5,
+            },
+            "morning" | "afternoon" => LightingPlan {
+                direction: "top_left".to_string(),
+                shadow_strength: 0.45,
+                highlight_strength: 0.35,
+                ambient_strength: 0.55,
+            },
+            _ => LightingPlan::default(),
         };
 
         Self {
             hint_adjustments,
             region_color_targets,
-            lighting_plan: LightingPlan::default(),
-            mood,
-            time_of_day,
+            lighting_plan,
+            scene: resolution.scene,
             confidence: total_confidence,
         }
     }
 
-    /// Apply this plan to existing hint maps and region locks.
-    pub fn apply_to_hints(
-        &self,
-        hint_map: &mut image::RgbImage,
-        hint_mask: &mut image::GrayImage,
-    ) {
-        let (w, h) = hint_map.dimensions();
-        if w == 0 || h == 0 {
-            return;
-        }
-
-        for adjustment in &self.hint_adjustments {
-            // Parse region bounds from the adjustment
-            // For now, apply color to a central area based on semantic
-            let center_x = w / 2;
-            let center_y = h / 2;
-            let radius = w.min(h) / 8;
-
-            for dy in -(radius as i32)..=(radius as i32) {
-                for dx in -(radius as i32)..=(radius as i32) {
-                    let x = center_x as i32 + dx;
-                    let y = center_y as i32 + dy;
-                    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-                        let dist = ((dx * dx + dy * dy) as f32).sqrt() / radius as f32;
-                        if dist <= 1.0 {
-                            let strength = (1.0 - dist) * adjustment.strength;
-                            let pixel = hint_map.get_pixel_mut(x as u32, y as u32);
-                            pixel[0] = (pixel[0] as f32 * (1.0 - strength)
-                                + adjustment.color.r as f32 * strength) as u8;
-                            pixel[1] = (pixel[1] as f32 * (1.0 - strength)
-                                + adjustment.color.g as f32 * strength) as u8;
-                            pixel[2] = (pixel[2] as f32 * (1.0 - strength)
-                                + adjustment.color.b as f32 * strength) as u8;
-
-                            let mask_pixel = hint_mask.get_pixel_mut(x as u32, y as u32);
-                            let current = mask_pixel[0] as f32;
-                            mask_pixel[0] =
-                                (current.max(strength * 255.0)).min(255.0) as u8;
-                        }
+    /// Convert the plan into a region lock file so the engine's tested
+    /// lock rasterizer paints the exact pixels the agents agreed on.
+    /// Exact run-length masks are used where the structure graph has them;
+    /// rectangular geometry is the fallback. Feathering keeps the paint
+    /// from banding at region borders.
+    pub fn to_region_lock_file(&self) -> RegionLockFile {
+        let locks = self
+            .hint_adjustments
+            .iter()
+            .map(|adjustment| {
+                let region = if adjustment.mask_runs.is_empty() {
+                    RegionShape::Rectangle {
+                        x: adjustment.normalized_bounds.x,
+                        y: adjustment.normalized_bounds.y,
+                        width: adjustment.normalized_bounds.width,
+                        height: adjustment.normalized_bounds.height,
                     }
+                } else {
+                    RegionShape::MaskRle {
+                        source_width: adjustment.source_width,
+                        source_height: adjustment.source_height,
+                        runs: adjustment.mask_runs.clone(),
+                    }
+                };
+                RegionLock {
+                    id: format!("agent_{}", adjustment.region_id),
+                    label: Some(format!(
+                        "agent_{}",
+                        adjustment.semantic
+                    )),
+                    semantic: semantic_to_region_semantic(&adjustment.semantic),
+                    mode: RegionLockMode::Colorize,
+                    region,
+                    color: Some(adjustment.color),
+                    strength: adjustment.strength,
+                    feather_radius: 2.0,
+                    enabled: true,
                 }
-            }
+            })
+            .collect();
+        RegionLockFile {
+            version: 1,
+            page_id: None,
+            coordinate_space: RegionCoordinateSpace::Normalized,
+            source_width: None,
+            source_height: None,
+            locks,
         }
     }
 }

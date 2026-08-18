@@ -1,20 +1,9 @@
 use anyhow::Result;
-use mangahue_core::ColorRgb;
-use mangahue_intelligence::StructureNodeKind;
 
 use crate::agent::{AgentAuthority, AgentId, AgentRole, ColoringAgent, DecisionType};
-use crate::bus::{AgentMessage, ProposedColor};
+use crate::bus::{AgentMessage, ProposalTarget, ProposedColor};
 use crate::config::AgentConfig;
 use crate::PageContext;
-
-#[derive(Debug, Clone)]
-pub struct SceneAnalysis {
-    pub time_of_day: TimeOfDay,
-    pub lighting: LightingStyle,
-    pub mood: Mood,
-    pub palette_bias: PaletteBias,
-    pub confidence: f32,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeOfDay {
@@ -24,6 +13,21 @@ pub enum TimeOfDay {
     Afternoon,
     Dusk,
     Night,
+    Indoor,
+}
+
+impl TimeOfDay {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Dawn => "dawn",
+            Self::Morning => "morning",
+            Self::Noon => "noon",
+            Self::Afternoon => "afternoon",
+            Self::Dusk => "dusk",
+            Self::Night => "night",
+            Self::Indoor => "indoor",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,18 @@ pub enum LightingStyle {
     Artificial,
     Dramatic,
     Neon,
+}
+
+impl LightingStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DirectSun => "direct_sun",
+            Self::Overcast => "overcast",
+            Self::Artificial => "artificial",
+            Self::Dramatic => "dramatic",
+            Self::Neon => "neon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,19 @@ pub enum Mood {
     Neutral,
 }
 
+impl Mood {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calm => "calm",
+            Self::Tense => "tense",
+            Self::Action => "action",
+            Self::Romantic => "romantic",
+            Self::Horror => "horror",
+            Self::Neutral => "neutral",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteBias {
     Warm,
@@ -52,6 +81,34 @@ pub enum PaletteBias {
     Neutral,
     Desaturated,
     Vivid,
+}
+
+impl PaletteBias {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cool => "cool",
+            Self::Neutral => "neutral",
+            Self::Desaturated => "desaturated",
+            Self::Vivid => "vivid",
+        }
+    }
+}
+
+/// Perceptual scene analysis derived from real page luma measurements.
+#[derive(Debug, Clone)]
+pub struct SceneAnalysis {
+    pub time_of_day: TimeOfDay,
+    pub lighting: LightingStyle,
+    pub mood: Mood,
+    pub palette_bias: PaletteBias,
+    /// Measured mean background luma (0..1).
+    pub background_luma: f32,
+    /// Measured background luma variance.
+    pub background_variance: f32,
+    /// Scene-adapted background color proposal.
+    pub background_color: mangahue_core::ColorRgb,
+    pub confidence: f32,
 }
 
 pub struct SceneContextAgent {
@@ -80,93 +137,181 @@ impl SceneContextAgent {
         }
     }
 
+    /// Measure the page from the structure graph and grayscale: background
+    /// luma decides time of day and lighting, luma variance decides mood,
+    /// and the page's own brightness decides the palette bias. No hashes,
+    /// no dice rolls - every decision is grounded in page pixels.
     fn analyze_scene(&self, context: &PageContext) -> SceneAnalysis {
-        // Analyze luma distribution for time of day
-        let graph = &context.structure_graph;
-        let bg_nodes: Vec<_> = graph
+        let background_nodes: Vec<_> = context
+            .structure_graph
             .nodes
             .iter()
-            .filter(|n| n.kind.semantic() == Some("background"))
+            .filter(|node| node.kind.semantic() == Some("background"))
             .collect();
 
-        let avg_confidence: f32 = if bg_nodes.is_empty() {
-            0.5
+        let (mean_luma, variance, _coverage, confidence) = if background_nodes.is_empty() {
+            // No detected background regions: fall back to a whole-page
+            // measurement with a strict stride budget.
+            let (width, height) = context.grayscale.dimensions();
+            let total = (width as u64).saturating_mul(height as u64);
+            let step = (total / 16384).max(1);
+            let mut sum = 0.0f64;
+            let mut sum_sq = 0.0f64;
+            let mut n = 0u64;
+            for (x, y, pixel) in context.grayscale.enumerate_pixels() {
+                let index = y as u64 * width as u64 + x as u64;
+                if !index.is_multiple_of(step) {
+                    continue;
+                }
+                let luma = pixel[0] as f64 / 255.0;
+                sum += luma;
+                sum_sq += luma * luma;
+                n += 1;
+            }
+            let mean = (sum / n.max(1) as f64) as f32;
+            (
+                mean,
+                ((sum_sq / n.max(1) as f64) as f32 - mean * mean).max(0.0),
+                1.0,
+                0.35,
+            )
         } else {
-            bg_nodes.iter().map(|n| n.confidence).sum::<f32>() / bg_nodes.len() as f32
+            let mut weighted_luma = 0.0f64;
+            let mut weighted_var = 0.0f64;
+            let mut total_weight = 0.0f64;
+            let mut total_coverage = 0.0f32;
+            for node in &background_nodes {
+                let stats = context.region_luma_stats(node);
+                if stats.samples < 4 {
+                    continue;
+                }
+                let weight = stats.coverage as f64;
+                weighted_luma += stats.mean_luma as f64 * weight;
+                weighted_var += stats.variance as f64 * weight;
+                total_weight += weight;
+                total_coverage += stats.coverage;
+            }
+            if total_weight <= f64::EPSILON {
+                (0.5, 0.01, 0.0, 0.4)
+            } else {
+                (
+                    (weighted_luma / total_weight) as f32,
+                    (weighted_var / total_weight) as f32,
+                    total_coverage.min(1.0),
+                    0.55 + 0.25 * total_coverage.min(1.0),
+                )
+            }
         };
 
-        // Simple heuristic: high background confidence with many nodes = complex scene
-        let node_count = graph.nodes.len();
-        let character_count = graph
-            .nodes
-            .iter()
-            .filter(|n| n.kind == StructureNodeKind::Character)
-            .count();
-
-        // Determine time of day from structure
-        let time_of_day = if node_count > 20 {
-            TimeOfDay::Night // Dense panels often = dramatic/night
-        } else if character_count > 2 {
-            TimeOfDay::Afternoon // Many characters = social scene
-        } else {
-            TimeOfDay::Noon // Default
+        // Time of day from measured background luminance.
+        let time_of_day = match mean_luma {
+            l if l < 0.16 => TimeOfDay::Night,
+            l if l < 0.28 => TimeOfDay::Dusk,
+            l if l < 0.42 => TimeOfDay::Indoor,
+            l if l < 0.52 => TimeOfDay::Dawn,
+            l if l < 0.66 => TimeOfDay::Morning,
+            l if l < 0.78 => TimeOfDay::Noon,
+            _ => TimeOfDay::Afternoon,
         };
 
-        // Determine mood from panel density
-        let mood = if node_count > 15 {
-            Mood::Tense
-        } else if character_count <= 1 {
-            Mood::Calm
-        } else {
-            Mood::Neutral
+        // Lighting follows the time-of-day classification; high-variance
+        // night scenes read as neon-lit.
+        let lighting = match (time_of_day, variance) {
+            (TimeOfDay::Night | TimeOfDay::Dusk, v) if v > 0.10 => LightingStyle::Neon,
+            (TimeOfDay::Night, _) => LightingStyle::Dramatic,
+            (TimeOfDay::Dusk, _) => LightingStyle::Dramatic,
+            (TimeOfDay::Indoor, _) => LightingStyle::Artificial,
+            (TimeOfDay::Morning | TimeOfDay::Afternoon, _) => LightingStyle::DirectSun,
+            (TimeOfDay::Noon, _) => LightingStyle::DirectSun,
+            _ => LightingStyle::Overcast,
         };
 
-        // Determine palette bias
+        // Mood from background contrast (variance): quiet backgrounds are
+        // calm, high-variance backgrounds are dramatic, night scenes read
+        // tense, and very quiet warm scenes read romantic.
+        let mood = match (time_of_day, variance) {
+            (TimeOfDay::Night | TimeOfDay::Dusk, v) if v > 0.06 => Mood::Horror,
+            (TimeOfDay::Night | TimeOfDay::Dusk, _) => Mood::Tense,
+            (TimeOfDay::Morning | TimeOfDay::Afternoon, v) if v < 0.02 => Mood::Romantic,
+            (_, v) if v > 0.10 => Mood::Action,
+            (_, v) if v > 0.045 => Mood::Neutral,
+            (TimeOfDay::Morning | TimeOfDay::Afternoon, _) => Mood::Calm,
+            _ => Mood::Neutral,
+        };
+
+        // Palette bias from the scene: night scenes cool down, dim indoor
+        // scenes desaturate, bright daylight stays neutral, and warm
+        // morning/afternoon light warms the palette. High-contrast night
+        // scenes may go vivid (neon).
         let palette_bias = match time_of_day {
-            TimeOfDay::Night | TimeOfDay::Dusk => PaletteBias::Cool,
-            TimeOfDay::Dawn | TimeOfDay::Morning => PaletteBias::Warm,
+            TimeOfDay::Night | TimeOfDay::Dusk => {
+                if variance > 0.10 {
+                    PaletteBias::Vivid
+                } else {
+                    PaletteBias::Cool
+                }
+            }
+            TimeOfDay::Indoor => PaletteBias::Desaturated,
+            TimeOfDay::Morning | TimeOfDay::Afternoon => PaletteBias::Warm,
             TimeOfDay::Noon => PaletteBias::Neutral,
-            TimeOfDay::Afternoon => PaletteBias::Warm,
+            _ => PaletteBias::Neutral,
         };
+
+        // Background color proposal: tint a neutral gray by the measured
+        // luminance, then shift hue by the palette bias.
+        let base = (mean_luma * 255.0).clamp(8.0, 248.0) as u8;
+        let (r, g, b) = match palette_bias {
+            PaletteBias::Warm => (base.saturating_add(10), base.saturating_add(2), base.saturating_sub(8)),
+            PaletteBias::Cool => (base.saturating_sub(8), base.saturating_add(2), base.saturating_add(12)),
+            PaletteBias::Desaturated => (base, base, base),
+            PaletteBias::Neutral => (base.saturating_add(2), base, base.saturating_sub(2)),
+            PaletteBias::Vivid => (base.saturating_add(14), base, base.saturating_add(10)),
+        };
+        let background_color = mangahue_core::ColorRgb::new(r, g, b);
 
         SceneAnalysis {
             time_of_day,
-            lighting: LightingStyle::Overcast, // Default
+            lighting,
             mood,
             palette_bias,
-            confidence: avg_confidence,
+            background_luma: mean_luma,
+            background_variance: variance,
+            background_color,
+            confidence: (confidence * self.config.authority_weight).clamp(0.0, 1.0),
         }
     }
 
-    fn adjust_colors_for_scene(
+    /// Adjust a region color for the scene lighting: night cools and
+    /// darkens, warm afternoon light shifts toward gold, indoor light
+    /// desaturates.
+    fn adapt_color_for_scene(
         &self,
-        colors: Vec<ProposedColor>,
+        color: mangahue_core::ColorRgb,
+        semantic: &str,
         scene: &SceneAnalysis,
-    ) -> Vec<ProposedColor> {
-        colors
-            .into_iter()
-            .map(|mut c| {
-                let shift = match scene.palette_bias {
-                    PaletteBias::Warm => (10, -5, -10),
-                    PaletteBias::Cool => (-10, -5, 10),
-                    PaletteBias::Desaturated => (-20, -20, -20),
-                    PaletteBias::Vivid => (15, 15, 15),
-                    PaletteBias::Neutral => (0, 0, 0),
-                };
-
-                c.color = ColorRgb::new(
-                    (c.color.r as i16 + shift.0).clamp(0, 255) as u8,
-                    (c.color.g as i16 + shift.1).clamp(0, 255) as u8,
-                    (c.color.b as i16 + shift.2).clamp(0, 255) as u8,
-                );
-                c.confidence *= scene.confidence;
-                c
-            })
-            .collect()
+    ) -> mangahue_core::ColorRgb {
+        if semantic == "background" || semantic == "effect" {
+            return color;
+        }
+        let (dr, dg, db, desat) = match scene.time_of_day {
+            TimeOfDay::Night | TimeOfDay::Dusk => (0, 0, 14, 0.10),
+            TimeOfDay::Indoor => (0, 0, 0, 0.18),
+            TimeOfDay::Morning | TimeOfDay::Afternoon => (12, 2, -8, 0.0),
+            _ => (0, 0, 0, 0.0),
+        };
+        let mut r = (color.r as i16 + dr).clamp(0, 255) as u8;
+        let mut g = (color.g as i16 + dg).clamp(0, 255) as u8;
+        let mut b = (color.b as i16 + db).clamp(0, 255) as u8;
+        if desat > 0.0 {
+            let luma = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+            r = (r as f32 + (luma - r as f32) * desat).round() as u8;
+            g = (g as f32 + (luma - g as f32) * desat).round() as u8;
+            b = (b as f32 + (luma - b as f32) * desat).round() as u8;
+        }
+        mangahue_core::ColorRgb::new(r, g, b)
     }
 }
 
-#[async_trait::async_trait]
 impl ColoringAgent for SceneContextAgent {
     fn id(&self) -> AgentId {
         self.id.clone()
@@ -180,47 +325,127 @@ impl ColoringAgent for SceneContextAgent {
         &self.authority
     }
 
-    async fn analyze(&self, context: &PageContext) -> Result<Vec<AgentMessage>> {
+    fn analyze(&self, context: &PageContext) -> Result<Vec<AgentMessage>> {
         let scene = self.analyze_scene(context);
 
-        // Get base proposals from structure
-        let base_proposals: Vec<ProposedColor> = context
+        let mut messages = vec![AgentMessage::ColorProposal {
+            agent_id: self.id.clone(),
+            target: ProposalTarget::PagePalette {
+                mood: scene.mood.label().to_string(),
+                time_of_day: scene.time_of_day.label().to_string(),
+                lighting: scene.lighting.label().to_string(),
+                palette_bias: scene.palette_bias.label().to_string(),
+            },
+            proposed_colors: Vec::new(),
+            confidence: scene.confidence,
+            reasoning: format!(
+                "measured background luma {:.2} variance {:.3}: {} {} {} {}",
+                scene.background_luma,
+                scene.background_variance,
+                scene.time_of_day.label(),
+                scene.lighting.label(),
+                scene.mood.label(),
+                scene.palette_bias.label()
+            ),
+        }];
+
+        // Scene-adapted background proposal per background node.
+        let background_proposals: Vec<ProposedColor> = context
             .structure_graph
             .nodes
             .iter()
-            .filter(|n| n.kind.semantic().is_some())
-            .map(|n| ProposedColor {
-                region_id: n.id.clone(),
-                color: mangahue_core::ColorRgb::new(128, 128, 128),
-                semantic: n.kind.semantic().unwrap_or("unknown").to_string(),
-                confidence: n.confidence,
+            .filter(|node| node.kind.semantic() == Some("background"))
+            .map(|node| ProposedColor {
+                region_id: node.id.clone(),
+                color: scene.background_color,
+                semantic: "background".to_string(),
+                confidence: (scene.confidence * node.confidence)
+                    .min(0.75)
+                    .max(0.25),
             })
             .collect();
+        if !background_proposals.is_empty() {
+            messages.push(AgentMessage::ColorProposal {
+                agent_id: self.id.clone(),
+                target: ProposalTarget::Region {
+                    region_id: "scene_backgrounds".to_string(),
+                    semantic: "background".to_string(),
+                },
+                proposed_colors: background_proposals,
+                confidence: scene.confidence,
+                reasoning: format!(
+                    "background painted from measured luma {:.2}",
+                    scene.background_luma
+                ),
+            });
+        }
 
-        let adjusted = self.adjust_colors_for_scene(base_proposals, &scene);
-
-        Ok(vec![AgentMessage::ColorProposal {
-            agent_id: self.id.clone(),
-            target: crate::bus::ProposalTarget::PagePalette {
-                mood: format!("{:?}", scene.mood).to_lowercase(),
-                time_of_day: format!("{:?}", scene.time_of_day).to_lowercase(),
-            },
-            proposed_colors: adjusted,
-            confidence: scene.confidence,
-            reasoning: format!(
-                "Scene: {:?}, Lighting: {:?}, Mood: {:?}, Bias: {:?}",
-                scene.time_of_day, scene.lighting, scene.mood, scene.palette_bias
-            ),
-        }])
+        Ok(messages)
     }
 
-    async fn deliberate(
+    fn deliberate(
         &self,
-        _context: &PageContext,
-        _proposals: &[AgentMessage],
+        context: &PageContext,
+        proposals: &[AgentMessage],
         _round: u32,
     ) -> Result<Vec<AgentMessage>> {
-        // Scene agent mostly provides initial analysis, minimal deliberation
-        Ok(Vec::new())
+        let scene = self.analyze_scene(context);
+        let mut responses = Vec::new();
+
+        for proposal in proposals {
+            if let AgentMessage::ColorProposal {
+                agent_id,
+                proposed_colors,
+                ..
+            } = proposal
+            {
+                if agent_id == &self.id {
+                    continue;
+                }
+                // Vote on skin/hair/clothing proposals: the scene decides
+                // whether the proposed brightness fits the environment,
+                // and counters with a scene-adapted color when it does not.
+                for color in proposed_colors {
+                    let luma = 0.299 * color.color.r as f32
+                        + 0.587 * color.color.g as f32
+                        + 0.114 * color.color.b as f32;
+                    let bright_ok = match scene.time_of_day {
+                        TimeOfDay::Night | TimeOfDay::Dusk => luma < 220.0,
+                        _ => luma < 250.0,
+                    };
+                    if bright_ok {
+                        responses.push(AgentMessage::Vote {
+                            agent_id: self.id.clone(),
+                            proposal_id: color.region_id.clone(),
+                            vote: crate::bus::VoteChoice::Approve,
+                            weight: self.authority.weights[&DecisionType::Lighting],
+                            counter_proposal: None,
+                        });
+                    } else {
+                        // Too bright for this scene: counter with the
+                        // scene-adapted variant instead of rejecting.
+                        let adapted = self.adapt_color_for_scene(
+                            color.color,
+                            &color.semantic,
+                            &scene,
+                        );
+                        responses.push(AgentMessage::Vote {
+                            agent_id: self.id.clone(),
+                            proposal_id: color.region_id.clone(),
+                            vote: crate::bus::VoteChoice::Counter,
+                            weight: self.authority.weights[&DecisionType::Lighting],
+                            counter_proposal: Some(crate::bus::ProposedColor {
+                                region_id: color.region_id.clone(),
+                                color: adapted,
+                                semantic: color.semantic.clone(),
+                                confidence: color.confidence * 0.9,
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(responses)
     }
 }

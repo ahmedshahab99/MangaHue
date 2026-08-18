@@ -14,6 +14,7 @@ anyhow.workspace = true
 base64.workspace = true
 image.workspace = true
 mangahue-agents = { path = "../mangahue-agents" }
+mangahue-brain = { path = "../mangahue-brain" }
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
 mangahue-eval = { path = "../mangahue-eval" }

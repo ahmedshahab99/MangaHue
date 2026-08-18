@@ -72,6 +72,10 @@ pub struct ColorizeRequest {
     /// Optional durable structure graph used by the correction editor/API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_graph_output_path: Option<PathBuf>,
+    /// Canonical chapter palette memory (locked roles) enforced by the
+    /// multi-agent deliberation before inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub palette_memory_path: Option<PathBuf>,
     /// Minimum accepted canonical-color identity score (0..1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_bible_consistency_threshold: Option<f32>,
@@ -565,8 +569,16 @@ impl MangaHueEngine {
             report.debug_files.push(path);
         }
 
+        // The multi-agent deliberation is a first-class pipeline stage: the
+        // structure graph is built whenever agents are enabled so they can
+        // reason over real page geometry.
+        let agent_config = mangahue_agents::AgentSystemConfig::default();
+
         let structure_graph =
-            if color_bible.is_some() || request.structure_graph_output_path.is_some() {
+            if color_bible.is_some()
+                || request.structure_graph_output_path.is_some()
+                || agent_config.enabled
+            {
                 let graph = build_structure_graph(
                     request.series_id.clone(),
                     request.chapter_id.clone(),
@@ -703,8 +715,17 @@ impl MangaHueEngine {
         // that enriches hints before inference. This adds deliberation without
         // changing the model's input contract.
         let agent_start = Instant::now();
-        let agent_config = mangahue_agents::AgentSystemConfig::default();
         if agent_config.enabled {
+            // Palette memory: canonical chapter colors learned from previous
+            // pages. When a book is supplied, agents enforce its locked roles.
+            let palette_memory_entries = request
+                .palette_memory_path
+                .as_deref()
+                .map(|path| mangahue_brain::load_palette_memory(path))
+                .transpose()?
+                .map(|book| book.entries)
+                .unwrap_or_default();
+
             let agent_system = mangahue_agents::AgentSystem::new(agent_config);
             let page_context = mangahue_agents::PageContext {
                 page_id: request
@@ -734,18 +755,32 @@ impl MangaHueEngine {
                         }
                     }),
                 color_bible: color_bible.clone(),
+                // The scene-adapted palette already carries the chapter
+                // accents (palette feedback) and scene re-weighting; the
+                // director reads its documented slots.
+                style_palette: scene_style.palette.clone(),
+                grayscale: preprocess.original_grayscale.clone(),
+                palette_memory: palette_memory_entries,
                 previous_page_colors: Vec::new(),
             };
 
-            match tokio::runtime::Handle::current().block_on(agent_system.deliberate(page_context)) {
+            match agent_system.deliberate(page_context) {
                 Ok(color_plan) => {
-                    // Apply the ColorPlan to hints
-                    color_plan.apply_to_hints(&mut hints.hint_map, &mut hints.hint_mask);
+                    // Bind the plan to real page geometry and paint the exact
+                    // regions through the engine's tested lock rasterizer.
+                    let agent_lock_file = color_plan.to_region_lock_file();
+                    let agent_lock_raster = rasterize_region_locks(&agent_lock_file, size)?;
+                    let lock_report = apply_region_locks_to_hints(
+                        &mut hints.hint_map,
+                        &mut hints.hint_mask,
+                        &agent_lock_raster,
+                    );
                     report.warn(format!(
-                        "agent deliberation: {} adjustments, mood={}, time_of_day={}, confidence={:.2}",
+                        "agent deliberation: {} adjustments, {} painted pixels, scene={}/{}, confidence={:.2}",
                         color_plan.hint_adjustments.len(),
-                        color_plan.mood,
-                        color_plan.time_of_day,
+                        lock_report.colorized_pixels,
+                        color_plan.scene.time_of_day,
+                        color_plan.scene.mood,
                         color_plan.confidence
                     ));
                     report.add_stage_report(
@@ -754,10 +789,17 @@ impl MangaHueEngine {
                                 "adjustments",
                                 color_plan.hint_adjustments.len() as f64,
                             )
+                            .metric("painted_pixels", lock_report.colorized_pixels as f64)
                             .metric("confidence", color_plan.confidence as f64)
-                            .note(format!("mood={}", color_plan.mood))
-                            .note(format!("time_of_day={}", color_plan.time_of_day)),
+                            .note(format!("mood={}", color_plan.scene.mood))
+                            .note(format!("time_of_day={}", color_plan.scene.time_of_day))
+                            .note(format!("lighting={}", color_plan.scene.lighting))
+                            .note(format!("palette_bias={}", color_plan.scene.palette_bias)),
                     );
+                    if let Some(debug_dir) = request.debug_dir.as_deref() {
+                        save_rgb(&debug_dir.join("agent_color_map.png"), &agent_lock_raster.color_map)?;
+                        save_gray(&debug_dir.join("agent_color_mask.png"), &agent_lock_raster.color_mask)?;
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(error = %err, "agent deliberation failed, continuing without");

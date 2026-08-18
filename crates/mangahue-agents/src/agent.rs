@@ -1,8 +1,7 @@
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::PageContext;
 use crate::bus::AgentMessage;
+use crate::PageContext;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentId(pub String);
@@ -39,8 +38,9 @@ pub enum DecisionType {
     Quality,
 }
 
-/// Trait that all coloring agents must implement.
-#[async_trait::async_trait]
+/// Trait that all coloring agents must implement. Agents are pure,
+/// deterministic, in-memory deliberators: no I/O, no async, no side
+/// effects. The same input always produces the same messages.
 pub trait ColoringAgent: Send + Sync {
     /// Unique identifier for this agent.
     fn id(&self) -> AgentId;
@@ -52,13 +52,13 @@ pub trait ColoringAgent: Send + Sync {
     fn authority(&self) -> &AgentAuthority;
 
     /// Analyze the page and produce initial proposals.
-    async fn analyze(&self, context: &PageContext) -> Result<Vec<AgentMessage>>;
+    fn analyze(&self, context: &PageContext) -> anyhow::Result<Vec<AgentMessage>>;
 
     /// Review other agents' proposals and vote/respond.
-    async fn deliberate(
+    fn deliberate(
         &self,
         context: &PageContext,
         proposals: &[AgentMessage],
         round: u32,
-    ) -> Result<Vec<AgentMessage>>;
+    ) -> anyhow::Result<Vec<AgentMessage>>;
 }

@@ -1441,7 +1441,6 @@ name = "mangahue-agents"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "image",
  "mangahue-brain",
  "mangahue-config",
@@ -1452,7 +1451,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -1749,6 +1747,7 @@ dependencies = [
  "base64",
  "image",
  "mangahue-agents",
+ "mangahue-brain",
  "mangahue-cache",
  "mangahue-config",
  "mangahue-core",
