@@ -266,9 +266,17 @@ pub struct PostprocessSection {
     #[serde(default = "default_cel_smoothing")]
     pub cel_smoothing: f32,
     /// Local-mean window radius (pixels) used to compute the "region base
-    /// color" before band quantization. Higher = broader smooth cel.
+    /// color" for hue extraction. Higher = broader smooth cel.
     #[serde(default = "default_cel_window_radius")]
     pub cel_window_radius: u8,
+    /// Normalized luma threshold (0..1) below which pixels are in the
+    /// shadow band. Typical 0.35-0.45.
+    #[serde(default = "default_cel_shadow_threshold")]
+    pub cel_shadow_threshold: f32,
+    /// Normalized luma threshold (0..1) above which pixels are in the
+    /// highlight band. Typical 0.75-0.85.
+    #[serde(default = "default_cel_highlight_threshold")]
+    pub cel_highlight_threshold: f32,
 }
 
 fn default_cel_levels() -> u8 {
@@ -293,6 +301,14 @@ fn default_cel_smoothing() -> f32 {
 
 fn default_cel_window_radius() -> u8 {
     4
+}
+
+fn default_cel_shadow_threshold() -> f32 {
+    0.40
+}
+
+fn default_cel_highlight_threshold() -> f32 {
+    0.80
 }
 
 fn default_muted_dark_sat() -> f32 {
@@ -667,6 +683,8 @@ impl Default for EngineConfig {
                 cel_strength: default_cel_strength(),
                 cel_smoothing: default_cel_smoothing(),
                 cel_window_radius: default_cel_window_radius(),
+                cel_shadow_threshold: default_cel_shadow_threshold(),
+                cel_highlight_threshold: default_cel_highlight_threshold(),
             },
             output: OutputSection {
                 format: "png".to_string(),

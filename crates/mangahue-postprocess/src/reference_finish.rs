@@ -714,6 +714,8 @@ mod tests {
             cel_strength: 0.7,
             cel_smoothing: 0.18,
             cel_window_radius: 4,
+            cel_shadow_threshold: 0.40,
+            cel_highlight_threshold: 0.80,
         }
     }
 

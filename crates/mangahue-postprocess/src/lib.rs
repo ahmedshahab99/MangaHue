@@ -417,8 +417,8 @@ pub fn finalize(input: PostprocessInput<'_>) -> Result<(RgbImage, PostprocessRep
             input.line_mask,
             input.bubble_mask,
             input.protected_mask,
-            0.70,
-            1.15,
+            input.config.cel_shadow_threshold,
+            input.config.cel_highlight_threshold,
             input.config.cel_shadow_factor,
             input.config.cel_highlight_factor,
             input.config.cel_smoothing,
@@ -2930,6 +2930,8 @@ mod tests {
             cel_strength: 0.7,
             cel_smoothing: 0.18,
             cel_window_radius: 4,
+            cel_shadow_threshold: 0.40,
+            cel_highlight_threshold: 0.80,
         };
 
         let (output, report) = finalize(PostprocessInput {

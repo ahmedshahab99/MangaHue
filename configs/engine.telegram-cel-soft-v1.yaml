@@ -80,8 +80,13 @@ postprocess:
   # Soft cel shading: 3-band quantization of the model's continuous tone
   # into shadow / mid / highlight. Strength 0.7 keeps model detail and
   # fine shading intact while the bands carry the painterly look.
+  # Thresholds are normalized luma values (0..1): pixels below
+  # cel_shadow_threshold are shadow, above cel_highlight_threshold are
+  # highlight.
   cel_shading_enabled: true
   cel_levels: 3
+  cel_shadow_threshold: 0.40
+  cel_highlight_threshold: 0.80
   cel_shadow_factor: 0.58
   cel_highlight_factor: 1.18
   cel_strength: 0.7
