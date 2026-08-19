@@ -75,7 +75,7 @@ postprocess:
   governor_min_gain: 0.9
   governor_max_gain: 1.15
   governor_target_warmth: 20.0
-  hint_chroma_strength: 0.35
+  hint_chroma_strength: 0.2
   unified_grade: true
   # Soft cel shading: 3-band quantization of the model's continuous tone
   # into shadow / mid / highlight. Strength 0.7 keeps model detail and
@@ -89,8 +89,8 @@ postprocess:
   cel_highlight_threshold: 0.80
   cel_shadow_factor: 0.58
   cel_highlight_factor: 1.18
-  cel_strength: 0.7
-  cel_smoothing: 0.18
+  cel_strength: 0.5
+  cel_smoothing: 0.22
   cel_window_radius: 4
   despeckle_color_specks: true
 

@@ -126,8 +126,9 @@ impl ColorPlan {
 
             // The model stays the artist: agent paint strength is capped so
             // the hint remains guidance, not a flat repaint. Wider feather
-            // keeps region borders soft.
-            let strength = color.confidence.clamp(0.25, 0.65);
+            // keeps region borders soft. Lower strength lets the model's
+            // creative output survive instead of forcing palette colors.
+            let strength = color.confidence.clamp(0.15, 0.45);
             hint_adjustments.push(HintAdjustment {
                 region_id: color.region_id.clone(),
                 semantic: color.semantic.clone(),
@@ -220,7 +221,7 @@ impl ColorPlan {
                     region,
                     color: Some(adjustment.color),
                     strength: adjustment.strength,
-                    feather_radius: 5.0,
+                    feather_radius: 8.0,
                     enabled: true,
                 }
             })
