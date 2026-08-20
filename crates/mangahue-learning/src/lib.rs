@@ -742,7 +742,7 @@ mod tests {
     use super::*;
 
     fn test_agent() -> LearningAgent {
-        let dir = std::env::temp_dir().join("mangahue_learning_test");
+        let dir = std::env::temp_dir().join(format!("mangahue_learning_test_{}", uuid_simple()));
         std::fs::create_dir_all(&dir).ok();
         LearningAgent::new(dir, LearningConfig::default())
     }

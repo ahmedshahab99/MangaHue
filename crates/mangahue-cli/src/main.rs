@@ -32,7 +32,6 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -156,7 +155,7 @@ enum ProductionCommand {
 struct PlatformArgs {
     #[arg(long, help = "Write platform-tuned config to this YAML path")]
     apply_to: Option<PathBuf>,
-    #[arg(long, help = "Base config to load before applying platform profile")]
+    #[arg(long, help = "Base config to load before applying platform profile", default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long, help = "Preset overlay applied on top of --config")]
     preset: Option<PathBuf>,
@@ -176,7 +175,7 @@ struct ColorizeArgs {
         help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
     )]
     ensemble_models: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
     preset: Option<PathBuf>,
@@ -238,7 +237,7 @@ struct BatchArgs {
     output: PathBuf,
     #[arg(long)]
     model: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
     preset: Option<PathBuf>,
@@ -265,7 +264,7 @@ struct InspectArgs {
     input: PathBuf,
     #[arg(long, short)]
     output: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
     preset: Option<PathBuf>,
@@ -278,7 +277,7 @@ struct PreprocessArgs {
     input: PathBuf,
     #[arg(long, short)]
     output: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
 }
 
@@ -352,7 +351,7 @@ struct LinkColorizeArgs {
         help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
     )]
     ensemble_models: Vec<PathBuf>,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
     preset: Option<PathBuf>,
@@ -444,7 +443,7 @@ struct ChapterColorizeArgs {
     retry_max_pages: usize,
     #[arg(long)]
     model: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
     preset: Option<PathBuf>,
@@ -619,8 +618,6 @@ enum ModelCommand {
         model: PathBuf,
         #[arg(long)]
         metadata: PathBuf,
-        #[arg(long)]
-        python: Option<String>,
     },
 }
 
@@ -655,7 +652,7 @@ struct ServeArgs {
     job_retention_hours: u64,
     #[arg(
         long,
-        default_value = "models/ddcolor-tiny-fp16.onnx",
+        default_value = "models/manga-colorize-fp16.onnx",
         env = "MANGAHUE_DEFAULT_MODEL"
     )]
     default_model: PathBuf,
@@ -1793,36 +1790,20 @@ fn run_model(command: ModelCommand) -> Result<()> {
                 metadata.model_name, metadata.version, metadata.model_type, metadata.input_channels
             );
         }
-        ModelCommand::ValidateOnnx {
-            model,
-            metadata,
-            python,
-        } => {
-            let python = python
-                .or_else(|| std::env::var("MANGAHUE_PYTHON").ok())
-                .unwrap_or_else(|| "python".to_string());
-            let output = Command::new(&python)
-                .arg("-m")
-                .arg("mangahue_train.validate_onnx")
-                .arg("--model")
-                .arg(&model)
-                .arg("--metadata")
-                .arg(&metadata)
-                .output()
+        ModelCommand::ValidateOnnx { model, metadata } => {
+            let backend = mangahue_inference::RustOnnxBackend::new(&model, &metadata)
                 .with_context(|| {
                     format!(
-                        "failed to start Python ONNX validator with '{}'; install ./python package or set MANGAHUE_PYTHON",
-                        python
+                        "ONNX validation failed for {}; ensure it is a valid ONNX file and the metadata path is correct",
+                        model.display()
                     )
                 })?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "ONNX validation failed:\n{}\n{}",
-                    String::from_utf8_lossy(&output.stderr),
-                    String::from_utf8_lossy(&output.stdout)
-                );
-            }
-            print!("{}", String::from_utf8_lossy(&output.stdout));
+            println!(
+                "ONNX model valid: {}\n  input:  {}\n  output: {}",
+                model.display(),
+                backend.input_name(),
+                backend.output_name()
+            );
         }
     }
     Ok(())
