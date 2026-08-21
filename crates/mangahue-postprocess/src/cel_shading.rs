@@ -91,13 +91,11 @@ pub fn apply_cel_shading(
 
             // Pixel's own brightness (normalized 0..1).
             let orig = image.get_pixel(x, y);
-            let pixel_luma = (0.299 * orig[0] as f32
-                + 0.587 * orig[1] as f32
-                + 0.114 * orig[2] as f32)
-                / 255.0;
+            let pixel_luma =
+                (0.299 * orig[0] as f32 + 0.587 * orig[1] as f32 + 0.114 * orig[2] as f32) / 255.0;
 
             // Skip near-paper and near-ink: the cel pass is meaningless there.
-            if pixel_luma < 0.06 || pixel_luma > 0.94 {
+            if !(0.06..=0.94).contains(&pixel_luma) {
                 continue;
             }
 
@@ -111,18 +109,13 @@ pub fn apply_cel_shading(
             let base_luma = (0.299 * br + 0.587 * bg + 0.114 * bb) / 255.0;
             // Skip if the local base is near-paper: the hue is meaningless
             // in a mostly-paper window.
-            if base_luma > 0.92 || base_luma < 0.04 {
+            if !(0.04..=0.92).contains(&base_luma) {
                 continue;
             }
 
             // Map pixel luma to a band (0 = shadow, 1 = mid, 2 = highlight).
             // Smoothstep edges make transitions painterly.
-            let band = luma_to_band(
-                pixel_luma,
-                shadow_threshold,
-                highlight_threshold,
-                smoothing,
-            );
+            let band = luma_to_band(pixel_luma, shadow_threshold, highlight_threshold, smoothing);
 
             // Brightness factor for this band.
             let factor = cel_factor(band, shadow_factor, highlight_factor);
@@ -189,12 +182,7 @@ fn local_mean(
 
 /// Map normalized pixel luma (0..1) to a band number (0 = shadow, 1 = mid,
 /// 2 = highlight) with smoothstep edges.
-fn luma_to_band(
-    luma: f32,
-    shadow_threshold: f32,
-    highlight_threshold: f32,
-    smoothing: f32,
-) -> f32 {
+fn luma_to_band(luma: f32, shadow_threshold: f32, highlight_threshold: f32, smoothing: f32) -> f32 {
     // Shadow to mid transition.
     let shadow_low = (shadow_threshold - smoothing).max(0.01);
     let shadow_high = shadow_threshold + smoothing;
@@ -206,8 +194,7 @@ fn luma_to_band(
     } else if luma <= highlight_threshold - smoothing {
         1.0
     } else if luma < highlight_threshold + smoothing {
-        let t = (luma - (highlight_threshold - smoothing))
-            / (2.0 * smoothing).max(0.001);
+        let t = (luma - (highlight_threshold - smoothing)) / (2.0 * smoothing).max(0.001);
         1.0 + smoothstep(0.0, 1.0, t)
     } else {
         2.0
@@ -255,17 +242,7 @@ mod tests {
         let lines = GrayImage::from_pixel(20, 20, Luma([0]));
         let bubbles = GrayImage::from_pixel(20, 20, Luma([0]));
         let report = apply_cel_shading(
-            &mut img,
-            &lines,
-            &bubbles,
-            None,
-            0.40,
-            0.80,
-            0.58,
-            1.18,
-            0.18,
-            0.7,
-            4,
+            &mut img, &lines, &bubbles, None, 0.40, 0.80, 0.58, 1.18, 0.18, 0.7, 4,
         );
         // All pixels are paper or ink; the cel pass should skip both.
         assert_eq!(report.pixels_shaded, 0);
@@ -286,17 +263,7 @@ mod tests {
         let bubbles = GrayImage::from_pixel(20, 20, Luma([0]));
         let original_red: Vec<u8> = (0..20u32).map(|x| img.get_pixel(x, 10)[0]).collect();
         let report = apply_cel_shading(
-            &mut img,
-            &lines,
-            &bubbles,
-            None,
-            0.40,
-            0.80,
-            0.58,
-            1.18,
-            0.18,
-            0.7,
-            4,
+            &mut img, &lines, &bubbles, None, 0.40, 0.80, 0.58, 1.18, 0.18, 0.7, 4,
         );
         assert!(
             report.pixels_shaded > 0,

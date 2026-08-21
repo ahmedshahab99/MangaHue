@@ -1,55 +1,113 @@
+# MangaHue production engine: one pretrained model, one inference pass.
+# Detection protects manga structure; no palette/agent stage invents color.
 engine:
   preserve_lines: true
   protect_speech_bubbles: true
   save_debug_outputs: false
   reading_direction: right_to_left
-  parallel_jobs: 0
+  parallel_jobs: 1
   pyramid_enabled: false
   hint_propagation_enabled: false
+
 preprocess:
   grayscale_mode: luma
-  denoise_enabled: true
-  denoise_strength: 1
+  denoise_enabled: false
+  denoise_strength: 0
   threshold_mode: adaptive
   line_sharpening: 0.35
   background_cleanup: true
-  max_input_dimension: 2600
+  max_input_dimension: 1024
+
 layout:
   panel_detection: true
-  tiling_enabled: true
-  tile_size: 768
-  tile_overlap: 64
+  tiling_enabled: false
+  tile_size: 1024
+  tile_overlap: 0
   webtoon_mode: auto
   reading_direction: right_to_left
+
 hints:
-  user_hints_enabled: true
-  character_memory_enabled: true
-  style_hints_enabled: true
+  user_hints_enabled: false
+  character_memory_enabled: false
+  style_hints_enabled: false
   hint_blur_radius: 4.0
-  hint_strength: 1.0
+  hint_strength: 0.0
+  region_style_hints_enabled: false
+  region_style_hint_budget: 0
+  propagation_radius: 0
+  propagation_similarity_threshold: 0.3
+  adaptive_placement_enabled: false
+
 inference:
-  model_path: models/manga-colorize-fp16.onnx
+  model_path: models/ddcolor-full-fp32.onnx
   model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
   device: cpu
   batch_size: 1
-  input_size: 768
+  input_size: 1024
   fp16_enabled: false
   resize_policy: fit
+
 postprocess:
   restore_lines: true
   line_strength: 1.0
   bubble_cleanup: true
   bleeding_correction: true
-  palette_correction: true
-  final_sharpening: 0.15
+  palette_correction: false
+  final_sharpening: 0.03
+  reference_finishing: false
+  reference_transfer: false
+  target_colorfulness: 0.0
+  midtone_depth: 0.0
+  local_contrast: 0.0
+  semantic_relighting: false
+  relighting_strength: 0.0
+  natural_grading: false
+  soft_coverage: false
+  hint_chroma_strength: 0.0
+  region_chroma_separation: 0.0
+  muted_target_grade: false
+  muted_strength: 0.0
+  muted_hue_shift_deg: 0.0
+  muted_yellow_shift_deg: 0.0
+  model_first: true
+  model_chroma_gain: 1.0
+  palette_harmony_strength: 0.0
+  face_paint_strength: 0.0
+  ambient_occlusion_strength: 0.0
+  smart_governor: true
+  governor_target_saturation: 0.18
+  governor_target_colorfulness: 36.0
+  governor_min_gain: 0.9
+  governor_max_gain: 1.15
+  governor_target_warmth: 25.0
+  unified_grade: true
+  cel_shading_enabled: false
+  despeckle_color_specks: true
+  descreen_halftone: true
+
 output:
   format: png
   quality: 95
   write_report: true
   write_intermediates: false
+
 eval:
-  line_preservation_threshold: 0.92
-  protected_region_violation_threshold: 0.96
-  hint_adherence_threshold: 0.72
+  line_preservation_threshold: 0.88
+  line_preservation_block_threshold: 0.65
+  protected_region_violation_threshold: 0.92
+  protected_region_block_threshold: 0.65
+  hint_adherence_threshold: 0.0
   screen_tone_warning_threshold: 0.18
 
+ensemble:
+  enabled: false
+  strategy: chroma_complement
+  primary_weight: 1.0
+  parallel_variants: false
+  divergence_reject_threshold: 0.5
+  cielab_distance: false
+
+pyramid:
+  enabled: false
+  levels: [512]
+  blend_weights: [1.0]

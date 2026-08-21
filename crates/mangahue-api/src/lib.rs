@@ -1614,7 +1614,7 @@ async fn create_colorize_job(
                 result: None,
             },
         );
-        let result = MangaHueEngine::new().colorize(payload.request);
+        let result = MangaHueEngine::new().colorize_for_delivery(payload.request);
         match result {
             Ok(result) => {
                 let output_path = result.output_path.clone();
@@ -3156,7 +3156,7 @@ fn run_batch_payload(payload: ApiBatchRequest) -> Result<ApiBatchSummary> {
         let mut request = payload.template.clone();
         request.input_path = input_path.to_path_buf();
         request.output_path = output_path.clone();
-        match engine.colorize(request) {
+        match engine.colorize_for_delivery(request) {
             Ok(result) => {
                 processed += 1;
                 pages.push(ApiBatchPage {
@@ -3253,7 +3253,7 @@ fn run_link_colorize_payload(
         request.input_path = page.local_path.clone();
         request.output_path = output_path.clone();
         request.cancel_token = Some(cancel_token.clone());
-        match engine.colorize(request) {
+        match engine.colorize_for_delivery(request) {
             Ok(result) => {
                 processed += 1;
                 pages.push(ApiLinkColorizePage {
@@ -3339,7 +3339,7 @@ fn default_job_retention_hours() -> u64 {
 }
 
 fn default_model_path() -> PathBuf {
-    PathBuf::from("models/ddcolor-tiny-fp16.onnx")
+    PathBuf::from("models/ddcolor-full-fp32.onnx")
 }
 
 fn default_server_config_path() -> PathBuf {
@@ -3351,9 +3351,7 @@ fn default_server_style_path() -> PathBuf {
 }
 
 fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
-    if !mangahue_inference::is_ddcolor_onnx_model(model_path) {
-        return Ok(());
-    }
+    mangahue_inference::validate_production_ddcolor_model(model_path)?;
     #[cfg(feature = "native-onnx")]
     {
         // DDColor ONNX runs natively through the Rust ort backend; the

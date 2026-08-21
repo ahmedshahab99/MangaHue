@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+#[cfg(test)]
 use mangahue_core::ProcessingReport;
 use mangahue_export::{render_export, ExportFormat, ExportProfile, WatermarkMode};
 use mangahue_ingest::{extract_manga_urls, validate_public_url, SafePublicResolver};
@@ -9,7 +10,9 @@ use mangahue_memory::{
     ColorBible, ColorBibleCorrection, ColorBibleReference, ColorSelector, CorrectionScope,
     ReferenceKind,
 };
-use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine, ProgressUpdate};
+use mangahue_orchestrator::{
+    delivery_quality_approved, ColorizeRequest, MangaHueEngine, ProgressUpdate,
+};
 use reqwest::blocking::multipart::Form;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, REFERER, USER_AGENT};
@@ -21,7 +24,6 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-mod palette_feedback;
 mod watermark;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -43,45 +45,17 @@ const TELEGRAM_MAX_ATTEMPTS: usize = 3;
 /// First retry delay in seconds; each retry doubles it (2s, 4s).
 const TELEGRAM_RETRY_BASE_SECS: u64 = 2;
 /// Retry one transient engine/backend failure before explicitly failing a
-/// page. Quality-gate rejections are repaired inside the engine and are not
-/// blindly re-run with identical inputs.
+/// page. Deterministic quality-gate rejections are withheld and reported;
+/// only transient engine failures receive one bounded retry.
 const PAGE_COLORIZE_MAX_ATTEMPTS: usize = 2;
+const PRODUCTION_MODEL_FILE: &str = mangahue_inference::PRODUCTION_DDCOLOR_FILE;
+const PRODUCTION_PRESET_FILE: &str = "engine.default.yaml";
+const PRODUCTION_STYLE_FILE: &str = "soft_cel_anime_v2.yaml";
 
 /// Telegram Bot API base URL. Defaults to api.telegram.org; the
 /// `--telegram-api-base` flag / `MANGAHUE_TELEGRAM_API` env can point at a
 /// Cloudflare Worker or regional proxy when Telegram blocks the VPS IP.
 static TELEGRAM_API_BASE: OnceLock<String> = OnceLock::new();
-
-/// Delivery requires proof of actual colorization: inference completed, the
-/// output carries real chromatic coverage, and it visibly differs from the
-/// input (excluding ink and protected text/paper). Quality verdicts such as
-/// `needs_*` record detector/quality concerns in the report and caption but
-/// never withhold a colored page; uncolored pass-through output, identity
-/// output, and failed inference are undeliverable.
-fn delivery_quality_approved(report: &ProcessingReport) -> bool {
-    let inference_completed = report.stage_reports.iter().any(|stage| {
-        stage.name == "inference"
-            && stage
-                .metrics
-                .get("tiles_completed")
-                .is_some_and(|tiles| *tiles >= 1.0)
-    });
-    let coverage_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_coverage"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
-    });
-    let transformation_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_transform"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
-    });
-    inference_completed && coverage_passed && transformation_passed
-}
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum DeliveryFormat {
@@ -123,38 +97,20 @@ struct Args {
     max_pages: usize,
     #[arg(long, default_value_t = 33_554_432)]
     max_bytes_per_page: u64,
-    #[arg(long)]
-    model: Option<PathBuf>,
+    #[arg(long, default_value = "models/ddcolor-full-fp32.onnx")]
+    model: PathBuf,
     #[arg(long, help = "Approved colored style or character reference image")]
     reference_image: Option<PathBuf>,
-    #[arg(
-        long = "ensemble-model",
-        help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
-    )]
-    ensemble_models: Vec<PathBuf>,
-    #[arg(long)]
-    config: Option<PathBuf>,
-    #[arg(long)]
-    preset: Option<PathBuf>,
-    #[arg(long)]
-    style: Option<PathBuf>,
+    #[arg(long, default_value = "configs/engine.default.yaml")]
+    preset: PathBuf,
+    #[arg(long, default_value = "configs/styles/soft_cel_anime_v2.yaml")]
+    style: PathBuf,
     #[arg(long)]
     project: Option<PathBuf>,
-    #[arg(long)]
-    mock: bool,
-    #[arg(long, help = "Enable multi-resolution pyramid inference")]
-    pyramid: bool,
-    #[arg(long, help = "Enable line-aware color-hint propagation")]
-    hint_propagate: bool,
     #[arg(long, help = "Region lock file or per-page lock directory")]
     region_locks: Option<PathBuf>,
     #[arg(long, help = "Global user hints file (per-chat memory overrides)")]
     hints: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Per-chapter palette feedback: extract the first page's dominant hues and merge them as accent colors for the rest of the chapter (creative variety, model-derived)"
-    )]
-    palette_feedback: bool,
     #[arg(long, default_value_t = 1)]
     max_concurrent_jobs: usize,
     #[arg(
@@ -204,11 +160,6 @@ struct Args {
         help = "Allow standalone photo colorization (off by default: the launch product is chapter links; references via a photo captioned 'ref' always work)"
     )]
     photos_enabled: bool,
-    #[arg(
-        long,
-        help = "Unified production mode: one canonical coloring pipeline. Pins the multi-agent deliberation on, disables ensemble/pyramid/mock alternates, and removes mode switching."
-    )]
-    unified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -677,30 +628,75 @@ impl BotState {
     }
 }
 
-fn main() -> Result<()> {
-    let mut args = Args::parse();
-    // Unified production mode: one canonical coloring pipeline. All
-    // alternate paths (ensemble, pyramid, hint propagation, mock) are
-    // pinned off and the multi-agent deliberation stays the single
-    // decision stage inside the one pipeline.
-    if args.unified {
-        if args.mock {
-            anyhow::bail!("--unified and --mock are mutually exclusive");
-        }
-        if !args.ensemble_models.is_empty() {
-            anyhow::bail!("--unified and --ensemble-model are mutually exclusive");
-        }
-        args.mock = false;
-        args.ensemble_models.clear();
-        args.pyramid = false;
-        args.hint_propagate = false;
+fn validate_production_assets(args: &Args) -> Result<()> {
+    for (path, expected, label) in [
+        (&args.model, PRODUCTION_MODEL_FILE, "model"),
+        (&args.preset, PRODUCTION_PRESET_FILE, "preset"),
+        (&args.style, PRODUCTION_STYLE_FILE, "style"),
+    ] {
+        anyhow::ensure!(
+            path.is_file(),
+            "production {label} is missing: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            path.file_name().and_then(|name| name.to_str()) == Some(expected),
+            "production {label} must be {expected}, got {}",
+            path.display()
+        );
     }
+
+    let config = mangahue_config::EngineConfig::from_path(&args.preset)?;
+    anyhow::ensure!(
+        config.engine.parallel_jobs == 1,
+        "production config must run one job"
+    );
+    anyhow::ensure!(
+        config
+            .inference
+            .model_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some(PRODUCTION_MODEL_FILE),
+        "production config selects a non-canonical model"
+    );
+    anyhow::ensure!(
+        !config.engine.pyramid_enabled,
+        "production pyramid must be disabled"
+    );
+    anyhow::ensure!(
+        !config.ensemble.enabled,
+        "production ensemble must be disabled"
+    );
+    anyhow::ensure!(
+        !config.hints.user_hints_enabled
+            && !config.hints.character_memory_enabled
+            && !config.hints.style_hints_enabled
+            && !config.hints.region_style_hints_enabled,
+        "production hint color author is enabled"
+    );
+    anyhow::ensure!(
+        !config.postprocess.palette_correction
+            && !config.postprocess.soft_coverage
+            && config.postprocess.hint_chroma_strength == 0.0
+            && config.postprocess.face_paint_strength == 0.0
+            && !config.postprocess.cel_shading_enabled,
+        "production postprocess contains a secondary color author"
+    );
+    mangahue_config::load_style_profile(&args.style)?;
+    mangahue_inference::validate_production_ddcolor_model(&args.model)
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    validate_production_assets(&args)?;
     let _ = tracing_subscriber::fmt()
         .with_env_filter("mangahue=info")
         .try_init();
-    if args.unified {
-        tracing::info!("unified production mode: one canonical coloring pipeline");
-    }
+    tracing::info!(
+        model = PRODUCTION_MODEL_FILE,
+        "single-model production pipeline locked"
+    );
     // Pre-load the ONNX Runtime shared library before anything else: ort
     // 2.0.0-rc.12 deadlocks on its load-dynamic failure path (pykeio/ort
     // #560/#604), which triggers in long-lived processes with many shared
@@ -1848,10 +1844,10 @@ fn handle_photo(
     }
 
     let settings = state.get_settings(chat_id, args.batch_size);
-    // One production colorization mode: the server-pinned style is identical
-    // for photos and chapter pages. Scene lighting, references, Color Bible
-    // constraints, and palette feedback remain automatic internal stages.
-    let style_path = args.style.clone();
+    // One production colorization mode: the server-pinned model and cleanup
+    // policy are identical for photos and chapter pages. References and the
+    // Color Bible remain metadata/correction surfaces, not color authors.
+    let style_path = Some(args.style.clone());
     let reference_image = settings
         .reference_image
         .clone()
@@ -1920,12 +1916,12 @@ fn handle_photo(
     let result = engine.colorize(ColorizeRequest {
         input_path: local_path.clone(),
         output_path: output_path.clone(),
-        model_path: args.model.clone(),
+        model_path: Some(args.model.clone()),
         reference_image_path: reference_image,
-        enable_ensemble: !args.ensemble_models.is_empty(),
-        ensemble_model_paths: args.ensemble_models.clone(),
-        config_path: args.config.clone(),
-        preset_path: args.preset.clone(),
+        enable_ensemble: false,
+        ensemble_model_paths: Vec::new(),
+        config_path: None,
+        preset_path: Some(args.preset.clone()),
         style_path: style_path.clone(),
         project_path: args.project.clone(),
         region_locks_path: None,
@@ -1936,9 +1932,9 @@ fn handle_photo(
         structure_graph_output_path: Some(image_structure_graph_path.clone()),
         color_bible_consistency_threshold: Some(0.62),
         user_hints_path: resolve_user_hints(args, chat_id, "image"),
-        use_mock_backend: args.mock,
-        pyramid_enabled: args.pyramid,
-        hint_propagation_enabled: args.hint_propagate,
+        use_mock_backend: false,
+        pyramid_enabled: false,
+        hint_propagation_enabled: false,
         palette_path: None,
         auto_palette: false,
         cache_dir: args.cache_dir.clone(),
@@ -2683,7 +2679,7 @@ fn handle_link(
         )?,
     };
 
-    let style_path = args.style.clone();
+    let style_path = Some(args.style.clone());
 
     // Job diagnostics: URL, extracted page count and chosen style are logged
     // so "the output was rubbish" cases can be traced to extraction or
@@ -2800,11 +2796,6 @@ fn handle_link(
         }
     }
     let counters = std::rc::Rc::new(std::cell::RefCell::new(PageCounters::default()));
-    // Per-chapter palette feedback: the first successful page seeds the
-    // accent palette the rest of the chapter grades toward (model-derived
-    // variety; paper/skin/hair slots in the style stay untouched).
-    let chapter_palette: std::rc::Rc<std::cell::RefCell<Option<Vec<mangahue_core::ColorRgb>>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
     // Downloads that failed transiently (CDN hiccups) are retried once
     // after the main pass instead of being silently dropped.
     let mut retry_queue: Vec<(usize, String, PathBuf)> = Vec::new();
@@ -2872,12 +2863,12 @@ fn handle_link(
             let attempt_result = engine.colorize(ColorizeRequest {
                 input_path: local_path.clone(),
                 output_path: output_path.clone(),
-                model_path: args.model.clone(),
+                model_path: Some(args.model.clone()),
                 reference_image_path: reference_image.clone(),
-                enable_ensemble: !args.ensemble_models.is_empty(),
-                ensemble_model_paths: args.ensemble_models.clone(),
-                config_path: args.config.clone(),
-                preset_path: args.preset.clone(),
+                enable_ensemble: false,
+                ensemble_model_paths: Vec::new(),
+                config_path: None,
+                preset_path: Some(args.preset.clone()),
                 style_path: style_path.clone(),
                 project_path: args.project.clone(),
                 region_locks_path: resolve_region_locks(args.region_locks.as_deref(), stem),
@@ -2888,12 +2879,12 @@ fn handle_link(
                 structure_graph_output_path: Some(structure_graph_path.clone()),
                 color_bible_consistency_threshold: Some(0.62),
                 user_hints_path: resolve_user_hints(args, chat_id, stem),
-                use_mock_backend: args.mock,
-                pyramid_enabled: args.pyramid,
-                hint_propagation_enabled: args.hint_propagate,
+                use_mock_backend: false,
+                pyramid_enabled: false,
+                hint_propagation_enabled: false,
                 palette_path: None,
                 auto_palette: false,
-                palette_override: chapter_palette.borrow().clone(),
+                palette_override: None,
                 cache_dir: args.cache_dir.clone(),
                 cancel_token: Some(Arc::clone(&cancel_token)),
                 progress_sender: Some(progress_sender.clone()),
@@ -2939,21 +2930,6 @@ fn handle_link(
                     let _ = std::fs::remove_file(&output_path);
                     let _ = std::fs::remove_file(local_path);
                     return Ok(args.fail_fast);
-                }
-                // Chapter palette feedback: seed the accents from the first
-                // colored page so later pages of this chapter share its
-                // color universe (deterministic per job, model-derived).
-                if args.palette_feedback && chapter_palette.borrow().is_none() {
-                    if let Ok(image) = image::open(&output_path) {
-                        let accents = palette_feedback::extract_accent_palette(&image.to_rgb8());
-                        if !accents.is_empty() {
-                            tracing::info!(
-                                accents = accents.len(),
-                                "chapter palette feedback: seeded accents from first page"
-                            );
-                            *chapter_palette.borrow_mut() = Some(accents);
-                        }
-                    }
                 }
                 if cancel_token.load(Ordering::Acquire) {
                     let _ = edit_message_with_markup(
@@ -4513,8 +4489,7 @@ mod tests {
             }
             report
         };
-        // Every page that was actually colored delivers, regardless of the
-        // quality verdict; the verdict is informational, not a gate.
+        // Actual color plus a production-ready verdict is required.
         assert!(delivery_quality_approved(&report(
             Some("production_ready_preview"),
             true,
@@ -4527,7 +4502,7 @@ mod tests {
             true,
             true
         )));
-        assert!(delivery_quality_approved(&report(
+        assert!(!delivery_quality_approved(&report(
             Some("needs_protected_region_cleanup"),
             true,
             true,
@@ -4560,8 +4535,7 @@ mod tests {
             false,
             false
         )));
-        // A missing verdict does not withhold a page that was colored.
-        assert!(delivery_quality_approved(&report(None, true, true, true)));
+        assert!(!delivery_quality_approved(&report(None, true, true, true)));
     }
 
     #[test]

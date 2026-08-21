@@ -8,12 +8,14 @@ use mangahue_brain::{
     SafetyGateThresholds,
 };
 use mangahue_config::load_style_profile;
-use mangahue_core::{ProcessingReport, StyleProfile};
+#[cfg(test)]
+use mangahue_core::ProcessingReport;
+use mangahue_core::StyleProfile;
 use mangahue_image::{
     export_chapter_archive, import_chapter_to_dir, write_chapter_manifest, ChapterImportOptions,
     ChapterManifest,
 };
-use mangahue_orchestrator::{ColorizeRequest, MangaHueEngine};
+use mangahue_orchestrator::{delivery_quality_approved, ColorizeRequest, MangaHueEngine};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -688,37 +690,6 @@ fn configure_color_bible_page(
     );
 }
 
-/// Delivery requires proof of actual colorization: inference completed, the
-/// output carries real chromatic coverage, and it visibly differs from the
-/// input (excluding ink and protected text/paper). Quality verdicts such as
-/// `needs_*` record detector/quality concerns in the manifest but never
-/// withhold a colored page; uncolored pass-through output, identity output,
-/// and failed inference are undeliverable.
-fn delivery_quality_approved(report: &ProcessingReport) -> bool {
-    let inference_completed = report.stage_reports.iter().any(|stage| {
-        stage.name == "inference"
-            && stage
-                .metrics
-                .get("tiles_completed")
-                .is_some_and(|tiles| *tiles >= 1.0)
-    });
-    let coverage_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_coverage"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
-    });
-    let transformation_passed = report.stage_reports.iter().any(|stage| {
-        stage.name == "colorization_transform"
-            && stage
-                .metrics
-                .get("passed")
-                .is_some_and(|passed| *passed >= 1.0)
-    });
-    inference_completed && coverage_passed && transformation_passed
-}
-
 fn resolve_region_locks_path(root: Option<&Path>, page_path: &Path) -> Option<PathBuf> {
     let root = root?;
     if root.is_file() {
@@ -963,10 +934,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     #[test]
-    fn delivery_approves_colored_pages_regardless_of_quality_verdict() {
-        // The engine ran, real color is present, and the output changed:
-        // deliver. A quality verdict such as needs_* (or none at all) is
-        // informational and must not withhold a colored page.
+    fn delivery_requires_ready_verdict_and_completed_inference() {
         let mut report = ProcessingReport {
             director_verdict: Some("needs_protected_region_cleanup".to_string()),
             ..ProcessingReport::default()
@@ -983,6 +951,8 @@ mod tests {
         report.add_stage_report(
             mangahue_core::StageReport::new("colorization_transform").metric("passed", 1.0),
         );
+        assert!(!delivery_quality_approved(&report));
+        report.director_verdict = Some("production_ready_preview".to_string());
         assert!(delivery_quality_approved(&report));
 
         // A page without real color (coverage failed) must not ship as a

@@ -2,7 +2,7 @@
 
 See [Color Bible Engine](docs/COLOR_BIBLE_ENGINE.md) for the chapter-aware consistency, protected-compositing, correction-propagation, and release-gate workflow.
 
-MangaHue Engine is a pure-Rust manga colorization engine. It does not treat colorization as a single "upload image, run model" step. The engine cleans line art, protects ink and speech bubbles, builds hint tensors, tiles large pages, runs the model, restores manga structure, and writes reports that can improve later passes.
+MangaHue Engine is a Rust manga colorization service. The pretrained model creates color; deterministic Rust stages resize the page, restore ink, protect text and whites, remove artifacts, and block damaged or unchanged results.
 
 The default build runs inference **natively in Rust** through the bundled ONNX Runtime — no Python subprocess and no `ORT_DYLIB_PATH` setup required (the runtime in `models/onnxruntime/` is auto-discovered). Colorization is real, not faked.
 
@@ -12,7 +12,7 @@ This repository currently contains the first production-shaped slice:
 - Strong domain types, config loading, image I/O, preprocessing, layout, hints, memory, inference interfaces, brain reports, postprocessing, evaluation, orchestrator, CLI, and API skeletons.
 - Director-grade inspection reports: page classification, ink density, tone score, component analysis, protected-region coverage, hint adherence, and a final verdict.
 - Debug overlays that show ink, bubbles, text, tones, and hints in one visual.
-- A Python/PyTorch package used only for *training* and *ONNX export*; the engine itself runs the exported models in pure Rust.
+- Optional Python research utilities that are not installed or invoked by production.
 - An explicit mock backend for tests and demos. Real CLI colorization does not silently fake an ONNX model.
 
 ## Quick Start
@@ -24,7 +24,7 @@ cargo run -p mangahue-cli -- colorize .\examples\input\page.png --output .\examp
 cargo run -p mangahue-cli -- inspect .\examples\input\page.png --output .\examples\output\inspection.json --debug .\examples\output\inspect_debug
 ```
 
-Use `--mock` only for pipeline verification. The default model is the bundled `models/manga-colorize-fp16.onnx` (a manga-specific hint U-Net), resolved automatically with the bundled ONNX Runtime — just run without `--mock`. To use a different model, pass `--model path/to/model.onnx` (a `.onnx` file whose name contains `ddcolor` or `style2paints`, or any model with a `mangahue.colorizer.v1` contract). The Python package in `python/` is only needed to *train/export* new models, not to run them.
+Production uses exactly one pretrained artifact: `models/ddcolor-full-fp32.onnx` (DDColor Full, Apache-2.0), executed natively through ONNX Runtime. Its SHA-256 is pinned in code and in `configs/model-checksums/`; the bot refuses to start with a renamed or different model. Python is not in the production inference path.
 
 ## CLI
 
@@ -53,7 +53,7 @@ mangahue character create --project projects/my_manga --name Hero --hair "#11111
 
 ## Philosophy
 
-The model creates color candidates. The Rust engine decides how manga pages are prepared, protected, guided, corrected, and remembered.
+The pretrained model creates the color. Rust prepares and protects the page, removes artifacts, verifies the result, and delivers it only when the release gates pass.
 
 ## CPU Reference-Grade Roadmap
 

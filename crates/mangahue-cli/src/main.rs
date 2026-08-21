@@ -155,7 +155,11 @@ enum ProductionCommand {
 struct PlatformArgs {
     #[arg(long, help = "Write platform-tuned config to this YAML path")]
     apply_to: Option<PathBuf>,
-    #[arg(long, help = "Base config to load before applying platform profile", default_value = "configs/engine.default.yaml")]
+    #[arg(
+        long,
+        help = "Base config to load before applying platform profile",
+        default_value = "configs/engine.default.yaml"
+    )]
     config: Option<PathBuf>,
     #[arg(long, help = "Preset overlay applied on top of --config")]
     preset: Option<PathBuf>,
@@ -652,7 +656,7 @@ struct ServeArgs {
     job_retention_hours: u64,
     #[arg(
         long,
-        default_value = "models/manga-colorize-fp16.onnx",
+        default_value = "models/ddcolor-full-fp32.onnx",
         env = "MANGAHUE_DEFAULT_MODEL"
     )]
     default_model: PathBuf,

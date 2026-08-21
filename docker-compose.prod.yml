@@ -107,16 +107,13 @@ services:
       - "1"
       - "--retention-hours"
       - "${CLEANUP_AFTER_HOURS:-24}"
-      # The single canonical pipeline: unified mode pins the multi-agent
-      # deliberation on and all alternate modes off.
-      - "--unified"
+      # One checksum-pinned pretrained model; no alternate color author.
       - "--model"
       - "${MANGAHUE_MODEL_PATH:-/app/models/ddcolor-full-fp32.onnx}"
       - "--preset"
-      - "/app/configs/engine.telegram-pure-model-v2.yaml"
+      - "/app/configs/engine.default.yaml"
       - "--style"
       - "/app/configs/styles/soft_cel_anime_v2.yaml"
-      - "--palette-feedback"
       - "--cache-dir"
       - "/data/cache"
       - "--daily-limit"

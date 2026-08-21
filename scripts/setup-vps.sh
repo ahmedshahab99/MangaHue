@@ -72,8 +72,17 @@ fi
 mkdir -p "$APP_DIR/models"
 cd "$APP_DIR"
 
-log "Downloading and verifying the compact production color model"
-bash scripts/download_ddcolor_tiny.sh "$APP_DIR/models/ddcolor-tiny-fp16.onnx"
+production_model="$APP_DIR/models/ddcolor-full-fp32.onnx"
+production_sha="08e7ae0362faddb4411a4412b5e017624da77f72d085f13862ea50fa4715a7e4"
+if [[ ! -s "$production_model" && -n "${MANGAHUE_PRODUCTION_MODEL_SOURCE:-}" ]]; then
+  log "Installing the operator-supplied production model"
+  install -m 0644 "$MANGAHUE_PRODUCTION_MODEL_SOURCE" "$production_model"
+fi
+if [[ ! -s "$production_model" ]]; then
+  echo "Missing $production_model. Supply the licensed pretrained DDColor Full FP32 artifact via MANGAHUE_PRODUCTION_MODEL_SOURCE." >&2
+  exit 3
+fi
+printf '%s  %s\n' "$production_sha" "$production_model" | sha256sum -c -
 
 log "Building the compact web runtime"
 docker compose build api
