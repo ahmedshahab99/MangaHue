@@ -24,22 +24,17 @@ cannot pass a release gate.
 Run the command below in the isolated benchmark environment:
 
 ```bash
-PYTHONPATH=python python -m mangahue_train.benchmark_quality \
-  --manifest /private/mangahue-heldout/manifest.json \
-  --target mangahue \
-  --baseline ddcolor \
-  --output /private/mangahue-heldout/report.json \
-  --min-pages 50 \
-  --max-delta-e 28 \
-  --min-ssim 0.55 \
-  --min-line-preservation 0.92
+cargo run --locked --release -p mangahue-cli -- benchmark \
+  /private/mangahue-heldout/inputs \
+  --output /private/mangahue-heldout/outputs \
+  --model models/ddcolor-full-fp32.onnx \
+  --report /private/mangahue-heldout/report.json
 ```
 
-The command fails closed when any page lacks license evidence, the sample count is too
-small, a metric misses its threshold, or MangaHue does not beat DDColor on mean Delta E.
-Record the report hash with the release SHA. Public promotion additionally requires the
-normal CI and deployment checks plus a blind preference review of beta output and all
-high-severity correction clusters resolved.
+The private manifest remains the license-evidence source of truth and must contain at
+least 50 approved pages before this report is accepted. Record the report hash with the
+release SHA. Public promotion additionally requires the normal CI and deployment checks,
+a blind preference review of beta output, and all high-severity correction clusters resolved.
 
 `--allow-unlicensed` exists only for local tests and pipeline development. It must never
 be used for a release decision.

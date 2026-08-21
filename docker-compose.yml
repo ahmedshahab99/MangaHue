@@ -14,9 +14,10 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
       MANGAHUE_MAX_CONCURRENT_JOBS: ${MANGAHUE_MAX_CONCURRENT_JOBS:-1}
-      MANGAHUE_JOB_RETENTION_HOURS: ${MANGAHUE_JOB_RETENTION_HOURS:-168}
-      MANGAHUE_DEFAULT_MODEL: /app/models/ddcolor-tiny-fp16.onnx
-      MANGAHUE_DEFAULT_CONFIG: /app/configs/engine.studio.yaml
+      MANGAHUE_JOB_RETENTION_HOURS: ${MANGAHUE_JOB_RETENTION_HOURS:-24}
+      MANGAHUE_DEFAULT_MODEL: /app/models/ddcolor-full-fp32.onnx
+      MANGAHUE_DEFAULT_CONFIG: /app/configs/engine.default.yaml
+      MANGAHUE_DEFAULT_STYLE: /app/configs/styles/soft_cel_anime_v2.yaml
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
       MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-900}
       OMP_NUM_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
@@ -77,7 +78,7 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 192
-    mem_limit: ${MANGAHUE_WORKER_MEMORY:-1536m}
+    mem_limit: ${MANGAHUE_WORKER_MEMORY:-4096m}
     cpus: ${MANGAHUE_WORKER_CPUS:-1.0}
     depends_on:
       api:

@@ -10,7 +10,6 @@ pub struct PlatformProfile {
     pub optimal_batch_size: usize,
     pub optimal_parallel_jobs: usize,
     pub fp16_supported: bool,
-    pub ensemble_viable: bool,
     pub backend_priority: Vec<BackendKind>,
     pub gpu_detected: bool,
     pub gpu_name: Option<String>,
@@ -22,9 +21,6 @@ pub struct PlatformProfile {
 pub enum BackendKind {
     NativeOnnxGpu,
     NativeOnnxCpu,
-    PythonOnnx,
-    Ensemble,
-    Mock,
 }
 
 impl PlatformProfile {
@@ -50,38 +46,16 @@ impl PlatformProfile {
             512
         };
 
-        let optimal_batch_size = if total_ram_gb >= 32.0 {
-            4
-        } else if total_ram_gb >= 8.0 {
-            2
-        } else {
-            1
-        };
-
-        let optimal_parallel_jobs = if cpu_cores >= 16 {
-            8
-        } else if cpu_cores >= 8 {
-            4
-        } else if cpu_cores >= 4 {
-            2
-        } else {
-            1
-        };
+        let optimal_batch_size = 1;
+        let optimal_parallel_jobs = 1;
 
         let fp16_supported = gpu_detected;
-
-        let ensemble_viable = cpu_cores >= 8 && total_ram_gb >= 8.0;
 
         let mut backend_priority = Vec::new();
         if gpu_detected {
             backend_priority.push(BackendKind::NativeOnnxGpu);
         }
         backend_priority.push(BackendKind::NativeOnnxCpu);
-        backend_priority.push(BackendKind::PythonOnnx);
-        if ensemble_viable {
-            backend_priority.push(BackendKind::Ensemble);
-        }
-        backend_priority.push(BackendKind::Mock);
 
         let profile = Self {
             cpu_cores,
@@ -90,7 +64,6 @@ impl PlatformProfile {
             optimal_batch_size,
             optimal_parallel_jobs,
             fp16_supported,
-            ensemble_viable,
             backend_priority,
             gpu_detected,
             gpu_name,
@@ -117,16 +90,7 @@ impl PlatformProfile {
     /// without hand-editing YAML.
     pub fn apply_to_config(&self, config: &mut mangahue_config::EngineConfig) {
         config.layout.tile_size = self.optimal_tile_size;
-        config.inference.batch_size = self.optimal_batch_size;
-        if config.engine.parallel_jobs == 0 {
-            config.engine.parallel_jobs = self.optimal_parallel_jobs;
-        }
-        config.inference.fp16_enabled = config.inference.fp16_enabled || self.fp16_supported;
-        config.inference.device = if self.gpu_detected {
-            "cuda".to_string()
-        } else {
-            "cpu".to_string()
-        };
+        config.engine.parallel_jobs = 1;
     }
 }
 

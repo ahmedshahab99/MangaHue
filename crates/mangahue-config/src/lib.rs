@@ -78,12 +78,6 @@ fn default_region_style_hint_budget() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceSection {
     pub model_path: PathBuf,
-    pub model_metadata_path: PathBuf,
-    pub device: String,
-    pub batch_size: usize,
-    pub input_size: u32,
-    pub fp16_enabled: bool,
-    pub resize_policy: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -546,13 +540,7 @@ impl Default for EngineConfig {
                 adaptive_placement_enabled: false,
             },
             inference: InferenceSection {
-                model_path: PathBuf::from("models/example_model.onnx.placeholder"),
-                model_metadata_path: PathBuf::from("models/model.mangahue.json"),
-                device: "cpu".to_string(),
-                batch_size: 1,
-                input_size: 768,
-                fp16_enabled: false,
-                resize_policy: "fit".to_string(),
+                model_path: PathBuf::from("models/ddcolor-full-fp32.onnx"),
             },
             postprocess: PostprocessSection {
                 restore_lines: true,
@@ -656,9 +644,6 @@ impl EngineConfig {
         }
         if !(0.0..=4.0).contains(&self.hints.hint_strength) {
             return Err(anyhow!("hints.hint_strength must be between 0 and 4"));
-        }
-        if self.inference.input_size == 0 {
-            return Err(anyhow!("inference.input_size must be greater than zero"));
         }
         if !(1..=100).contains(&self.output.quality) {
             return Err(anyhow!("output.quality must be in 1..=100"));

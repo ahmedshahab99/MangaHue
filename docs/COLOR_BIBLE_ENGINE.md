@@ -89,7 +89,7 @@ Automatic cross-page character recognition is still confidence-limited without a
 A release is deliverable only when all of the following pass:
 
 - Rust formatting, workspace tests, and Clippy;
-- Python tests for remaining model/tooling code;
+- native Rust inference and release-container tests;
 - production concurrency and retention policy checks;
 - chapter extraction and no-skipped-page tests;
 - protected-mask, exact-mask, Color Bible resolution/undo, impact, and verifier tests;

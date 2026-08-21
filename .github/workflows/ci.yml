@@ -27,21 +27,15 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --locked --release -p mangahue-telegram
 
-  python-compatibility:
+  deployment-scripts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-      - run: python -m pip install numpy pillow onnxruntime opencv-python-headless pytest pytest-asyncio
-      - run: python -m compileall python/mangahue_train
-      - run: PYTHONPATH=python python -m pytest -q python/tests
       - run: bash -n scripts/setup-vps.sh scripts/healthcheck.sh scripts/cleanup-old-vps-bot.sh scripts/promote-release.sh
 
   container:
     runs-on: ubuntu-latest
-    needs: [rust, python-compatibility]
+    needs: [rust, deployment-scripts]
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4

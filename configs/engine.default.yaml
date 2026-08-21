@@ -39,12 +39,6 @@ hints:
 
 inference:
   model_path: models/ddcolor-full-fp32.onnx
-  model_metadata_path: configs/model-contracts/manga-colorization-v2-onnx.json
-  device: cpu
-  batch_size: 1
-  input_size: 1024
-  fp16_enabled: false
-  resize_policy: fit
 
 postprocess:
   restore_lines: true

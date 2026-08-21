@@ -22,6 +22,6 @@ Views:
 - Chapter: import folders, images, ZIP, or CBZ into normalized page sets, colorize chapters, write brain/safety/palette memory reports, and export processed pages back to ZIP/CBZ.
 - Jobs: list in-memory and persisted job manifests.
 - Memory: save correction records, update character colors, export page hints, build palette memory, edit locked colors, and export palette-memory styles.
-- Doctor: check config parsing, styles, metadata, Python sidecar import, job storage, Studio files, and the sample page.
+- Doctor: check config parsing, canonical style, the pinned model checksum, job storage, Studio files, and the sample page.
 
 Studio intentionally works with local file paths because this engine is currently a desktop/local production shell. A hosted SaaS version can replace path inputs with upload storage while keeping the same API flow.

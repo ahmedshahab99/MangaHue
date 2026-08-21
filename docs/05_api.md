@@ -55,10 +55,9 @@ Doctor payload:
 {
   "config_path": "configs/engine.default.yaml",
   "styles_dir": "configs/styles",
-  "metadata_path": "models/model.mangahue.json",
+  "model_path": "models/ddcolor-full-fp32.onnx",
   "jobs_dir": ".mangahue/jobs",
-  "sample_input": "examples/input/smoke_page.png",
-  "python": "python"
+  "sample_input": "examples/input/smoke_page.png"
 }
 ```
 
