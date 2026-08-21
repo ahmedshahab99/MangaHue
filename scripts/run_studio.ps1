@@ -6,29 +6,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Runtime = Join-Path $Root ".mangahue\python-runtime"
-$Python = Join-Path $Runtime "Scripts\python.exe"
 
 Push-Location $Root
 try {
-  if (-not (Test-Path $Python)) {
-    uv venv --python 3.11 $Runtime
-  }
-  $runtimeReady = $false
-  try {
-    & $Python -c "import cv2, numpy, onnxruntime, PIL; assert hasattr(cv2, 'CascadeClassifier')" 2>$null
-    $runtimeReady = $LASTEXITCODE -eq 0
-  } catch {}
-  if (-not $runtimeReady) {
-    uv pip install --python $Python numpy pillow onnxruntime 'opencv-python-headless>=4.9,<5'
-  }
-  $env:MANGAHUE_PYTHON = $Python
-  $env:PYTHONPATH = Join-Path $Root "python"
-  $FaceModel = Join-Path $Root "models\anime-face\lbpcascade_animeface.xml"
-  if (Test-Path $FaceModel) {
-    $env:MANGAHUE_FACE_MODEL = Split-Path -Parent $FaceModel
-  }
-
   cargo +stable-x86_64-pc-windows-gnu run -p mangahue-cli -- serve --addr $Addr --jobs-dir $JobsDir --studio-dir $StudioDir
 }
 finally {

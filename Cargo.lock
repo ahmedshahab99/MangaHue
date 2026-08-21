@@ -1574,20 +1574,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mangahue-ensemble"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "mangahue-core",
- "mangahue-inference",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "mangahue-eval"
 version = "0.1.0"
 dependencies = [
@@ -1718,7 +1704,6 @@ dependencies = [
  "mangahue-cache",
  "mangahue-config",
  "mangahue-core",
- "mangahue-ensemble",
  "mangahue-eval",
  "mangahue-hints",
  "mangahue-image",
@@ -1728,7 +1713,6 @@ dependencies = [
  "mangahue-memory",
  "mangahue-postprocess",
  "mangahue-preprocess",
- "mangahue-pyramid",
  "rayon",
  "serde",
  "serde_json",
@@ -1785,18 +1769,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "uuid",
-]
-
-[[package]]
-name = "mangahue-pyramid"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "mangahue-core",
- "mangahue-inference",
- "serde",
- "tracing",
 ]
 
 [[package]]

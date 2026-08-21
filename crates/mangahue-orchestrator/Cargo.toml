@@ -26,8 +26,6 @@ mangahue-memory = { path = "../mangahue-memory" }
 mangahue-postprocess = { path = "../mangahue-postprocess" }
 mangahue-preprocess = { path = "../mangahue-preprocess" }
 mangahue-cache = { path = "../mangahue-cache" }
-mangahue-ensemble = { path = "../mangahue-ensemble" }
-mangahue-pyramid = { path = "../mangahue-pyramid" }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

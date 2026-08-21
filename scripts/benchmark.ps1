@@ -4,5 +4,4 @@ param(
   [string]$Report = "examples\output\benchmark.json"
 )
 
-cargo run -p mangahue-cli -- benchmark $InputDir --output $OutputDir --mock --report $Report
-
+cargo run -p mangahue-cli -- benchmark $InputDir --output $OutputDir --report $Report

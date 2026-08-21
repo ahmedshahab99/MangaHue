@@ -12,14 +12,12 @@ This repository currently contains the first production-shaped slice:
 - Strong domain types, config loading, image I/O, preprocessing, layout, hints, memory, inference interfaces, brain reports, postprocessing, evaluation, orchestrator, CLI, and API skeletons.
 - Director-grade inspection reports: page classification, ink density, tone score, component analysis, protected-region coverage, hint adherence, and a final verdict.
 - Debug overlays that show ink, bubbles, text, tones, and hints in one visual.
-- Optional Python research utilities that are not installed or invoked by production.
-- An explicit mock backend for tests and demos. Real CLI colorization does not silently fake an ONNX model.
+- A deterministic internal backend used only by automated pipeline tests; no user-facing command can select it.
 
 ## Quick Start
 
 ```powershell
 cargo test
-cargo run -p mangahue-cli -- colorize .\examples\input\page.png --output .\examples\output\page.png --mock --debug .\examples\output\debug
 cargo run -p mangahue-cli -- colorize .\examples\input\page.png --output .\examples\output\page.png
 cargo run -p mangahue-cli -- inspect .\examples\input\page.png --output .\examples\output\inspection.json --debug .\examples\output\inspect_debug
 ```
@@ -29,11 +27,10 @@ Production uses exactly one pretrained artifact: `models/ddcolor-full-fp32.onnx`
 ## CLI
 
 ```powershell
-mangahue colorize input.png --output output.png --model model.onnx
-mangahue colorize input.png --output output.png --mock
-mangahue batch pages --output colored --mock
+mangahue colorize input.png --output output.png --model models/ddcolor-full-fp32.onnx
+mangahue batch pages --output colored --model models/ddcolor-full-fp32.onnx
 mangahue inspect input.png --output inspection.json --debug debug_folder
-mangahue benchmark pages --output colored --mock --report benchmark.json
+mangahue benchmark pages --output colored --model models/ddcolor-full-fp32.onnx --report benchmark.json
 mangahue correction add --project projects/my_manga/project.json --page page_001 --x 100 --y 200 --width 80 --height 120 --label hair --old "#5a4632" --new "#111111" --character hero
 mangahue project export-corrections --project projects/my_manga/project.json --output training/corrections.jsonl
 mangahue styles list --dir configs/styles
@@ -43,9 +40,9 @@ mangahue serve --addr 127.0.0.1:7878
 mangahue preprocess input.png --output clean.png
 mangahue make-hints input.png --hints hints.json --output-map hint_map.png --output-mask hint_mask.png
 mangahue chapter import chapter.cbz --output .mangahue/imported_chapter
-mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --gallery examples/output/colored_chapter/gallery.html --manifest examples/output/colored_chapter/job.json --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --locked-style examples/output/colored_chapter/mangahue_locked_style.json --palette-memory examples/output/colored_chapter/mangahue_palette_memory.json --palette-memory-style examples/output/colored_chapter/mangahue_palette_memory_style.json --safety-report examples/output/colored_chapter/mangahue_safety_gate.json --consistency-retry --mock
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --export examples/output/colored_chapter.cbz --gallery examples/output/colored_chapter/gallery.html --manifest examples/output/colored_chapter/job.json --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --locked-style examples/output/colored_chapter/mangahue_locked_style.json --palette-memory examples/output/colored_chapter/mangahue_palette_memory.json --palette-memory-style examples/output/colored_chapter/mangahue_palette_memory_style.json --safety-report examples/output/colored_chapter/mangahue_safety_gate.json --consistency-retry
 mangahue brain palette-memory --brain-report examples/output/colored_chapter/mangahue_chapter_brain.json --output examples/output/colored_chapter/mangahue_palette_memory.json --style-output examples/output/colored_chapter/mangahue_palette_memory_style.json
-mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --manifest examples/output/colored_chapter/job.json --resume --mock
+mangahue chapter colorize chapter.cbz --output examples/output/colored_chapter --manifest examples/output/colored_chapter/job.json --resume
 mangahue chapter export examples/output/colored_chapter --output examples/output/colored_chapter.cbz
 mangahue project create "My Manga" --output projects/my_manga
 mangahue character create --project projects/my_manga --name Hero --hair "#111111" --eyes "#3366ff" --skin "#e8b89a"

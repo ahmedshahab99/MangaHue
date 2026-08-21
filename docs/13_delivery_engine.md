@@ -16,8 +16,8 @@ cargo run -p mangahue-cli -- link colorize `
   "https://your-authorized-site.example/chapter/1" `
   --output examples/output/link_chapter `
   --max-pages 8 `
-  --style configs/styles/webtoon_bright.yaml `
-  --mock
+  --model models/ddcolor-full-fp32.onnx `
+  --style configs/styles/soft_cel_anime_v2.yaml
 ```
 
 Fetch only:
@@ -38,7 +38,7 @@ cargo run -p mangahue-cli -- chapter import chapter.cbz `
 cargo run -p mangahue-cli -- chapter colorize chapter.cbz `
   --output examples/output/colored_chapter `
   --export examples/output/colored_chapter.cbz `
-  --mock
+  --model models/ddcolor-full-fp32.onnx
 ```
 
 The archive path supports folders, single images, ZIP, and CBZ. MangaHue validates page images, sorts them naturally, normalizes output names, and writes a manifest beside imported pages.
@@ -52,10 +52,12 @@ $env:TELEGRAM_BOT_TOKEN="123456:token"
 cargo run -p mangahue-telegram -- `
   --work-dir .mangahue/telegram `
   --max-pages 4 `
-  --mock
+  --model models/ddcolor-full-fp32.onnx `
+  --preset configs/engine.default.yaml `
+  --style configs/styles/soft_cel_anime_v2.yaml
 ```
 
-The bot accepts a message containing one authorized URL, downloads page images, colorizes them, and sends PNG documents back to the chat. After training, remove `--mock` and pass `--model`, `--config`, and optionally `--style`.
+The bot accepts a message containing one authorized URL, downloads every supported page image, colorizes each page with the pinned DDColor artifact, and sends the complete result back to the chat.
 
 ## Production Notes
 
@@ -63,4 +65,4 @@ The bot accepts a message containing one authorized URL, downloads page images, 
 - Put the API behind authentication before hosting it publicly.
 - Store job manifests and outputs on durable storage when deployed.
 - Move `POST /api/link/colorize` jobs to a queue when traffic grows.
-- Use the same model contract for web and Telegram delivery, so training improves every surface at once.
+- Web, CLI, and Telegram all use the same pinned production model, engine config, and style profile.

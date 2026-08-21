@@ -3,11 +3,7 @@ use image::{GrayImage, Luma, Pixel, Rgb, RgbImage};
 use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
-    BoundingBox, CharacterProfile, ColorRgb, ImageSize, MangaPanel, ProcessingReport, StageReport,
-    StyleProfile, TileInfo,
-};
-use mangahue_ensemble::{
-    ConfidenceMap, ConsensusStrategy, EnsembleConfig, EnsembleReport, Ensembler,
+    CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
 };
 use mangahue_hints::{
     apply_region_locks_to_hints, apply_region_style_hints, detect_semantic_regions,
@@ -28,7 +24,6 @@ use mangahue_postprocess::{
     PostprocessInput,
 };
 use mangahue_preprocess::preprocess_page;
-use mangahue_pyramid::{PyramidColorizer, PyramidConfig};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -87,43 +82,12 @@ pub struct ColorizeRequest {
     pub use_mock_backend: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ensemble_model_paths: Vec<PathBuf>,
-    #[serde(default)]
-    pub enable_ensemble: bool,
     #[serde(default, skip)]
     pub cancel_token: Option<Arc<AtomicBool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
     #[serde(default)]
-    pub pyramid_enabled: bool,
-    #[serde(default)]
     pub hint_propagation_enabled: bool,
-    /// Force the legacy four-pass grading cascade (unified_grade: false)
-    /// regardless of the config. Used by the benchmark harness to A/B the
-    /// two-stage architecture against the old one.
-    #[serde(default)]
-    pub legacy_grade: bool,
-    /// Artist palette override (configs/palettes/*.yaml). Overrides
-    /// style.palette before scene re-weighting.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub palette_path: Option<PathBuf>,
-    /// Automatically select the artist palette that best fits the page
-    /// fingerprint (brightness/contrast) from the scene palettes.
-    #[serde(default)]
-    pub auto_palette: bool,
-    /// Per-chapter accent palette extracted from the manga's own colored
-    /// output. Merged into the style palette's accent slots (>= 9) before
-    /// scene re-weighting, so each manga gets its own color universe while
-    /// paper/skin/hair slots stay natural.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub palette_override: Option<Vec<ColorRgb>>,
-    /// Client-side draft: a colorized image produced OUTSIDE the engine
-    /// (e.g. by the WebGPU web app). When set, the orchestrator skips model
-    /// inference and uses the draft as the model output, then runs the full
-    /// protected-layer + director + grading postprocess.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub draft_path: Option<PathBuf>,
     #[serde(skip)]
     pub progress_sender: Option<tokio::sync::mpsc::UnboundedSender<ProgressUpdate>>,
 }
@@ -299,23 +263,12 @@ impl MangaHueEngine {
         }
 
         let total_start = Instant::now();
-        let mut config = load_config(
+        let config = load_config(
             request.config_path.as_deref(),
             request.preset_path.as_deref(),
         )?;
-        // Explicit legacy-grade override (the benchmark harness uses this to
-        // A/B the unified grade against the old cascade without editing
-        // config files).
-        if request.legacy_grade {
-            config.postprocess.unified_grade = false;
-        }
         let style = load_style(request.style_path.as_deref())?;
 
-        // Resolve pyramid / hint propagation flags. Request explicit opt-in
-        // takes precedence; otherwise fall back to the config-derived value.
-        let pyramid_enabled =
-            request.pyramid_enabled || config.engine.pyramid_enabled || config.pyramid.enabled;
-        let pyramid_config = config.pyramid.clone();
         let hint_propagation_enabled =
             request.hint_propagation_enabled || config.engine.hint_propagation_enabled;
         let progress = request.progress_sender.clone();
@@ -359,44 +312,9 @@ impl MangaHueEngine {
         // scene so the coloring matches the environment instead of forcing
         // one fixed look.
         let scene = mangahue_postprocess::analyze_scene(&preprocess.original_grayscale);
-        // Artist palette: every series has its own color vision. Either an
-        // explicit palette file (configs/palettes/*.yaml) or automatic
-        // selection from the page fingerprint overrides the style palette
-        // BEFORE the scene re-weighting applies.
-        let mut palette_style = style.clone();
-        if request.auto_palette {
-            let name = mangahue_config::select_palette_name(scene.brightness, scene.contrast);
-            let path = mangahue_config::default_palettes_dir().join(format!("{name}.yaml"));
-            if let Ok(colors) = mangahue_config::load_palette(&path) {
-                report.warn(format!("artist palette auto-selected: {name}"));
-                palette_style.palette = merge_artist_accents(&style.palette, &colors);
-            } else {
-                report.warn(format!(
-                    "auto palette {name} not found at {}; using style palette",
-                    path.display()
-                ));
-            }
-        } else if let Some(palette_path) = request.palette_path.as_deref() {
-            let colors = mangahue_config::load_palette(palette_path)?;
-            report.warn(format!(
-                "artist palette override: {}",
-                palette_path.display()
-            ));
-            palette_style.palette = colors;
-        }
-        if let Some(accents) = request.palette_override.as_deref() {
-            if !accents.is_empty() {
-                report.warn(format!(
-                    "chapter palette accents merged: {} color(s)",
-                    accents.len()
-                ));
-                palette_style.palette = merge_artist_accents(&palette_style.palette, accents);
-            }
-        }
         let scene_style = {
-            let mut adapted = palette_style.clone();
-            adapted.palette =
-                mangahue_postprocess::scene_palette(&palette_style.palette, &scene, 14);
+            let mut adapted = style.clone();
+            adapted.palette = mangahue_postprocess::scene_palette(&style.palette, &scene, 14);
             adapted
         };
         report.warn(format!(
@@ -754,179 +672,22 @@ impl MangaHueEngine {
 
         let inference_start = Instant::now();
         let parallel_jobs = resolve_parallel_jobs(config.engine.parallel_jobs);
-        let use_ensemble = request.enable_ensemble && !request.ensemble_model_paths.is_empty();
         let tiles_total = layout.tiles.len();
         emit_progress(&progress, "inference_started", 0, tiles_total, None);
 
-        let colored_tiles: Vec<(TileInfo, RgbImage)>;
-        let mut ensemble_report: Option<mangahue_ensemble::EnsembleReport> = None;
-        let mut confidence_map: Option<ConfidenceMap> = None;
-        let backend_name: String;
-
-        if let Some(draft_path) = request.draft_path.as_deref() {
-            // Client-side draft mode (WebGPU web app): the model output was
-            // produced on the CLIENT's GPU and uploaded here. Model
-            // inference is skipped; the full protected-layer, region
-            // director and grading postprocess still runs on the draft.
-            let draft = load_image(draft_path)?.image.to_rgb8();
-            let draft = if draft.dimensions() != (size.width, size.height) {
-                image::imageops::resize(
-                    &draft,
-                    size.width,
-                    size.height,
-                    image::imageops::FilterType::Lanczos3,
-                )
-            } else {
-                draft
-            };
-            backend_name = "client-webgpu-draft".to_string();
-            info!(draft = %draft_path.display(), "using client-side draft");
-            colored_tiles = vec![(
-                TileInfo {
-                    id: "tile_0001".to_string(),
-                    bbox: BoundingBox::new(0, 0, size.width, size.height),
-                    overlap: 0,
-                    panel_id: None,
-                },
-                draft,
-            )];
-        } else if use_ensemble {
-            backend_name = "ensemble".to_string();
-            let ens = build_ensembler(&request, &config, &style)?;
-            info!(
-                ensemble_variants = 1usize + request.ensemble_model_paths.len(),
-                jobs = parallel_jobs,
-                tiles = layout.tiles.len(),
-                "running ensemble inference"
-            );
-            let cancel = cancel.clone();
-            // DDColor-family variants need the original grayscale; the
-            // ensemble feeds every variant the same source, so the most
-            // demanding variant decides.
-            let use_original = ens.prefers_original_grayscale();
-            let source_gray = if use_original {
-                &preprocess.original_grayscale
-            } else {
-                &preprocess.clean_lineart
-            };
+        let backend: Arc<dyn ColorizationBackend> =
+            Arc::from(select_backend(&request, &config, &style)?);
+        let backend_name = backend.name().to_string();
+        info!(
+            backend = backend.name(),
+            jobs = parallel_jobs,
+            tiles = layout.tiles.len(),
+            "running single-model inference"
+        );
+        let cancel = cancel.clone();
+        let use_original = backend.prefers_original_grayscale();
+        let colored_tiles: Vec<(TileInfo, RgbImage)> =
             if layout.tiles.len() < 2 || parallel_jobs == 1 {
-                let mut acc = Vec::with_capacity(layout.tiles.len());
-                for tile in &layout.tiles {
-                    if check_cancel(&cancel) {
-                        return Err(anyhow!("colorization cancelled before tile {}", tile.id));
-                    }
-                    let (merged, conf, _report) = ens
-                        .colorize(&ModelInput {
-                            lineart: crop_gray(source_gray, tile.bbox),
-                            hint_map: crop_rgb(&hints.hint_map, tile.bbox),
-                            hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
-                        })
-                        .map_err(|err| anyhow!(err))?;
-                    ensemble_report = Some(_report);
-                    if confidence_map.is_none() {
-                        confidence_map = Some(conf.clone());
-                    }
-                    acc.push((tile.clone(), merged));
-                    emit_progress(
-                        &progress,
-                        "inference_tile",
-                        acc.len(),
-                        tiles_total,
-                        Some(tile.id.clone()),
-                    );
-                }
-                colored_tiles = acc;
-            } else {
-                let pool = build_pool(parallel_jobs);
-                let raw: Vec<Result<(TileInfo, RgbImage, ConfidenceMap, EnsembleReport)>> = pool
-                    .install(|| {
-                        let tiles = &layout.tiles;
-                        let clean = source_gray;
-                        let hint_map = &hints.hint_map;
-                        let hint_mask = &hints.hint_mask;
-                        let cancel = cancel.clone();
-                        tiles
-                            .par_iter()
-                            .map(|tile| {
-                                if check_cancel(&cancel) {
-                                    return Err(anyhow!(
-                                        "cancelled during ensemble tile {}",
-                                        tile.id
-                                    ));
-                                }
-                                ens.colorize(&ModelInput {
-                                    lineart: crop_gray(clean, tile.bbox),
-                                    hint_map: crop_rgb(hint_map, tile.bbox),
-                                    hint_mask: crop_gray(hint_mask, tile.bbox),
-                                })
-                                .map(|(merged, conf, report)| (tile.clone(), merged, conf, report))
-                                .map_err(|err| anyhow!(err))
-                            })
-                            .collect()
-                    });
-                let mut colored: Vec<(TileInfo, RgbImage)> = Vec::with_capacity(raw.len());
-                for entry in raw {
-                    let (tile, merged, conf, report) = entry?;
-                    if ensemble_report.is_none() {
-                        ensemble_report = Some(report);
-                    }
-                    if confidence_map.is_none() {
-                        confidence_map = Some(conf);
-                    }
-                    colored.push((tile, merged));
-                }
-                colored_tiles = colored;
-            }
-            emit_progress(&progress, "inference_done", 4, 6, None);
-        } else {
-            let raw_backend: Arc<dyn ColorizationBackend> =
-                Arc::from(select_backend(&request, &config, &style)?);
-            let backend: Arc<dyn ColorizationBackend> = if pyramid_enabled {
-                let config = if pyramid_config.levels.is_empty() {
-                    PyramidConfig::default()
-                } else {
-                    PyramidConfig {
-                        enabled: true,
-                        levels: pyramid_config.levels.clone(),
-                        blend_weights: if pyramid_config.blend_weights.len()
-                            == pyramid_config.levels.len()
-                        {
-                            pyramid_config.blend_weights.clone()
-                        } else {
-                            // Equal weights when the count mismatches.
-                            let n = pyramid_config.levels.len() as f32;
-                            vec![1.0 / n; pyramid_config.levels.len()]
-                        },
-                        ..PyramidConfig::default()
-                    }
-                };
-                // The pyramid runs one extra inference per level per tile:
-                // report the real stack cost so a config can't silently
-                // claim a pyramid that isn't running (or vice versa).
-                info!(
-                    levels = ?config.levels,
-                    weights = ?config.blend_weights,
-                    extra_inferences = config.levels.len(),
-                    "pyramid pipeline active"
-                );
-                Arc::new(
-                    PyramidColorizer::new(raw_backend, config)
-                        .with_cancel(request.cancel_token.clone()),
-                )
-            } else {
-                info!("single-pass pipeline active");
-                raw_backend
-            };
-            backend_name = backend.name().to_string();
-            info!(
-                backend = backend.name(),
-                jobs = parallel_jobs,
-                tiles = layout.tiles.len(),
-                "running inference"
-            );
-            let cancel = cancel.clone();
-            let use_original = backend.prefers_original_grayscale();
-            colored_tiles = if layout.tiles.len() < 2 || parallel_jobs == 1 {
                 let mut acc = Vec::with_capacity(layout.tiles.len());
                 for tile in &layout.tiles {
                     if check_cancel(&cancel) {
@@ -986,8 +747,7 @@ impl MangaHueEngine {
                 });
                 raw.into_iter().collect::<Result<Vec<_>>>()?
             };
-            emit_progress(&progress, "inference_done", 4, 6, None);
-        }
+        emit_progress(&progress, "inference_done", 4, 6, None);
 
         if check_cancel(&cancel) {
             return Err(anyhow!("colorization cancelled after inference"));
@@ -1030,32 +790,17 @@ impl MangaHueEngine {
             config.layout.tile_size,
             config.layout.tile_overlap,
         );
-        let mut inference_report = StageReport::new("inference")
+        let inference_report = StageReport::new("inference")
             .note(format!("backend={}", backend_name))
             .metric("parallel_jobs", parallel_jobs as f64)
             .metric("tiles_completed", colored_tiles.len() as f64);
-        if let Some(ref er) = ensemble_report {
-            inference_report = inference_report
-                .metric("ensemble_variants", er.variant_count as f64)
-                .metric("divergence_score", er.divergence_score as f64)
-                .metric("semantic_rescue_pixels", er.semantic_rescue_pixels as f64);
-        }
         report.add_stage_report(inference_report);
 
-        let confidence_map_path: Option<PathBuf> = if let Some(ref cm) = confidence_map {
-            let conf_path =
-                mangahue_image::sibling_with_suffix(&request.output_path, ".confidence", "png");
-            save_gray(&conf_path, &cm.to_gray_image()).with_context(|| {
-                format!("failed to save confidence map {}", conf_path.display())
-            })?;
-            Some(conf_path)
-        } else {
-            None
-        };
+        let confidence_map_path: Option<PathBuf> = None;
 
         if let Some(debug_dir) = request.debug_dir.as_deref() {
             fs::create_dir_all(debug_dir)?;
-            let path = debug_dir.join("ensemble_merged.png");
+            let path = debug_dir.join("model_output.png");
             save_rgb(&path, &merged)?;
             report.debug_files.push(path);
         }
@@ -1798,24 +1543,6 @@ fn load_style(style_path: Option<&Path>) -> Result<StyleProfile> {
     }
 }
 
-fn merge_artist_accents(base: &[ColorRgb], accents: &[ColorRgb]) -> Vec<ColorRgb> {
-    if base.len() < 9 {
-        return accents.to_vec();
-    }
-    let mut merged = Vec::with_capacity(base.len() + accents.len());
-    for color in base
-        .iter()
-        .take(9)
-        .chain(accents)
-        .chain(base.iter().skip(9))
-    {
-        if !merged.contains(color) {
-            merged.push(*color);
-        }
-    }
-    merged
-}
-
 fn load_characters(project_path: Option<&Path>, ids: &[String]) -> Result<Vec<CharacterProfile>> {
     match project_path {
         Some(path) => load_project_characters(path, ids),
@@ -1838,107 +1565,16 @@ fn select_backend(
         .model_path
         .as_ref()
         .unwrap_or(&config.inference.model_path);
-    select_backend_for_model(model_path, config, request.reference_image_path.as_deref())
-}
-
-fn select_backend_for_model(
-    model_path: &Path,
-    config: &EngineConfig,
-    reference_image_path: Option<&Path>,
-) -> Result<Box<dyn ColorizationBackend>> {
-    if mangahue_inference::is_anime_face_model_dir(model_path) {
-        return Ok(Box::new(mangahue_inference::AnimeFaceBackend::shared(
-            model_path,
-        )?));
-    }
-    if mangahue_inference::is_reference_cgan_model_dir(model_path) {
-        let reference_path = reference_image_path.ok_or_else(|| {
-            anyhow!(
-                "reference cGAN requires a reference image; pass --reference-image path/to/style.jpg"
-            )
-        })?;
-        return Ok(Box::new(mangahue_inference::ReferenceCganBackend::shared(
-            model_path,
-            reference_path,
-        )?));
-    }
-    #[cfg(feature = "native-onnx")]
-    if mangahue_inference::is_style2paints_onnx_model(model_path) {
-        // Style2Paints V3: full-RGB cel output, native Rust session.
-        return Ok(Box::new(
-            mangahue_inference::Style2PaintsV3OnnxBackend::shared(model_path)?,
-        ));
-    }
-    #[cfg(not(feature = "native-onnx"))]
-    if is_style2paints_model_name(model_path) {
-        anyhow::bail!(
-            "Style2Paints models require the native-onnx build (mangahue-telegram/mangahue-cli are built with it)"
-        );
-    }
-    if mangahue_inference::is_ddcolor_onnx_model(model_path) {
-        #[cfg(feature = "native-onnx")]
-        {
-            // Native Rust inference: no Python sidecar, no IPC. Sessions are
-            // shared across pages so chapters never reload the model.
-            return Ok(Box::new(
-                mangahue_inference::NativeDdColorOnnxBackend::shared(model_path)?,
-            ));
-        }
-        #[cfg(not(feature = "native-onnx"))]
-        {
-            return Ok(Box::new(mangahue_inference::DdColorOnnxBackend::shared(
-                model_path,
-            )?));
-        }
-    }
-    if mangahue_inference::is_ddcolor_model_dir(model_path) {
-        return Ok(Box::new(mangahue_inference::DdColorBackend::shared(
-            model_path,
-            &config.inference.device,
-            512,
-            "large",
-        )?));
-    }
-    if mangahue_inference::is_manga_ninja_model_dir(model_path) {
-        return Ok(Box::new(mangahue_inference::MangaNinjaBackend::shared(
-            model_path,
-            &config.inference.device,
-            50,
-        )?));
-    }
-    if mangahue_inference::is_pretrained_model_dir(model_path) {
-        return Ok(Box::new(
-            mangahue_inference::PretrainedWorkerBackend::shared(
-                model_path,
-                &config.inference.device,
-                config.inference.input_size,
-            )?,
-        ));
-    }
-    if model_path.extension().and_then(|value| value.to_str()) == Some("placeholder") {
-        return Err(anyhow!(
-            "real colorization requires an ONNX model; pass --model path/to/model.onnx or use --mock for pipeline verification"
-        ));
-    }
-
+    mangahue_inference::validate_production_ddcolor_model(model_path)?;
     #[cfg(feature = "native-onnx")]
     {
-        // Native inference is the ONLY path in this build: if the session
-        // cannot be built (missing metadata, broken ORT_DYLIB_PATH, corrupt
-        // model), fail loudly instead of silently falling back to a Python
-        // sidecar that may not even exist on the host.
-        let backend = mangahue_inference::RustOnnxBackend::shared(
-            model_path,
-            &config.inference.model_metadata_path,
-        )?;
-        Ok(Box::new(backend))
+        Ok(Box::new(
+            mangahue_inference::NativeDdColorOnnxBackend::shared(model_path)?,
+        ))
     }
     #[cfg(not(feature = "native-onnx"))]
     {
-        Ok(Box::new(mangahue_inference::OnnxColorizationBackend::new(
-            model_path,
-            &config.inference.model_metadata_path,
-        )?))
+        anyhow::bail!("production colorization requires the native-onnx Rust build")
     }
 }
 
@@ -2190,18 +1826,6 @@ fn resolve_parallel_jobs(requested: usize) -> usize {
     }
 }
 
-/// Style2Paints ONNX models are identified by file name; the native-onnx
-/// build also verifies the file exists (see mangahue-inference). Kept here
-/// so non-native builds can still produce a clear error for them.
-#[allow(dead_code)]
-fn is_style2paints_model_name(path: &Path) -> bool {
-    path.extension().and_then(|value| value.to_str()) == Some("onnx")
-        && path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .is_some_and(|name| name.to_ascii_lowercase().contains("style2paints"))
-}
-
 /// Measure delivery color evidence: mean HSV saturation and the fraction of
 /// truly colored non-paper/non-ink pixels, plus Hasler-Suesstrunk
 /// colorfulness. Sampling keeps this bounded on long chapters.
@@ -2332,61 +1956,6 @@ fn build_pool(jobs: usize) -> rayon::ThreadPool {
         })
 }
 
-fn build_ensembler(
-    request: &ColorizeRequest,
-    config: &EngineConfig,
-    style: &StyleProfile,
-) -> Result<Ensembler> {
-    let primary: Arc<dyn ColorizationBackend> = Arc::from(select_backend(request, config, style)?);
-    let has_reference = request.reference_image_path.is_some();
-    let auxiliaries = request
-        .ensemble_model_paths
-        .iter()
-        .filter_map(|path| {
-            // Reference-cGAN auxiliaries require a reference image; skip them
-            // gracefully (warn, don't fail the whole job) when none is set.
-            if mangahue_inference::is_reference_cgan_model_dir(path) && !has_reference {
-                tracing::warn!(
-                    model = %path.display(),
-                    "skipping reference-cGAN ensemble model (no reference image set)"
-                );
-                return None;
-            }
-            Some(
-                select_backend_for_model(path, config, request.reference_image_path.as_deref())
-                    .map(Arc::<dyn ColorizationBackend>::from)
-                    .with_context(|| format!("failed to load ensemble model {}", path.display())),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let ensemble_config = EnsembleConfig {
-        enabled: true,
-        fallback_mock_count: 0,
-        consensus_strategy: match config.ensemble.strategy {
-            mangahue_config::EnsembleStrategy::MajorityWeighted => {
-                ConsensusStrategy::MajorityWeighted
-            }
-            mangahue_config::EnsembleStrategy::AverageBlend => ConsensusStrategy::AverageBlend,
-            mangahue_config::EnsembleStrategy::DivergenceReject => {
-                ConsensusStrategy::DivergenceReject
-            }
-            mangahue_config::EnsembleStrategy::ChromaComplement => {
-                ConsensusStrategy::ChromaComplement
-            }
-        },
-        weight_divergence: true,
-        cielab_distance: config.ensemble.cielab_distance,
-        divergence_reject_threshold: config.ensemble.divergence_reject_threshold,
-    };
-    let weights = vec![config.ensemble.primary_weight; auxiliaries.len() + 1];
-    Ok(Ensembler::with_weights(
-        primary,
-        auxiliaries,
-        weights,
-        ensemble_config,
-    ))
-}
-
 fn check_cancel(cancel: &Option<Arc<AtomicBool>>) -> bool {
     cancel
         .as_ref()
@@ -2430,14 +1999,8 @@ fn compute_idempotency_key(
     }
     hasher.update([
         request.use_mock_backend as u8,
-        request.pyramid_enabled as u8,
         request.hint_propagation_enabled as u8,
-        request.enable_ensemble as u8,
     ]);
-    for model in &request.ensemble_model_paths {
-        hasher.update(model.to_string_lossy().as_bytes());
-        hasher.update(b"\x00");
-    }
     hasher.update(config.layout.tile_size.to_le_bytes());
     let digest = hasher.finalize();
     base64_encode_hash(&digest)
@@ -2453,6 +2016,7 @@ fn base64_encode_hash(digest: &[u8]) -> String {
 mod tests {
     use super::*;
     use image::{GrayImage, Luma, Rgb, RgbImage};
+    use mangahue_core::ColorRgb;
     use mangahue_memory::{ColorBibleCorrection, ColorSelector, CorrectionScope};
 
     fn quality_report() -> mangahue_eval::QualityReport {
@@ -2483,19 +2047,6 @@ mod tests {
             contour_count: 0,
             warnings: Vec::new(),
         }
-    }
-
-    #[test]
-    fn automatic_palette_preserves_semantic_roles() {
-        let base = (0..12)
-            .map(|index| ColorRgb::new(index, 40 + index, 80 + index))
-            .collect::<Vec<_>>();
-        let accents = vec![ColorRgb::new(200, 20, 40), ColorRgb::new(20, 80, 200)];
-
-        let merged = merge_artist_accents(&base, &accents);
-
-        assert_eq!(&merged[..9], &base[..9]);
-        assert_eq!(&merged[9..11], accents.as_slice());
     }
 
     #[test]

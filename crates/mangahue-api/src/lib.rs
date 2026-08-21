@@ -1122,15 +1122,9 @@ fn validate_public_source_url(source_url: &str) -> Result<()> {
 fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.model_path = None;
     request.reference_image_path = None;
-    request.ensemble_model_paths.clear();
-    request.enable_ensemble = false;
     request.config_path = None;
     request.preset_path = None;
     request.style_path = None;
-    request.palette_path = None;
-    request.palette_override = None;
-    request.auto_palette = false;
-    request.draft_path = None;
     request.cache_dir = None;
     request.debug_dir = None;
     request.user_hints_path = None;
@@ -1141,9 +1135,7 @@ fn sandbox_engine_paths(request: &mut ColorizeRequest) {
     request.character_ids.clear();
     request.idempotency_key = None;
     request.use_mock_backend = false;
-    request.pyramid_enabled = false;
     request.hint_propagation_enabled = false;
-    request.legacy_grade = false;
     request.color_bible_consistency_threshold = None;
 }
 
@@ -1178,23 +1170,9 @@ fn pin_public_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) {
 }
 
 fn apply_engine_defaults(request: &mut ColorizeRequest, state: &ApiState) -> Result<()> {
-    if state.sandbox_jobs {
-        // There is one public colorization mode. Remote requests cannot
-        // select a style or alter the rendering pipeline; the server-owned
-        // canonical profile is always applied.
-        pin_public_engine_defaults(request, state);
-    } else if request.style_path.is_none() {
-        // Local/admin operators keep the ability to select research
-        // profiles explicitly, while omitted values use production's
-        // canonical style.
-        request.style_path = Some(state.default_style_path.clone());
-    }
-    if request.model_path.is_none() {
-        request.model_path = Some(state.default_model_path.clone());
-    }
-    if request.config_path.is_none() {
-        request.config_path = Some(state.default_config_path.clone());
-    }
+    // Every API surface uses the same server-owned model, config, and style.
+    // There is no local/admin research bypass in the production codebase.
+    pin_public_engine_defaults(request, state);
     Ok(())
 }
 
@@ -4003,14 +3981,7 @@ mod tests {
             config_path: Some(PathBuf::from("attacker.yaml")),
             preset_path: Some(PathBuf::from("attacker-preset.yaml")),
             style_path: Some(PathBuf::from("attacker-style.yaml")),
-            palette_path: Some(PathBuf::from("attacker-palette.yaml")),
-            palette_override: Some(vec![ColorRgb { r: 1, g: 2, b: 3 }]),
-            auto_palette: true,
-            ensemble_model_paths: vec![PathBuf::from("attacker-ensemble.pkl")],
-            enable_ensemble: true,
-            pyramid_enabled: true,
             hint_propagation_enabled: true,
-            legacy_grade: true,
             use_mock_backend: true,
             ..ColorizeRequest::default()
         };
@@ -4031,14 +4002,7 @@ mod tests {
             Some(default_style_path.as_path())
         );
         assert!(request.preset_path.is_none());
-        assert!(request.palette_path.is_none());
-        assert!(request.palette_override.is_none());
-        assert!(!request.auto_palette);
-        assert!(request.ensemble_model_paths.is_empty());
-        assert!(!request.enable_ensemble);
-        assert!(!request.pyramid_enabled);
         assert!(!request.hint_propagation_enabled);
-        assert!(!request.legacy_grade);
         assert!(!request.use_mock_backend);
 
         let mut durable_payload = serde_json::to_value(ColorizeRequest {
@@ -4046,11 +4010,6 @@ mod tests {
             config_path: Some(PathBuf::from("user-config.yaml")),
             preset_path: Some(PathBuf::from("user-preset.yaml")),
             style_path: Some(PathBuf::from("user-style.yaml")),
-            palette_path: Some(PathBuf::from("user-palette.yaml")),
-            enable_ensemble: true,
-            ensemble_model_paths: vec![PathBuf::from("user-ensemble.pkl")],
-            pyramid_enabled: true,
-            legacy_grade: true,
             ..ColorizeRequest::default()
         })
         .unwrap();
@@ -4069,11 +4028,6 @@ mod tests {
             Some(state.default_style_path.as_path())
         );
         assert!(durable_request.preset_path.is_none());
-        assert!(durable_request.palette_path.is_none());
-        assert!(!durable_request.enable_ensemble);
-        assert!(durable_request.ensemble_model_paths.is_empty());
-        assert!(!durable_request.pyramid_enabled);
-        assert!(!durable_request.legacy_grade);
 
         let mut chapter_payload = serde_json::to_value(ChapterJobRequest {
             input_path: PathBuf::from("chapter.cbz"),
@@ -4089,10 +4043,6 @@ mod tests {
             safety_report_path: None,
             colorize_template: ColorizeRequest {
                 style_path: Some(PathBuf::from("chapter-style.yaml")),
-                palette_path: Some(PathBuf::from("chapter-palette.yaml")),
-                enable_ensemble: true,
-                pyramid_enabled: true,
-                legacy_grade: true,
                 ..ColorizeRequest::default()
             },
             import_options: ChapterImportOptions::default(),
@@ -4107,14 +4057,10 @@ mod tests {
             chapter_request.colorize_template.style_path.as_deref(),
             Some(state.default_style_path.as_path())
         );
-        assert!(chapter_request.colorize_template.palette_path.is_none());
-        assert!(!chapter_request.colorize_template.enable_ensemble);
-        assert!(!chapter_request.colorize_template.pyramid_enabled);
-        assert!(!chapter_request.colorize_template.legacy_grade);
     }
 
     #[test]
-    fn local_operator_engine_policy_preserves_explicit_research_settings() {
+    fn local_operator_engine_policy_is_also_single_mode() {
         let dir = tempfile::tempdir().unwrap();
         let explicit_style = dir.path().join("research-style.yaml");
         let state = ApiState {
@@ -4136,10 +4082,6 @@ mod tests {
         };
         let mut request = ColorizeRequest {
             style_path: Some(explicit_style.clone()),
-            palette_path: Some(dir.path().join("research-palette.yaml")),
-            enable_ensemble: true,
-            pyramid_enabled: true,
-            legacy_grade: true,
             ..ColorizeRequest::default()
         };
 
@@ -4147,12 +4089,8 @@ mod tests {
 
         assert_eq!(
             request.style_path.as_deref(),
-            Some(explicit_style.as_path())
+            Some(state.default_style_path.as_path())
         );
-        assert!(request.palette_path.is_some());
-        assert!(request.enable_ensemble);
-        assert!(request.pyramid_enabled);
-        assert!(request.legacy_grade);
 
         let mut defaulted_request = ColorizeRequest::default();
         apply_engine_defaults(&mut defaulted_request, &state).unwrap();
