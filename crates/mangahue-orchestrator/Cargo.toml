@@ -13,7 +13,6 @@ native-onnx = ["mangahue-inference/native-onnx"]
 anyhow.workspace = true
 base64.workspace = true
 image.workspace = true
-mangahue-agents = { path = "../mangahue-agents" }
 mangahue-brain = { path = "../mangahue-brain" }
 mangahue-config = { path = "../mangahue-config" }
 mangahue-core = { path = "../mangahue-core" }
@@ -29,7 +28,6 @@ mangahue-preprocess = { path = "../mangahue-preprocess" }
 mangahue-cache = { path = "../mangahue-cache" }
 mangahue-ensemble = { path = "../mangahue-ensemble" }
 mangahue-pyramid = { path = "../mangahue-pyramid" }
-mangahue-learning = { path = "../mangahue-learning" }
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true

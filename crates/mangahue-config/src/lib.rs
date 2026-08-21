@@ -922,6 +922,31 @@ mod tests {
     }
 
     #[test]
+    fn production_config_has_one_model_and_no_secondary_color_author() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/engine.default.yaml");
+        let config = EngineConfig::from_path(path).unwrap();
+
+        assert_eq!(
+            config.inference.model_path,
+            PathBuf::from("models/ddcolor-full-fp32.onnx")
+        );
+        assert_eq!(config.engine.parallel_jobs, 1);
+        assert!(!config.engine.pyramid_enabled);
+        assert!(!config.hints.user_hints_enabled);
+        assert!(!config.hints.character_memory_enabled);
+        assert!(!config.hints.style_hints_enabled);
+        assert!(!config.hints.region_style_hints_enabled);
+        assert!(!config.postprocess.palette_correction);
+        assert!(!config.postprocess.soft_coverage);
+        assert_eq!(config.postprocess.hint_chroma_strength, 0.0);
+        assert_eq!(config.postprocess.face_paint_strength, 0.0);
+        assert!(!config.postprocess.cel_shading_enabled);
+        assert!(!config.ensemble.enabled);
+        assert!(!config.pyramid.enabled);
+    }
+
+    #[test]
     fn loads_real_palette_files() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/palettes");
         for name in AUTO_PALETTES {

@@ -1437,25 +1437,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 
 [[package]]
-name = "mangahue-agents"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "image",
- "mangahue-brain",
- "mangahue-config",
- "mangahue-core",
- "mangahue-hints",
- "mangahue-intelligence",
- "mangahue-memory",
- "serde",
- "serde_json",
- "serde_yaml",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "mangahue-api"
 version = "0.1.0"
 dependencies = [
@@ -1665,6 +1646,7 @@ dependencies = [
  "ort",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
  "uuid",
@@ -1712,20 +1694,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mangahue-learning"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "mangahue-brain",
- "mangahue-intelligence",
- "mangahue-memory",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
 name = "mangahue-memory"
 version = "0.1.0"
 dependencies = [
@@ -1746,7 +1714,6 @@ dependencies = [
  "anyhow",
  "base64",
  "image",
- "mangahue-agents",
  "mangahue-brain",
  "mangahue-cache",
  "mangahue-config",
@@ -1758,7 +1725,6 @@ dependencies = [
  "mangahue-inference",
  "mangahue-intelligence",
  "mangahue-layout",
- "mangahue-learning",
  "mangahue-memory",
  "mangahue-postprocess",
  "mangahue-preprocess",
@@ -1843,6 +1809,7 @@ dependencies = [
  "clap",
  "image",
  "imageproc",
+ "mangahue-config",
  "mangahue-core",
  "mangahue-export",
  "mangahue-inference",

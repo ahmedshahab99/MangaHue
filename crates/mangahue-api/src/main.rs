@@ -36,7 +36,7 @@ struct Args {
     job_retention_hours: u64,
     #[arg(
         long,
-        default_value = "models/ddcolor-tiny-fp16.onnx",
+        default_value = "models/ddcolor-full-fp32.onnx",
         env = "MANGAHUE_DEFAULT_MODEL"
     )]
     default_model: PathBuf,

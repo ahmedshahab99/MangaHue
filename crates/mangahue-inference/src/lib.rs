@@ -2,8 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use image::{GrayImage, Rgb, RgbImage};
 use mangahue_core::{ColorRgb, EngineError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -167,6 +169,47 @@ pub fn is_ddcolor_onnx_model(path: impl AsRef<Path>) -> bool {
             .file_name()
             .and_then(|value| value.to_str())
             .is_some_and(|name| name.to_ascii_lowercase().contains("ddcolor"))
+}
+
+pub const PRODUCTION_DDCOLOR_FILE: &str = "ddcolor-full-fp32.onnx";
+pub const PRODUCTION_DDCOLOR_SHA256: &str =
+    "08e7ae0362faddb4411a4412b5e017624da77f72d085f13862ea50fa4715a7e4";
+
+/// Fail closed unless the configured model is the single licensed production
+/// artifact. This prevents a service override from silently switching the bot
+/// to a smaller experiment while the release itself remains unchanged.
+pub fn validate_production_ddcolor_model(path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    anyhow::ensure!(
+        path.is_file(),
+        "production model is missing: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        path.file_name().and_then(|name| name.to_str()) == Some(PRODUCTION_DDCOLOR_FILE),
+        "production model must be {PRODUCTION_DDCOLOR_FILE}, got {}",
+        path.display()
+    );
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open production model {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to hash production model {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    anyhow::ensure!(
+        actual == PRODUCTION_DDCOLOR_SHA256,
+        "production model checksum mismatch for {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub fn is_reference_cgan_model_dir(path: impl AsRef<Path>) -> bool {
@@ -1686,7 +1729,7 @@ fn resolve_onnx_runtime_library() -> String {
             let path = candidate.canonicalize().unwrap_or(candidate);
             let resolved = path.to_string_lossy().to_string();
             // Make ort (which honors ORT_DYLIB_PATH) load this exact file.
-            let _ = std::env::set_var("ORT_DYLIB_PATH", &resolved);
+            std::env::set_var("ORT_DYLIB_PATH", &resolved);
             return resolved;
         }
     }

@@ -24,16 +24,14 @@ RuntimeDirectoryMode=0700
 ExecStartPre=/usr/bin/install -d -m 0700 /run/mangahue-pro/jobs /run/mangahue-pro/tmp
 ExecStartPre=/usr/bin/test -s /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx
 ExecStartPre=/usr/bin/sha256sum -c /opt/MangaHue-current/configs/model-checksums/ddcolor-full-fp32.sha256
-ExecStartPre=/usr/bin/test -r /opt/MangaHue-current/configs/engine.telegram-pure-model-v2.yaml
+ExecStartPre=/usr/bin/test -r /opt/MangaHue-current/configs/engine.default.yaml
 ExecStartPre=/usr/bin/test -r /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml
-# Model-first purity tier: DDColor-FULL with the pure-model-v2 preset
-# (model chroma preserved — low confidence bars, exact gain, model regions
-# frozen against palette re-hueing, harmony gated to neutrals, face paint
-# yields to real skin) + soft_cel_anime_v2 style (de-warmed finishing) +
-# per-chapter palette feedback (each manga carries its own accent hues).
+# One pretrained model, one native Rust inference pass. The engine protects
+# ink/text/whites and removes artifacts but does not run palette agents,
+# ensembles, learning, or a Python colorization sidecar.
 # Rollback is an atomic symlink change: point /opt/MangaHue-current at a
 # previous directory under /opt/MangaHue-releases and restart this unit.
-ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 100 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 0 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.telegram-pure-model-v2.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --palette-feedback --cache-dir /var/lib/mangahue-pro/cache
+ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 2000 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 0 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.default.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --cache-dir /var/lib/mangahue-pro/cache
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=30

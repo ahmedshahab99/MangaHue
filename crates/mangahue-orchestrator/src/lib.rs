@@ -72,8 +72,9 @@ pub struct ColorizeRequest {
     /// Optional durable structure graph used by the correction editor/API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structure_graph_output_path: Option<PathBuf>,
-    /// Canonical chapter palette memory (locked roles) enforced by the
-    /// multi-agent deliberation before inference.
+    /// Reserved for backward-compatible chapter manifests. Production
+    /// colorization does not run a second color-authoring system before the
+    /// pretrained model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub palette_memory_path: Option<PathBuf>,
     /// Minimum accepted canonical-color identity score (0..1).
@@ -200,9 +201,55 @@ pub struct PageInspection {
 #[derive(Debug, Default)]
 pub struct MangaHueEngine;
 
+/// One delivery policy shared by Telegram, chapter jobs, the HTTP API, and
+/// durable workers. Keeping it here prevents one surface from accepting a
+/// `needs_*` page that another surface correctly withholds.
+pub fn delivery_quality_approved(report: &ProcessingReport) -> bool {
+    let production_ready = report
+        .director_verdict
+        .as_deref()
+        .is_some_and(|verdict| verdict.starts_with("production_ready"));
+    let inference_completed = report.stage_reports.iter().any(|stage| {
+        stage.name == "inference"
+            && stage
+                .metrics
+                .get("tiles_completed")
+                .is_some_and(|tiles| *tiles >= 1.0)
+    });
+    let coverage_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_coverage"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    let transformation_passed = report.stage_reports.iter().any(|stage| {
+        stage.name == "colorization_transform"
+            && stage
+                .metrics
+                .get("passed")
+                .is_some_and(|passed| *passed >= 1.0)
+    });
+    production_ready && inference_completed && coverage_passed && transformation_passed
+}
+
 impl MangaHueEngine {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn colorize_for_delivery(&self, request: ColorizeRequest) -> Result<ColorizeResult> {
+        let result = self.colorize(request)?;
+        if delivery_quality_approved(&result.report) {
+            return Ok(result);
+        }
+        let verdict = result
+            .report
+            .director_verdict
+            .clone()
+            .unwrap_or_else(|| "missing_quality_verdict".to_string());
+        let _ = fs::remove_file(&result.output_path);
+        anyhow::bail!("delivery quality gate rejected result: {verdict}")
     }
 
     pub fn colorize(&self, request: ColorizeRequest) -> Result<ColorizeResult> {
@@ -487,35 +534,37 @@ impl MangaHueEngine {
                             // back to natural defaults instead of reading an
                             // arbitrary hue (e.g. slot 2 is BLUE in the
                             // 3-color default style).
-                            let palette_slots_ok = style.palette.len() >= 9;
-                            let skin = if palette_slots_ok {
-                                style.palette.get(2).map(|c| [c.r, c.g, c.b])
-                            } else {
-                                None
-                            }
-                            .unwrap_or([242, 208, 182]);
-                            let hair = if palette_slots_ok {
-                                style.palette.get(6).map(|c| [c.r, c.g, c.b])
-                            } else {
-                                None
-                            }
-                            .unwrap_or([38, 28, 34]);
-                            let eyes = [46, 40, 54];
-                            let face_painted = rasterize_face_hints(
-                                &mut hints.hint_map,
-                                &mut hints.hint_mask,
-                                &face_boxes,
-                                skin,
-                                hair,
-                                eyes,
-                            );
-                            if face_painted > 0 {
-                                hints.notes.push(format!(
-                                    "face-driven hints painted {face_painted} pixels across {} face(s)",
-                                    face_boxes.len()
-                                ));
-                                hints.applied_hints += 1;
-                                hints.region_style_hints_applied += 1;
+                            if config.hints.region_style_hints_enabled {
+                                let palette_slots_ok = style.palette.len() >= 9;
+                                let skin = if palette_slots_ok {
+                                    style.palette.get(2).map(|c| [c.r, c.g, c.b])
+                                } else {
+                                    None
+                                }
+                                .unwrap_or([242, 208, 182]);
+                                let hair = if palette_slots_ok {
+                                    style.palette.get(6).map(|c| [c.r, c.g, c.b])
+                                } else {
+                                    None
+                                }
+                                .unwrap_or([38, 28, 34]);
+                                let eyes = [46, 40, 54];
+                                let face_painted = rasterize_face_hints(
+                                    &mut hints.hint_map,
+                                    &mut hints.hint_mask,
+                                    &face_boxes,
+                                    skin,
+                                    hair,
+                                    eyes,
+                                );
+                                if face_painted > 0 {
+                                    hints.notes.push(format!(
+                                        "face-driven hints painted {face_painted} pixels across {} face(s)",
+                                        face_boxes.len()
+                                    ));
+                                    hints.applied_hints += 1;
+                                    hints.region_style_hints_applied += 1;
+                                }
                             }
                         }
                         Ok(_) => {}
@@ -569,16 +618,8 @@ impl MangaHueEngine {
             report.debug_files.push(path);
         }
 
-        // The multi-agent deliberation is a first-class pipeline stage: the
-        // structure graph is built whenever agents are enabled so they can
-        // reason over real page geometry.
-        let agent_config = mangahue_agents::AgentSystemConfig::default();
-
         let structure_graph =
-            if color_bible.is_some()
-                || request.structure_graph_output_path.is_some()
-                || agent_config.enabled
-            {
+            if color_bible.is_some() || request.structure_graph_output_path.is_some() {
                 let graph = build_structure_graph(
                     request.series_id.clone(),
                     request.chapter_id.clone(),
@@ -710,104 +751,6 @@ impl MangaHueEngine {
                 )?;
             }
         }
-
-        // Multi-Agent Deliberation: agents analyze the page and produce a ColorPlan
-        // that enriches hints before inference. This adds deliberation without
-        // changing the model's input contract.
-        let agent_start = Instant::now();
-        if agent_config.enabled {
-            // Palette memory: canonical chapter colors learned from previous
-            // pages. When a book is supplied, agents enforce its locked roles.
-            let palette_memory_entries = request
-                .palette_memory_path
-                .as_deref()
-                .map(|path| mangahue_brain::load_palette_memory(path))
-                .transpose()?
-                .map(|book| book.entries)
-                .unwrap_or_default();
-
-            let agent_system = mangahue_agents::AgentSystem::new(agent_config);
-            let page_context = mangahue_agents::PageContext {
-                page_id: request
-                    .page_id
-                    .clone()
-                    .unwrap_or_else(|| manga_image.info.id.clone()),
-                input_path: request.input_path.clone(),
-                width: size.width,
-                height: size.height,
-                structure_graph: structure_graph
-                    .clone()
-                    .unwrap_or_else(|| {
-                        // Build a minimal structure graph if none exists
-                        mangahue_intelligence::StructureGraph {
-                            schema_version: 1,
-                            series_id: request.series_id.clone(),
-                            chapter_id: request.chapter_id.clone(),
-                            page_id: request
-                                .page_id
-                                .clone()
-                                .unwrap_or_else(|| manga_image.info.id.clone()),
-                            input_path: request.input_path.clone(),
-                            size,
-                            lighting: scene.lighting.label().to_string(),
-                            nodes: Vec::new(),
-                            edges: Vec::new(),
-                        }
-                    }),
-                color_bible: color_bible.clone(),
-                // The scene-adapted palette already carries the chapter
-                // accents (palette feedback) and scene re-weighting; the
-                // director reads its documented slots.
-                style_palette: scene_style.palette.clone(),
-                grayscale: preprocess.original_grayscale.clone(),
-                palette_memory: palette_memory_entries,
-                previous_page_colors: Vec::new(),
-            };
-
-            match agent_system.deliberate(page_context) {
-                Ok(color_plan) => {
-                    // Bind the plan to real page geometry and paint the exact
-                    // regions through the engine's tested lock rasterizer.
-                    let agent_lock_file = color_plan.to_region_lock_file();
-                    let agent_lock_raster = rasterize_region_locks(&agent_lock_file, size)?;
-                    let lock_report = apply_region_locks_to_hints(
-                        &mut hints.hint_map,
-                        &mut hints.hint_mask,
-                        &agent_lock_raster,
-                    );
-                    report.warn(format!(
-                        "agent deliberation: {} adjustments, {} painted pixels, scene={}/{}, confidence={:.2}",
-                        color_plan.hint_adjustments.len(),
-                        lock_report.colorized_pixels,
-                        color_plan.scene.time_of_day,
-                        color_plan.scene.mood,
-                        color_plan.confidence
-                    ));
-                    report.add_stage_report(
-                        StageReport::new("agent_deliberation")
-                            .metric(
-                                "adjustments",
-                                color_plan.hint_adjustments.len() as f64,
-                            )
-                            .metric("painted_pixels", lock_report.colorized_pixels as f64)
-                            .metric("confidence", color_plan.confidence as f64)
-                            .note(format!("mood={}", color_plan.scene.mood))
-                            .note(format!("time_of_day={}", color_plan.scene.time_of_day))
-                            .note(format!("lighting={}", color_plan.scene.lighting))
-                            .note(format!("palette_bias={}", color_plan.scene.palette_bias)),
-                    );
-                    if let Some(debug_dir) = request.debug_dir.as_deref() {
-                        save_rgb(&debug_dir.join("agent_color_map.png"), &agent_lock_raster.color_map)?;
-                        save_gray(&debug_dir.join("agent_color_mask.png"), &agent_lock_raster.color_mask)?;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "agent deliberation failed, continuing without");
-                    report.warn(format!("agent deliberation failed: {err:#}"));
-                }
-            }
-        }
-        report.agent_ms = agent_start.elapsed().as_millis();
 
         let inference_start = Instant::now();
         let parallel_jobs = resolve_parallel_jobs(config.engine.parallel_jobs);
@@ -1331,87 +1274,19 @@ impl MangaHueEngine {
             ));
         }
 
-        // If the model/postprocess result still reads as grayscale, run one
-        // automatic palette-directed recovery on the bounded working canvas
-        // (the production preset caps it at 1024 px). This avoids the huge
-        // allocations and multi-billion-neighbor pass that a full-resolution
-        // recovery would cause on the low-memory VPS. It is an internal
-        // repair stage, not a user-selectable colorization mode.
+        // The pretrained model is the only color author. If its result still
+        // reads as grayscale, record that fact and fail the delivery gate
+        // later. Do not hide a weak model result behind invented palette fill.
         let (working_before_sat, working_before_fraction, working_before_colorfulness) =
             measure_colorization_evidence(&final_image);
-        let mut recovery_attempted = false;
-        let mut recovery_selected = false;
-        let mut recovery_palette_pixels = 0u64;
-        let mut recovery_region_pixels = 0u64;
-        if !colorization_evidence_passes(
-            working_before_sat,
-            working_before_fraction,
-            working_before_colorfulness,
-        ) {
-            recovery_attempted = true;
-            let mut recovery_config = config.postprocess.clone();
-            recovery_config.palette_correction = true;
-            recovery_config.model_first = false;
-            recovery_config.soft_coverage = true;
-            recovery_config.soft_strength = recovery_config.soft_strength.max(1.0);
-            recovery_config.soft_confidence = recovery_config.soft_confidence.max(0.95);
-            recovery_config.region_chroma_separation =
-                recovery_config.region_chroma_separation.max(36.0);
-            recovery_config.palette_harmony_strength =
-                recovery_config.palette_harmony_strength.max(0.35);
-            recovery_config.hint_chroma_strength = recovery_config.hint_chroma_strength.max(0.65);
-            let (mut candidate, recovery_report) = finalize(PostprocessInput {
-                colorized: final_image.clone(),
-                original_grayscale: &preprocess.original_grayscale,
-                line_mask: &preprocess.line_mask,
-                bubble_mask: &bubble_mask,
-                tone_mask: Some(&preprocess.tone_mask),
-                protected_mask: Some(&preprocess.protected_mask),
-                face_mask: face_mask.as_ref(),
-                style: &scene_style,
-                config: &recovery_config,
-                reference_image: reference_image.as_ref(),
-                hint_map: Some(&hints.hint_map),
-                hint_mask: Some(&hints.hint_mask),
-                chroma_signal,
-            })?;
-            recovery_palette_pixels = recovery_report.palette_fill_pixels;
-            recovery_region_pixels = recovery_report.region_pixels_rendered;
-            if let Some(raster) = &color_bible_lock_raster {
-                enforce_region_locks(
-                    &mut candidate,
-                    &preprocess.original_grayscale,
-                    &preprocess.line_mask,
-                    raster,
-                );
-            }
-            if let Some(raster) = &region_lock_raster {
-                enforce_region_locks(
-                    &mut candidate,
-                    &preprocess.original_grayscale,
-                    &preprocess.line_mask,
-                    raster,
-                );
-            }
-            let candidate_evidence = measure_colorization_evidence(&candidate);
-            if colorization_evidence_passes(
-                candidate_evidence.0,
-                candidate_evidence.1,
-                candidate_evidence.2,
-            ) || candidate_evidence.2 > working_before_colorfulness
-            {
-                final_image = candidate;
-                recovery_selected = true;
-            }
-        }
         let (working_after_sat, working_after_fraction, working_after_colorfulness) =
             measure_colorization_evidence(&final_image);
         report.add_stage_report(
             StageReport::new("colorization_recovery")
-                .metric("attempted", if recovery_attempted { 1.0 } else { 0.0 })
-                .metric("selected", if recovery_selected { 1.0 } else { 0.0 })
-                .metric("palette_fill_pixels", recovery_palette_pixels as f64)
-                .metric("region_pixels_rendered", recovery_region_pixels as f64)
+                .metric("attempted", 0.0)
+                .metric("selected", 0.0)
+                .metric("palette_fill_pixels", 0.0)
+                .metric("region_pixels_rendered", 0.0)
                 .metric("before_mean_saturation", working_before_sat as f64)
                 .metric("before_colored_fraction", working_before_fraction as f64)
                 .metric("before_colorfulness", working_before_colorfulness as f64)

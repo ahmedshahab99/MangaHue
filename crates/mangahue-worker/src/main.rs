@@ -140,7 +140,7 @@ fn execute_job(
                     progress_value.store(update.percent.to_bits(), Ordering::Release);
                 }
             });
-            let result = MangaHueEngine::new().colorize(request)?;
+            let result = MangaHueEngine::new().colorize_for_delivery(request)?;
             let _ = progress_thread.join();
             let artifact = store_output(
                 objects,
