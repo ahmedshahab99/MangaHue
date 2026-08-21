@@ -174,11 +174,6 @@ struct ColorizeArgs {
     model: Option<PathBuf>,
     #[arg(long, help = "Approved colored style or character reference image")]
     reference_image: Option<PathBuf>,
-    #[arg(
-        long = "ensemble-model",
-        help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
-    )]
-    ensemble_models: Vec<PathBuf>,
     #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -195,32 +190,8 @@ struct ColorizeArgs {
     characters: Vec<String>,
     #[arg(long)]
     debug: Option<PathBuf>,
-    #[arg(long, help = "Use deterministic preview backend for tests and demos")]
-    mock: bool,
-    #[arg(long, help = "Enable multi-resolution pyramid inference")]
-    pyramid: bool,
     #[arg(long, help = "Propagate user hints to similar line-art regions")]
     hint_propagate: bool,
-    #[arg(
-        long,
-        help = "Force the legacy four-pass grading cascade (A/B benchmark)"
-    )]
-    legacy: bool,
-    #[arg(
-        long = "palette",
-        help = "Artist palette file (configs/palettes/*.yaml) overriding the style palette"
-    )]
-    palette: Option<PathBuf>,
-    #[arg(
-        long = "auto-palette",
-        help = "Automatically select the artist palette matching the page fingerprint"
-    )]
-    auto_palette: bool,
-    #[arg(
-        long = "from-draft",
-        help = "Client-side draft: skip model inference and finish this colorized draft with the full postprocess"
-    )]
-    from_draft: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -249,8 +220,6 @@ struct BatchArgs {
     style: Option<PathBuf>,
     #[arg(long)]
     project: Option<PathBuf>,
-    #[arg(long)]
-    mock: bool,
     #[arg(long)]
     report: Option<PathBuf>,
     #[arg(
@@ -350,11 +319,6 @@ struct LinkColorizeArgs {
     model: Option<PathBuf>,
     #[arg(long, help = "Approved colored style or character reference image")]
     reference_image: Option<PathBuf>,
-    #[arg(
-        long = "ensemble-model",
-        help = "Auxiliary color model; repeat to enable structure-preserving chroma fusion"
-    )]
-    ensemble_models: Vec<PathBuf>,
     #[arg(long, default_value = "configs/engine.default.yaml")]
     config: Option<PathBuf>,
     #[arg(long)]
@@ -369,8 +333,6 @@ struct LinkColorizeArgs {
     hints: Option<PathBuf>,
     #[arg(long)]
     debug: Option<PathBuf>,
-    #[arg(long)]
-    mock: bool,
     #[arg(long)]
     user_agent: Option<String>,
     #[arg(long)]
@@ -457,8 +419,6 @@ struct ChapterColorizeArgs {
     project: Option<PathBuf>,
     #[arg(long = "region-locks")]
     region_locks: Option<PathBuf>,
-    #[arg(long)]
-    mock: bool,
     #[arg(long)]
     report: Option<PathBuf>,
     #[arg(long, short = 'j')]
@@ -799,8 +759,6 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         output_path: args.output,
         model_path: args.model,
         reference_image_path: args.reference_image,
-        enable_ensemble: !args.ensemble_models.is_empty(),
-        ensemble_model_paths: args.ensemble_models,
         config_path: args.config,
         preset_path: args.preset,
         style_path: args.style,
@@ -809,13 +767,7 @@ fn run_colorize(args: ColorizeArgs, force_debug: bool) -> Result<()> {
         user_hints_path: args.hints,
         region_locks_path: args.region_locks,
         debug_dir,
-        use_mock_backend: args.mock,
-        pyramid_enabled: args.pyramid,
         hint_propagation_enabled: args.hint_propagate,
-        palette_path: args.palette,
-        auto_palette: args.auto_palette,
-        draft_path: args.from_draft,
-        legacy_grade: args.legacy,
         ..ColorizeRequest::default()
     })?;
 
@@ -923,7 +875,6 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
     let style_path = Arc::new(args.style.clone());
     let project_path = Arc::new(args.project.clone());
     let output_dir = Arc::new(args.output.clone());
-    let use_mock = args.mock;
     let hint_propagate = args.hint_propagate;
 
     let started_at = Utc::now().to_rfc3339();
@@ -971,7 +922,6 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
                 &preset_path,
                 &style_path,
                 &project_path,
-                use_mock,
                 hint_propagate,
             );
             serial.push(summary);
@@ -996,7 +946,6 @@ fn run_batch(args: BatchArgs, benchmark: bool) -> Result<()> {
                         &preset_path,
                         &style_path,
                         &project_path,
-                        use_mock,
                         hint_propagate,
                     )
                 })
@@ -1071,7 +1020,6 @@ fn process_one_page(
     preset_path: &Arc<Option<PathBuf>>,
     style_path: &Arc<Option<PathBuf>>,
     project_path: &Arc<Option<PathBuf>>,
-    use_mock: bool,
     hint_propagate: bool,
 ) -> BatchPageSummary {
     let file_name = input.file_name().unwrap_or_default();
@@ -1091,7 +1039,6 @@ fn process_one_page(
         preset_path: preset_path.as_ref().clone(),
         style_path: style_path.as_ref().clone(),
         project_path: project_path.as_ref().clone(),
-        use_mock_backend: use_mock,
         hint_propagation_enabled: hint_propagate,
         ..ColorizeRequest::default()
     });
@@ -1390,8 +1337,6 @@ fn run_link_colorize(args: LinkColorizeArgs) -> Result<()> {
             output_path: output.clone(),
             model_path: args.model.clone(),
             reference_image_path: args.reference_image.clone(),
-            enable_ensemble: !args.ensemble_models.is_empty(),
-            ensemble_model_paths: args.ensemble_models.clone(),
             config_path: args.config.clone(),
             preset_path: args.preset.clone(),
             style_path: args.style.clone(),
@@ -1399,7 +1344,6 @@ fn run_link_colorize(args: LinkColorizeArgs) -> Result<()> {
             user_hints_path: args.hints.clone(),
             region_locks_path: args.region_locks.clone(),
             debug_dir,
-            use_mock_backend: args.mock,
             ..ColorizeRequest::default()
         });
         match result {
@@ -1543,7 +1487,6 @@ fn run_chapter_colorize(args: ChapterColorizeArgs) -> Result<()> {
             style_path: args.style,
             project_path: args.project,
             region_locks_path: args.region_locks,
-            use_mock_backend: args.mock,
             ..ColorizeRequest::default()
         },
         import_options: ChapterImportOptions {

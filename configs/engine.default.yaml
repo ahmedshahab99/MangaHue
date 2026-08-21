@@ -6,7 +6,6 @@ engine:
   save_debug_outputs: false
   reading_direction: right_to_left
   parallel_jobs: 1
-  pyramid_enabled: false
   hint_propagation_enabled: false
 
 preprocess:
@@ -98,16 +97,3 @@ eval:
   protected_region_block_threshold: 0.65
   hint_adherence_threshold: 0.0
   screen_tone_warning_threshold: 0.18
-
-ensemble:
-  enabled: false
-  strategy: chroma_complement
-  primary_weight: 1.0
-  parallel_variants: false
-  divergence_reject_threshold: 0.5
-  cielab_distance: false
-
-pyramid:
-  enabled: false
-  levels: [512]
-  blend_weights: [1.0]

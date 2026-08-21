@@ -661,14 +661,6 @@ fn validate_production_assets(args: &Args) -> Result<()> {
         "production config selects a non-canonical model"
     );
     anyhow::ensure!(
-        !config.engine.pyramid_enabled,
-        "production pyramid must be disabled"
-    );
-    anyhow::ensure!(
-        !config.ensemble.enabled,
-        "production ensemble must be disabled"
-    );
-    anyhow::ensure!(
         !config.hints.user_hints_enabled
             && !config.hints.character_memory_enabled
             && !config.hints.style_hints_enabled
@@ -1918,13 +1910,9 @@ fn handle_photo(
         output_path: output_path.clone(),
         model_path: Some(args.model.clone()),
         reference_image_path: reference_image,
-        enable_ensemble: false,
-        ensemble_model_paths: Vec::new(),
-        config_path: None,
         preset_path: Some(args.preset.clone()),
         style_path: style_path.clone(),
         project_path: args.project.clone(),
-        region_locks_path: None,
         series_id: Some(image_series_id.clone()),
         chapter_id: Some(image_chapter_id.clone()),
         page_id: Some(image_page_id.clone()),
@@ -1932,11 +1920,6 @@ fn handle_photo(
         structure_graph_output_path: Some(image_structure_graph_path.clone()),
         color_bible_consistency_threshold: Some(0.62),
         user_hints_path: resolve_user_hints(args, chat_id, "image"),
-        use_mock_backend: false,
-        pyramid_enabled: false,
-        hint_propagation_enabled: false,
-        palette_path: None,
-        auto_palette: false,
         cache_dir: args.cache_dir.clone(),
         cancel_token: Some(Arc::clone(&cancel_token)),
         progress_sender: Some(progress_sender),
@@ -2865,9 +2848,6 @@ fn handle_link(
                 output_path: output_path.clone(),
                 model_path: Some(args.model.clone()),
                 reference_image_path: reference_image.clone(),
-                enable_ensemble: false,
-                ensemble_model_paths: Vec::new(),
-                config_path: None,
                 preset_path: Some(args.preset.clone()),
                 style_path: style_path.clone(),
                 project_path: args.project.clone(),
@@ -2879,12 +2859,6 @@ fn handle_link(
                 structure_graph_output_path: Some(structure_graph_path.clone()),
                 color_bible_consistency_threshold: Some(0.62),
                 user_hints_path: resolve_user_hints(args, chat_id, stem),
-                use_mock_backend: false,
-                pyramid_enabled: false,
-                hint_propagation_enabled: false,
-                palette_path: None,
-                auto_palette: false,
-                palette_override: None,
                 cache_dir: args.cache_dir.clone(),
                 cancel_token: Some(Arc::clone(&cancel_token)),
                 progress_sender: Some(progress_sender.clone()),

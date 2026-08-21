@@ -16,7 +16,7 @@ Production is one Rust service, one pretrained model, and one immutable Git rele
 - Daily quota: disabled
 - User-image retention: 24 hours
 
-The Telegram binary validates the model filename and checksum at startup. The production config disables ensemble inference, pyramid inference, palette color authoring, agent deliberation, hint color authoring, learning, and cel-shading modes. Rust preprocessing and postprocessing remain because they protect ink, text, speech-bubble whites, and remove chroma artifacts.
+The Telegram binary validates the model filename and checksum at startup. Ensemble, pyramid, alternate-model, palette-authoring, agent, learning, and client-draft paths are absent from the production engine. Rust preprocessing and postprocessing remain because they protect ink, text, speech-bubble whites, and remove chroma artifacts.
 
 ## Release flow
 

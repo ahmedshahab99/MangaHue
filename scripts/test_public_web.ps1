@@ -8,7 +8,6 @@ $RunId = [guid]::NewGuid().ToString("N")
 $TestRoot = Join-Path $Root ".mangahue\public-e2e\$RunId"
 $JobsDir = Join-Path $TestRoot "jobs"
 $Database = Join-Path $TestRoot "production.db"
-$Runtime = Join-Path $Root ".mangahue\python-runtime\Scripts\python.exe"
 $Sample = Join-Path $Root "examples\input\smoke_page.png"
 $BaseUrl = "http://127.0.0.1:$Port"
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $Root "target" }
@@ -38,7 +37,6 @@ function Wait-ForHealth {
 }
 
 New-Item -ItemType Directory -Force $TestRoot | Out-Null
-if (-not (Test-Path $Runtime)) { throw "Run scripts/dev_web.ps1 once to prepare the local inference runtime" }
 if (-not (Test-Path $Sample)) { throw "Missing integration sample: $Sample" }
 if (-not (Test-Path $BuiltApi)) {
   & cargo +stable-x86_64-pc-windows-gnu build -q -p mangahue-api
@@ -50,9 +48,6 @@ Push-Location $Root
 try {
   $tokenOne = Get-BootstrapToken "artist-one-$RunId@example.invalid" "Artist One"
   $tokenTwo = Get-BootstrapToken "artist-two-$RunId@example.invalid" "Artist Two"
-  $env:MANGAHUE_PYTHON = $Runtime
-  $env:PYTHONPATH = Join-Path $Root "python"
-
   $arguments = @(
     "--addr", "127.0.0.1:$Port",
     "--jobs-dir", $JobsDir,
@@ -95,13 +90,7 @@ try {
     user_hints_path = $null
     debug_dir = $null
     use_mock_backend = $true
-    ensemble_model_paths = @()
-    enable_ensemble = $false
-    pyramid_enabled = $true
     hint_propagation_enabled = $true
-    palette_path = $null
-    auto_palette = $true
-    draft_path = $null
   }
   $job = Invoke-RestMethod "$BaseUrl/api/colorize" -Method Post -Headers $headersOne `
     -ContentType "application/json" -Body (@{ request = $template; ads_token = $null } | ConvertTo-Json -Depth 8)
@@ -112,7 +101,7 @@ try {
     $job = Invoke-RestMethod "$BaseUrl/api/jobs/$($job.id)" -Headers $headersOne
   } while ($job.status -in @("queued", "running") -and (Get-Date) -lt $deadline)
   if ($job.status -ne "complete") { throw "Public job ended as $($job.status): $($job.error)" }
-  if ($job.result.report.model_path -notlike "*ddcolor-tiny-fp16.onnx") {
+  if ($job.result.report.model_path -notlike "*ddcolor-full-fp32.onnx") {
     throw "Server did not force the trusted default model"
   }
 
@@ -131,7 +120,7 @@ try {
   [pscustomobject]@{
     health = "ok"
     anonymous_rejected = $true
-    real_model = "ddcolor-tiny-fp16.onnx"
+    real_model = "ddcolor-full-fp32.onnx"
     job_status = $job.status
     cross_user_denied = $true
     result_bytes = (Get-Item $download).Length

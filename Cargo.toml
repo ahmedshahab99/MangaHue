@@ -16,8 +16,6 @@ members = [
   "crates/mangahue-chapter",
   "crates/mangahue-ingest",
   "crates/mangahue-telegram",
-  "crates/mangahue-ensemble",
-  "crates/mangahue-pyramid",
   "crates/mangahue-orchestrator",
   "crates/mangahue-cli",
   "crates/mangahue-api",

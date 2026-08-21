@@ -1,10 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use mangahue_core::{ColorRgb, StyleProfile};
+use mangahue_core::StyleProfile;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -20,8 +19,6 @@ pub struct EngineSection {
     pub save_debug_outputs: bool,
     pub reading_direction: ReadingDirection,
     pub parallel_jobs: usize,
-    #[serde(default)]
-    pub pyramid_enabled: bool,
     #[serde(default)]
     pub hint_propagation_enabled: bool,
 }
@@ -483,44 +480,6 @@ fn default_protected_region_block_threshold() -> f32 {
     0.45
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EnsembleStrategy {
-    MajorityWeighted,
-    AverageBlend,
-    DivergenceReject,
-    #[default]
-    ChromaComplement,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EnsembleSection {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_ensemble_strategy")]
-    pub strategy: EnsembleStrategy,
-    #[serde(default = "default_ensemble_weight_primary")]
-    pub primary_weight: f32,
-    #[serde(default)]
-    pub parallel_variants: bool,
-    #[serde(default = "default_ensemble_divergence_threshold")]
-    pub divergence_reject_threshold: f32,
-    #[serde(default)]
-    pub cielab_distance: bool,
-}
-
-fn default_ensemble_strategy() -> EnsembleStrategy {
-    EnsembleStrategy::ChromaComplement
-}
-
-fn default_ensemble_weight_primary() -> f32 {
-    1.0
-}
-
-fn default_ensemble_divergence_threshold() -> f32 {
-    0.5
-}
-
 impl Default for EvalSection {
     fn default() -> Self {
         Self {
@@ -535,34 +494,6 @@ impl Default for EvalSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PyramidSection {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_pyramid_levels")]
-    pub levels: Vec<u32>,
-    #[serde(default = "default_pyramid_weights")]
-    pub blend_weights: Vec<f32>,
-}
-
-fn default_pyramid_levels() -> Vec<u32> {
-    vec![512, 768]
-}
-
-fn default_pyramid_weights() -> Vec<f32> {
-    vec![0.35, 0.65]
-}
-
-impl Default for PyramidSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            levels: default_pyramid_levels(),
-            blend_weights: default_pyramid_weights(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub engine: EngineSection,
     pub preprocess: PreprocessSection,
@@ -572,10 +503,6 @@ pub struct EngineConfig {
     pub postprocess: PostprocessSection,
     pub output: OutputSection,
     pub eval: EvalSection,
-    #[serde(default)]
-    pub ensemble: EnsembleSection,
-    #[serde(default)]
-    pub pyramid: PyramidSection,
 }
 
 impl Default for EngineConfig {
@@ -587,7 +514,6 @@ impl Default for EngineConfig {
                 save_debug_outputs: false,
                 reading_direction: ReadingDirection::RightToLeft,
                 parallel_jobs: 0,
-                pyramid_enabled: false,
                 hint_propagation_enabled: false,
             },
             preprocess: PreprocessSection {
@@ -693,15 +619,6 @@ impl Default for EngineConfig {
                 write_intermediates: false,
             },
             eval: EvalSection::default(),
-            ensemble: EnsembleSection {
-                enabled: false,
-                strategy: default_ensemble_strategy(),
-                primary_weight: default_ensemble_weight_primary(),
-                parallel_variants: false,
-                divergence_reject_threshold: default_ensemble_divergence_threshold(),
-                cielab_distance: false,
-            },
-            pyramid: PyramidSection::default(),
         }
     }
 }
@@ -781,14 +698,6 @@ impl EngineConfig {
                 "hints.propagation_similarity_threshold must be in 0.0..=1.0"
             ));
         }
-        if !(0.1..=5.0).contains(&self.ensemble.primary_weight) {
-            return Err(anyhow!("ensemble.primary_weight must be in 0.1..=5.0"));
-        }
-        if !(0.1..=1.0).contains(&self.ensemble.divergence_reject_threshold) {
-            return Err(anyhow!(
-                "ensemble.divergence_reject_threshold must be in 0.1..=1.0"
-            ));
-        }
         Ok(())
     }
 }
@@ -799,63 +708,6 @@ pub fn load_style_profile(path: impl AsRef<Path>) -> Result<StyleProfile> {
         .with_context(|| format!("failed to read style profile {}", path.display()))?;
     serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse style profile {}", path.display()))
-}
-
-// ── Artist palette files (configs/palettes/*.yaml) ──────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaletteFile {
-    pub name: String,
-    pub colors: Vec<String>,
-}
-
-/// Load a palette YAML (e.g. configs/palettes/seinen.yaml) into colors.
-pub fn load_palette(path: impl AsRef<Path>) -> Result<Vec<ColorRgb>> {
-    let path = path.as_ref();
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("failed to read palette {}", path.display()))?;
-    let file: PaletteFile = serde_yaml::from_str(&text)
-        .with_context(|| format!("failed to parse palette {}", path.display()))?;
-    file.colors
-        .iter()
-        .map(|hex| {
-            ColorRgb::from_str(hex)
-                .map_err(|_| anyhow!("invalid palette color {hex} in {}", path.display()))
-        })
-        .collect()
-}
-
-/// The scene palettes eligible for automatic selection (skin_tones and
-/// hair_defaults are material palettes, not scene palettes).
-pub const AUTO_PALETTES: &[&str] = &["fantasy", "seinen", "shojo", "shonen", "webtoon"];
-
-/// Pick the artist palette that best fits the page's fingerprint.
-/// brightness: 0..1 mean luma; contrast: gray std-dev (0..~80).
-pub fn select_palette_name(brightness: f32, contrast: f32) -> &'static str {
-    // Each scene palette has a target profile (brightness, contrast).
-    let candidates: &[(&str, f32, f32)] = &[
-        ("seinen", 0.42, 55.0),  // dark, dramatic, muted
-        ("fantasy", 0.55, 45.0), // mid, saturated
-        ("shonen", 0.60, 60.0),  // mid-bright, punchy
-        ("shojo", 0.68, 35.0),   // bright, soft
-        ("webtoon", 0.72, 58.0), // bright, high contrast
-    ];
-    let mut best = "shonen";
-    let mut best_score = f32::MAX;
-    for (name, b_target, c_target) in candidates {
-        let score = (brightness - b_target).abs() * 3.0 + (contrast - c_target).abs() / 20.0;
-        if score < best_score {
-            best_score = score;
-            best = name;
-        }
-    }
-    best
-}
-
-/// Default palette directory (relative to the working directory, matching
-/// the repo layout used by the bot service).
-pub fn default_palettes_dir() -> PathBuf {
-    PathBuf::from("configs/palettes")
 }
 
 fn merge_yaml(base: &mut Value, overlay: Value) {
@@ -932,7 +784,6 @@ mod tests {
             PathBuf::from("models/ddcolor-full-fp32.onnx")
         );
         assert_eq!(config.engine.parallel_jobs, 1);
-        assert!(!config.engine.pyramid_enabled);
         assert!(!config.hints.user_hints_enabled);
         assert!(!config.hints.character_memory_enabled);
         assert!(!config.hints.style_hints_enabled);
@@ -942,27 +793,5 @@ mod tests {
         assert_eq!(config.postprocess.hint_chroma_strength, 0.0);
         assert_eq!(config.postprocess.face_paint_strength, 0.0);
         assert!(!config.postprocess.cel_shading_enabled);
-        assert!(!config.ensemble.enabled);
-        assert!(!config.pyramid.enabled);
-    }
-
-    #[test]
-    fn loads_real_palette_files() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../configs/palettes");
-        for name in AUTO_PALETTES {
-            let colors = load_palette(dir.join(format!("{name}.yaml"))).unwrap();
-            assert!(!colors.is_empty(), "{name} palette empty");
-            assert!(colors.len() <= 64, "{name} palette unexpectedly large");
-        }
-    }
-
-    #[test]
-    fn selects_palette_by_page_fingerprint() {
-        // Dark dramatic page -> seinen; bright soft page -> shojo.
-        assert_eq!(select_palette_name(0.40, 58.0), "seinen");
-        assert_eq!(select_palette_name(0.70, 30.0), "shojo");
-        assert_eq!(select_palette_name(0.60, 62.0), "shonen");
-        assert_eq!(select_palette_name(0.75, 60.0), "webtoon");
-        assert_eq!(select_palette_name(0.55, 45.0), "fantasy");
     }
 }
