@@ -22,7 +22,7 @@ cargo run -p mangahue-cli -- colorize .\examples\input\page.png --output .\examp
 cargo run -p mangahue-cli -- inspect .\examples\input\page.png --output .\examples\output\inspection.json --debug .\examples\output\inspect_debug
 ```
 
-Production uses exactly one pretrained artifact: `models/ddcolor-full-fp32.onnx` (DDColor Full, Apache-2.0), executed natively through ONNX Runtime. Its SHA-256 is pinned in code and in `configs/model-checksums/`; the bot refuses to start with a renamed or different model. Python is not in the production inference path.
+Production uses exactly one pretrained artifact: `models/ddcolor-full-fp32.onnx` (DDColor Full, Apache-2.0), executed natively through ONNX Runtime. Its SHA-256 is pinned in code and in `configs/model-checksums/`; the bot refuses to start with a renamed or different model. The runtime and colorization pipeline are Rust-only.
 
 ## CLI
 
@@ -34,8 +34,6 @@ mangahue benchmark pages --output colored --model models/ddcolor-full-fp32.onnx 
 mangahue correction add --project projects/my_manga/project.json --page page_001 --x 100 --y 200 --width 80 --height 120 --label hair --old "#5a4632" --new "#111111" --character hero
 mangahue project export-corrections --project projects/my_manga/project.json --output training/corrections.jsonl
 mangahue styles list --dir configs/styles
-mangahue model validate --metadata models/model.mangahue.json
-mangahue model validate-onnx --model models/model.onnx --metadata models/model.mangahue.json
 mangahue serve --addr 127.0.0.1:7878
 mangahue preprocess input.png --output clean.png
 mangahue make-hints input.png --hints hints.json --output-map hint_map.png --output-mask hint_mask.png
@@ -51,13 +49,6 @@ mangahue character create --project projects/my_manga --name Hero --hair "#11111
 ## Philosophy
 
 The pretrained model creates the color. Rust prepares and protects the page, removes artifacts, verifies the result, and delivers it only when the release gates pass.
-
-## CPU Reference-Grade Roadmap
-
-The implementation plan for a 6 GB RAM CPU server, including pretrained-model
-admission gates, reference guidance, semantic region graphs, material rendering,
-quality targets, and the July 29 execution order, is documented in
-[`docs/15_cpu_reference_grade_plan.md`](docs/15_cpu_reference_grade_plan.md).
 
 ## Studio
 

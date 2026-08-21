@@ -7,7 +7,6 @@ services:
       - "${API_PORT:-7878}:7878"
     environment:
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
-      MANGAHUE_PYTHON: ${MANGAHUE_PYTHON:-python}
       ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
     volumes:
       - mangahue-data:/data
@@ -52,7 +51,6 @@ services:
       - "--no-telemetry"
     environment:
       RUST_LOG: ${RUST_LOG:-mangahue=info,tower_http=info}
-      MANGAHUE_PYTHON: ${MANGAHUE_PYTHON:-python}
       MANGAHUE_MODEL_THREADS: ${MANGAHUE_MODEL_THREADS:-2}
       MANGAHUE_MODEL_TIMEOUT_SECONDS: ${MANGAHUE_MODEL_TIMEOUT_SECONDS:-180}
     volumes:

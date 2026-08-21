@@ -6,7 +6,6 @@ Core verification commands:
 cargo fmt --all
 cargo test
 cargo clippy --all-targets -- -D warnings
-python -m compileall python\mangahue_train
 ```
 
 CLI smoke checks:
@@ -16,12 +15,6 @@ cargo run -p mangahue-cli -- inspect examples\input\smoke_page.png --output exam
 cargo run -p mangahue-cli -- colorize examples\input\smoke_page.png --output examples\output\smoke_colored.png --model models\ddcolor-full-fp32.onnx --debug examples\output\smoke_debug
 cargo run -p mangahue-cli -- benchmark examples\input --output examples\output\benchmark --model models\ddcolor-full-fp32.onnx --report examples\output\benchmark.json
 cargo run -p mangahue-cli -- styles list --dir configs\styles
-```
-
-Model contract check:
-
-```powershell
-cargo run -p mangahue-cli -- model validate --metadata models\model.mangahue.json
 ```
 
 Production ONNX runtime check:

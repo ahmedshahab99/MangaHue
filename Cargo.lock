@@ -1635,7 +1635,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "tracing",
- "uuid",
 ]
 
 [[package]]

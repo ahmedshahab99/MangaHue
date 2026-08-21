@@ -17,7 +17,6 @@ use mangahue_image::{
     collect_image_paths, export_chapter_archive, import_chapter_to_dir, is_supported_image_path,
     load_image, save_gray, save_rgb, write_chapter_manifest, ChapterImportOptions,
 };
-use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestRequest};
 use mangahue_memory::{
     add_correction, create_character, create_project_directory, export_correction_hints,
@@ -91,10 +90,6 @@ enum Commands {
     Palette {
         #[command(subcommand)]
         command: PaletteCommand,
-    },
-    Model {
-        #[command(subcommand)]
-        command: ModelCommand,
     },
     Benchmark(BatchArgs),
     Serve(ServeArgs),
@@ -273,14 +268,12 @@ struct DoctorArgs {
     config: PathBuf,
     #[arg(long, default_value = "configs/styles")]
     styles_dir: PathBuf,
-    #[arg(long, default_value = "models/model.mangahue.json")]
-    metadata: PathBuf,
+    #[arg(long, default_value = "models/ddcolor-full-fp32.onnx")]
+    model: PathBuf,
     #[arg(long, default_value = ".mangahue/jobs")]
     jobs_dir: PathBuf,
     #[arg(long, default_value = "examples/input/smoke_page.png")]
     sample_input: PathBuf,
-    #[arg(long)]
-    python: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -571,20 +564,6 @@ struct CorrectionAddArgs {
     character: Option<String>,
 }
 
-#[derive(Debug, Subcommand)]
-enum ModelCommand {
-    Validate {
-        #[arg(long)]
-        metadata: PathBuf,
-    },
-    ValidateOnnx {
-        #[arg(long)]
-        model: PathBuf,
-        #[arg(long)]
-        metadata: PathBuf,
-    },
-}
-
 #[derive(Debug, Args)]
 struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:7878")]
@@ -671,7 +650,6 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Commands::Model { command } => run_model(command),
         Commands::Serve(args) => run_serve(args),
         Commands::Platform(args) => run_platform(args),
         Commands::Score(args) => run_score(args),
@@ -1244,13 +1222,9 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     let report = run_doctor_report(DoctorRequest {
         config_path: args.config,
         styles_dir: args.styles_dir,
-        metadata_path: args.metadata,
+        model_path: args.model,
         jobs_dir: args.jobs_dir,
         sample_input: args.sample_input,
-        python: args
-            .python
-            .or_else(|| std::env::var("MANGAHUE_PYTHON").ok())
-            .unwrap_or_else(|| "python".to_string()),
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1722,34 +1696,6 @@ fn run_brain(command: BrainCommand) -> Result<()> {
                 raster.applied_locks,
                 raster.active_pixels,
                 args.output.display()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn run_model(command: ModelCommand) -> Result<()> {
-    match command {
-        ModelCommand::Validate { metadata } => {
-            let metadata = ModelMetadata::load(metadata)?;
-            println!(
-                "model metadata ok: {} v{} ({}, {} input channels)",
-                metadata.model_name, metadata.version, metadata.model_type, metadata.input_channels
-            );
-        }
-        ModelCommand::ValidateOnnx { model, metadata } => {
-            let backend = mangahue_inference::RustOnnxBackend::new(&model, &metadata)
-                .with_context(|| {
-                    format!(
-                        "ONNX validation failed for {}; ensure it is a valid ONNX file and the metadata path is correct",
-                        model.display()
-                    )
-                })?;
-            println!(
-                "ONNX model valid: {}\n  input:  {}\n  output: {}",
-                model.display(),
-                backend.input_name(),
-                backend.output_name()
             );
         }
     }

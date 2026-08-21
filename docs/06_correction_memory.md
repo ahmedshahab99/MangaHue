@@ -45,6 +45,6 @@ cargo run -p mangahue-cli -- project export-training-manifest `
   --output training/manifest.corrections.json
 ```
 
-The manifest uses the Python dataset contract: each row contains `lineart`, `color`, and `hints`. Pages without matching line art or target color files are reported instead of silently included.
+The correction export is a portable JSONL archive: each row contains `lineart`, `color`, and `hints`. Pages without matching line art or target color files are reported instead of silently included.
 
 This creates an active-learning trail: user correction -> project memory -> character consistency -> hint export -> future fine-tuning data.

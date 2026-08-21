@@ -24,7 +24,6 @@ use mangahue_image::{
     export_chapter_archive, import_chapter_to_dir, load_image, save_gray, save_rgb,
     write_chapter_manifest, ChapterImportOptions, ChapterManifest,
 };
-use mangahue_inference::ModelMetadata;
 use mangahue_ingest::{ingest_url, IngestReport, IngestRequest};
 use mangahue_intelligence::{
     analyze_semantics, character_observations, curate_dataset, plan_correction_impact,
@@ -42,7 +41,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -469,14 +467,12 @@ pub struct DoctorRequest {
     pub config_path: PathBuf,
     #[serde(default = "default_styles_dir")]
     pub styles_dir: PathBuf,
-    #[serde(default = "default_model_metadata_path")]
-    pub metadata_path: PathBuf,
+    #[serde(default = "default_model_path")]
+    pub model_path: PathBuf,
     #[serde(default = "default_jobs_dir")]
     pub jobs_dir: PathBuf,
     #[serde(default = "default_sample_input_path")]
     pub sample_input: PathBuf,
-    #[serde(default = "default_python_command")]
-    pub python: String,
 }
 
 impl Default for DoctorRequest {
@@ -484,10 +480,9 @@ impl Default for DoctorRequest {
         Self {
             config_path: default_config_path(),
             styles_dir: default_styles_dir(),
-            metadata_path: default_model_metadata_path(),
+            model_path: default_model_path(),
             jobs_dir: default_jobs_dir(),
             sample_input: default_sample_input_path(),
-            python: default_python_command(),
         }
     }
 }
@@ -1441,34 +1436,14 @@ async fn run_doctor_default(State(state): State<ApiState>) -> Json<DoctorReport>
 }
 
 async fn run_doctor_custom(Json(payload): Json<DoctorRequest>) -> Json<DoctorReport> {
-    // The `python` field is argv[0] of a spawned process: only accept known
-    // Python interpreters so the endpoint can never launch arbitrary
-    // binaries (and exfiltrate their stderr) from an unauthenticated call.
-    let mut sanitized = payload;
-    if !python_command_is_safe(&sanitized.python) {
-        sanitized.python = default_python_command();
-    }
-    Json(run_doctor_report(sanitized))
-}
-
-fn python_command_is_safe(python: &str) -> bool {
-    let python = python.trim();
-    if python.is_empty() || python.contains(['/', '\\']) {
-        return false;
-    }
-    // Plain interpreter names only (python, python3, python3.11, python.exe):
-    // never accept a path, so argv[0] can only be a Python binary.
-    let name = python.to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    name.starts_with("python")
+    Json(run_doctor_report(payload))
 }
 
 pub fn run_doctor_report(request: DoctorRequest) -> DoctorReport {
     let checks = vec![
         check_engine_config(&request.config_path),
         check_styles_dir(&request.styles_dir),
-        check_model_metadata(&request.metadata_path),
-        check_python_sidecar(&request.python),
+        check_production_model(&request.model_path),
         check_jobs_dir(&request.jobs_dir),
         check_sample_input(&request.sample_input),
     ];
@@ -3332,27 +3307,12 @@ fn validate_default_inference_runtime(model_path: &Path) -> Result<()> {
     mangahue_inference::validate_production_ddcolor_model(model_path)?;
     #[cfg(feature = "native-onnx")]
     {
-        // DDColor ONNX runs natively through the Rust ort backend; the
-        // Python sidecar is not part of this build.
+        // DDColor ONNX runs natively through the Rust ONNX Runtime backend.
         Ok(())
     }
     #[cfg(not(feature = "native-onnx"))]
     {
-        let python = std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string());
-        let output = Command::new(&python)
-            .args([
-                "-c",
-                "import numpy, onnxruntime, PIL, mangahue_train.ddcolor_onnx_worker",
-            ])
-            .output()
-            .with_context(|| format!("failed to start inference Python runtime '{python}'"))?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "inference Python runtime is incomplete: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+        anyhow::bail!("production colorization requires the native-onnx Rust build")
     }
 }
 
@@ -3416,20 +3376,12 @@ fn default_styles_dir() -> PathBuf {
     PathBuf::from("configs/styles")
 }
 
-fn default_model_metadata_path() -> PathBuf {
-    PathBuf::from("models/model.mangahue.json")
-}
-
 fn default_jobs_dir() -> PathBuf {
     PathBuf::from(".mangahue/jobs")
 }
 
 fn default_sample_input_path() -> PathBuf {
     PathBuf::from("examples/input/smoke_page.png")
-}
-
-fn default_python_command() -> String {
-    std::env::var("MANGAHUE_PYTHON").unwrap_or_else(|_| "python".to_string())
 }
 
 fn check_engine_config(path: &Path) -> DoctorCheck {
@@ -3506,74 +3458,18 @@ fn check_styles_dir(dir: &Path) -> DoctorCheck {
     )
 }
 
-fn check_model_metadata(path: &Path) -> DoctorCheck {
-    if !path.exists() {
-        return doctor_check(
-            "model_metadata",
-            DoctorStatus::Warn,
-            format!("model metadata is missing: {}", path.display()),
-            None,
-        );
-    }
-    match ModelMetadata::load(path) {
-        Ok(metadata) => doctor_check(
-            "model_metadata",
+fn check_production_model(path: &Path) -> DoctorCheck {
+    match mangahue_inference::validate_production_ddcolor_model(path) {
+        Ok(()) => doctor_check(
+            "production_model",
             DoctorStatus::Pass,
-            format!(
-                "loaded {} v{} ({})",
-                metadata.model_name, metadata.version, metadata.model_type
-            ),
-            Some(serde_json::json!({
-                "input_size": metadata.input_size,
-                "input_channels": metadata.input_channels,
-                "output_channels": metadata.output_channels
-            })),
+            format!("validated pinned model {}", path.display()),
+            None,
         ),
         Err(error) => doctor_check(
-            "model_metadata",
+            "production_model",
             DoctorStatus::Fail,
-            format!("failed to parse {}: {error}", path.display()),
-            None,
-        ),
-    }
-}
-
-fn check_python_sidecar(python: &str) -> DoctorCheck {
-    let mut command = Command::new(python);
-    command
-        .arg("-c")
-        .arg("import mangahue_train; print('mangahue_train ok')");
-    if Path::new("python").exists() {
-        let mut paths = vec![PathBuf::from("python")];
-        if let Some(current) = std::env::var_os("PYTHONPATH") {
-            paths.extend(std::env::split_paths(&current));
-        }
-        if let Ok(pythonpath) = std::env::join_paths(paths) {
-            command.env("PYTHONPATH", pythonpath);
-        }
-    }
-    match command.output() {
-        Ok(output) if output.status.success() => doctor_check(
-            "python_sidecar",
-            DoctorStatus::Pass,
-            format!("{} can import mangahue_train", python),
-            None,
-        ),
-        Ok(output) => doctor_check(
-            "python_sidecar",
-            DoctorStatus::Warn,
-            format!(
-                "{} could not import mangahue_train: {}{}",
-                python,
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            ),
-            None,
-        ),
-        Err(error) => doctor_check(
-            "python_sidecar",
-            DoctorStatus::Warn,
-            format!("failed to start {python}: {error}"),
+            format!("invalid production model {}: {error}", path.display()),
             None,
         ),
     }
