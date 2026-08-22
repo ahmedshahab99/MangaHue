@@ -95,7 +95,6 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          script_stop: true
           script: |
             set -Eeuo pipefail
             sudo /usr/local/sbin/mangahue-promote '${{ env.RELEASE_SHA }}'

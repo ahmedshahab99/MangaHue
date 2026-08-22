@@ -26,9 +26,10 @@ ExecStartPre=/usr/bin/test -s /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp3
 ExecStartPre=/usr/bin/sha256sum -c /opt/MangaHue-current/configs/model-checksums/ddcolor-full-fp32.sha256
 ExecStartPre=/usr/bin/test -r /opt/MangaHue-current/configs/engine.default.yaml
 ExecStartPre=/usr/bin/test -r /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml
-# One pretrained model, one native Rust inference pass. The engine protects
-# ink/text/whites and removes artifacts but does not run palette agents,
-# ensembles, learning, or a Python colorization sidecar.
+# One pretrained model and one shared native Rust inference session. Large
+# pages may use sequential overlapping crops through that same model. The
+# engine protects ink/text/whites and removes artifacts but does not run
+# palette agents, ensembles, learning, or a Python colorization sidecar.
 # Rollback is an atomic symlink change: point /opt/MangaHue-current at a
 # previous directory under /opt/MangaHue-releases and restart this unit.
 ExecStart=/opt/MangaHue-current/bin/mangahue-telegram --work-dir /var/lib/mangahue-pro/telegram --scratch-dir /run/mangahue-pro/jobs --scratch-limit-bytes 805306368 --delivery-format jpeg --jpeg-quality 95 --max-pages 2000 --max-concurrent-jobs 1 --max-queued-jobs 16 --max-queued-jobs-per-chat 1 --daily-limit 0 --retention-hours 24 --batch-size 1 --model /opt/MangaHue/models/ddcolor-full/ddcolor-full-fp32.onnx --preset /opt/MangaHue-current/configs/engine.default.yaml --style /opt/MangaHue-current/configs/styles/soft_cel_anime_v2.yaml --cache-dir /var/lib/mangahue-pro/cache
