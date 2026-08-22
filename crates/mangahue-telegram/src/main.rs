@@ -2674,25 +2674,32 @@ fn handle_link(
         "chapter scan complete"
     );
 
-    // SSRF guard: drop any extracted image URL that resolves to a private
-    // or reserved host (attacker-controlled pages can point at internal
-    // services or cloud metadata). Fail the image, not the whole job.
-    let all_image_urls: Vec<String> = all_image_urls
-        .into_iter()
-        .filter(|u| {
-            let parsed = match url::Url::parse(u) {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
-            match validate_public_url(&parsed) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(url = %u, error = %e, "skipping unsafe image URL");
-                    false
-                }
+    // SSRF guard: reject the entire chapter if any extracted page URL is not
+    // safe. Removing rejected URLs here used to shrink the admitted page set,
+    // which made a chapter appear complete even though an extracted page had
+    // silently disappeared before accounting began.
+    let extracted_page_count = all_image_urls.len();
+    let mut validated_image_urls = Vec::with_capacity(extracted_page_count);
+    let mut rejected_image_urls = Vec::new();
+    for image_url in all_image_urls {
+        let validation = url::Url::parse(&image_url)
+            .map_err(anyhow::Error::from)
+            .and_then(|parsed| validate_public_url(&parsed));
+        match validation {
+            Ok(()) => validated_image_urls.push(image_url),
+            Err(error) => {
+                tracing::warn!(url = %image_url, error = %error, "unsafe chapter page URL rejected");
+                rejected_image_urls.push(image_url);
             }
-        })
-        .collect();
+        }
+    }
+    if !rejected_image_urls.is_empty() {
+        anyhow::bail!(
+            "chapter extraction found {extracted_page_count} page(s), but {} page URL(s) failed the network-safety check; no partial chapter was admitted",
+            rejected_image_urls.len()
+        );
+    }
+    let all_image_urls = validated_image_urls;
 
     if all_image_urls.is_empty() {
         anyhow::bail!("no page images were found at that URL");

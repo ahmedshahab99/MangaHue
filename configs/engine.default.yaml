@@ -1,5 +1,7 @@
-# MangaHue production engine: one pretrained model, one inference pass.
-# Detection protects manga structure; no palette/agent stage invents color.
+# MangaHue production engine: one pretrained model, run sequentially.
+# Large pages use overlapping crops from that same model to preserve local
+# detail on CPU; detection protects manga structure and no alternate model or
+# palette/agent stage invents color.
 engine:
   preserve_lines: true
   protect_speech_bubbles: true
@@ -19,9 +21,9 @@ preprocess:
 
 layout:
   panel_detection: true
-  tiling_enabled: false
-  tile_size: 1024
-  tile_overlap: 0
+  tiling_enabled: true
+  tile_size: 768
+  tile_overlap: 128
   webtoon_mode: auto
   reading_direction: right_to_left
 

@@ -469,12 +469,10 @@ fn process_manifest_pages(
         if let Some(export_path) = manifest.export_path.clone() {
             export_chapter_archive(&manifest.output_dir, export_path)?;
         }
-    } else if manifest.export_path.is_some() && request.safety_gate.enforce {
+    } else if manifest.export_path.is_some() {
         manifest
             .warnings
-            .push("archive export skipped because enforced safety gate failed".to_string());
-    } else if let Some(export_path) = manifest.export_path.clone() {
-        export_chapter_archive(&manifest.output_dir, export_path)?;
+            .push("archive export skipped because the chapter is incomplete".to_string());
     }
     if let Some(gallery_path) = manifest.gallery_path.clone() {
         write_gallery(&manifest, gallery_path)?;
@@ -864,13 +862,13 @@ fn recompute_counts(manifest: &mut ChapterJobManifest) {
         .count();
 }
 
-/// A chapter delivers per-page: completed pages are real value, so a job
-/// with at least one delivered page completes even when other pages were
-/// withheld. Withheld pages stay visible as `Failed` in the manifest and
-/// gallery and are listed in the job warnings. Only a job that delivered
-/// nothing fails outright.
+/// A chapter is complete only when every admitted page has an approved output.
+/// Individual successful pages remain available for diagnosis and resume, but
+/// a partial set must never be promoted or exported as a completed chapter.
 fn chapter_job_status(manifest: &ChapterJobManifest) -> ChapterJobStatus {
-    if manifest.failed == 0 || manifest.processed >= 1 {
+    if manifest.failed == 0
+        && manifest.processed.saturating_add(manifest.skipped) == manifest.total_pages
+    {
         ChapterJobStatus::Complete
     } else {
         ChapterJobStatus::Failed
@@ -1062,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn chapter_job_completes_partially_when_some_pages_are_withheld() {
+    fn incomplete_chapter_is_not_promoted_or_exported() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input");
         let output = dir.path().join("output");
@@ -1098,9 +1096,9 @@ mod tests {
         };
         let manifest = run_chapter_job(request).unwrap();
 
-        // The job completes and exports what was actually delivered instead
-        // of failing the whole chapter because one page was withheld.
-        assert_eq!(manifest.status, ChapterJobStatus::Complete);
+        // Successful pages remain resumable, but the chapter cannot be marked
+        // complete or exported while one admitted page is withheld.
+        assert_eq!(manifest.status, ChapterJobStatus::Failed);
         assert_eq!(manifest.processed, 2);
         assert_eq!(manifest.failed, 1);
         assert_eq!(manifest.pages[1].status, ChapterPageStatus::Failed);
@@ -1108,7 +1106,7 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("withheld")));
-        assert!(output.join("chapter.cbz").exists());
+        assert!(!output.join("chapter.cbz").exists());
         assert!(output.join("gallery.html").exists());
     }
 

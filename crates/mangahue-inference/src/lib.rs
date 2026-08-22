@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "native-onnx")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 use image::{GrayImage, Rgb, RgbImage};
 use mangahue_core::{ColorRgb, EngineError};
 use sha2::{Digest, Sha256};
@@ -13,7 +15,15 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone)]
 pub struct ModelInput {
+    /// Working-resolution luminance used to reconstruct the final RGB tile.
+    /// This remains aligned with every mask and with the requested output.
     pub lineart: GrayImage,
+    /// Optional higher-detail grayscale guide used only for the model's
+    /// fixed-resolution input. Keeping this separate avoids resizing a page
+    /// to the working canvas and then resizing that already-sampled image a
+    /// second time to 512x512. The predicted chroma is still recombined with
+    /// `lineart`, so source luminance, ink, and screentones remain canonical.
+    pub model_guide: Option<GrayImage>,
     pub hint_map: RgbImage,
     pub hint_mask: GrayImage,
 }
@@ -526,11 +536,14 @@ impl ColorizationBackend for NativeDdColorOnnxBackend {
     fn colorize(&self, input: &ModelInput) -> std::result::Result<RgbImage, EngineError> {
         let (w, h) = input.lineart.dimensions();
         let gray = input.lineart.clone();
+        let model_guide = input.model_guide.as_ref().unwrap_or(&gray);
 
         // Resize to the model's native 512x512 (Lanczos3 approximates the
-        // Python worker's bicubic), then build the neutral-RGB tensor.
+        // Python worker's bicubic), then build the neutral-RGB tensor. The
+        // optional guide may retain more source detail than the bounded
+        // working canvas, but never changes output dimensions or luminance.
         let resized = image::imageops::resize(
-            &gray,
+            model_guide,
             DDCOLOR_MODEL_SIZE,
             DDCOLOR_MODEL_SIZE,
             image::imageops::FilterType::Lanczos3,
@@ -781,6 +794,7 @@ mod tests {
         let hint_mask = GrayImage::from_pixel(16, 12, Luma([0]));
         let input = ModelInput {
             lineart,
+            model_guide: None,
             hint_map,
             hint_mask,
         };
