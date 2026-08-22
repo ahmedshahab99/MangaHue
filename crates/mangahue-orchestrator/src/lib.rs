@@ -3,7 +3,8 @@ use image::{GrayImage, Luma, Pixel, Rgb, RgbImage};
 use mangahue_cache::{ArtifactCache, ArtifactKind, CacheKey};
 use mangahue_config::{load_style_profile, EngineConfig};
 use mangahue_core::{
-    CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport, StyleProfile, TileInfo,
+    BoundingBox, CharacterProfile, ImageSize, MangaPanel, ProcessingReport, StageReport,
+    StyleProfile, TileInfo,
 };
 use mangahue_hints::{
     apply_region_locks_to_hints, apply_region_style_hints, detect_semantic_regions,
@@ -19,9 +20,8 @@ use mangahue_intelligence::{
 use mangahue_layout::{analyze_layout, merge_rgb_tiles};
 use mangahue_memory::{load_project_characters, ColorBible, ProjectMemory};
 use mangahue_postprocess::{
-    cross_tile_coherence, finalize, reconstruct_full_resolution, remove_chroma_grid_artifacts,
-    remove_color_specks, restore_delivery_protected_regions, ChromaGridCleanupReport,
-    PostprocessInput,
+    finalize, reconstruct_full_resolution, remove_chroma_grid_artifacts, remove_color_specks,
+    restore_delivery_protected_regions, ChromaGridCleanupReport, PostprocessInput,
 };
 use mangahue_preprocess::preprocess_page;
 use rayon::prelude::*;
@@ -39,6 +39,8 @@ const MIN_DELIVERY_COLORED_FRACTION: f32 = 0.025;
 const MIN_DELIVERY_COLORFULNESS: f32 = 8.0;
 const MIN_DELIVERY_MEAN_RGB_DELTA: f32 = 1.0;
 const MIN_DELIVERY_CHANGED_FRACTION: f32 = 0.01;
+const MAX_TILE_OVERLAP_P95_RGB_DELTA: f32 = 80.0;
+const PIPELINE_CACHE_SCHEMA: &[u8] = b"mangahue-cpu-direct-guide-v1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ColorizeRequest {
@@ -180,6 +182,22 @@ pub fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("tiles_completed")
                 .is_some_and(|tiles| *tiles >= 1.0)
     });
+    let tile_overlap_consistent = report
+        .stage_reports
+        .iter()
+        .find(|stage| stage.name == "inference")
+        .is_some_and(|stage| {
+            let tiles = stage.metrics.get("tiles_completed").copied().unwrap_or(0.0);
+            tiles <= 1.0
+                || (stage
+                    .metrics
+                    .get("overlap_pairs")
+                    .is_some_and(|pairs| *pairs >= 1.0)
+                    && stage
+                        .metrics
+                        .get("overlap_p95_rgb_delta")
+                        .is_some_and(|delta| *delta <= MAX_TILE_OVERLAP_P95_RGB_DELTA as f64))
+        });
     let coverage_passed = report.stage_reports.iter().any(|stage| {
         stage.name == "colorization_coverage"
             && stage
@@ -194,7 +212,11 @@ pub fn delivery_quality_approved(report: &ProcessingReport) -> bool {
                 .get("passed")
                 .is_some_and(|passed| *passed >= 1.0)
     });
-    production_ready && inference_completed && coverage_passed && transformation_passed
+    production_ready
+        && inference_completed
+        && tile_overlap_consistent
+        && coverage_passed
+        && transformation_passed
 }
 
 impl MangaHueEngine {
@@ -284,6 +306,7 @@ impl MangaHueEngine {
         };
 
         let manga_image = load_image(&request.input_path)?;
+        let source_grayscale = manga_image.image.to_luma8();
 
         let resized = mangahue_image::resize_to_max(
             &manga_image.image,
@@ -300,6 +323,18 @@ impl MangaHueEngine {
         let preprocess_start = Instant::now();
         emit_progress(&progress, "preprocess", 0, 6, None);
         let preprocess = preprocess_page(&resized, &config.preprocess, &Default::default())?;
+        // Keep model perception separate from the bounded mask/postprocess
+        // canvas. DDColor always reduces its guide to 512x512, so feeding it
+        // the already-resized working page needlessly resamples screentones
+        // twice and turns their aliases into colored dots. Build one direct
+        // source-derived guide, suppressing only evidenced screentone texture;
+        // final luminance still comes from `preprocess.original_grayscale`.
+        let (model_guide, descreened_guide_pixels) = build_model_guide(
+            &source_grayscale,
+            &preprocess.tone_mask,
+            &preprocess.line_mask,
+            config.preprocess.max_input_dimension,
+        );
         report.preprocessing_ms = preprocess_start.elapsed().as_millis();
         emit_progress(&progress, "preprocess", 1, 6, None);
         report.page_classification = Some(classify_page(
@@ -331,6 +366,13 @@ impl MangaHueEngine {
                 .note(format!("lighting={}", scene.lighting.label())),
         );
         report.add_stage_report(preprocess_stage_report(&preprocess.report));
+        report.add_stage_report(
+            StageReport::new("model_guide")
+                .metric("width", model_guide.width() as f64)
+                .metric("height", model_guide.height() as f64)
+                .metric("descreened_pixels", descreened_guide_pixels as f64)
+                .note("direct source guide; canonical luminance remains unchanged"),
+        );
         for warning in &preprocess.report.warnings {
             report.warn(warning.clone());
         }
@@ -686,74 +728,83 @@ impl MangaHueEngine {
         );
         let cancel = cancel.clone();
         let use_original = backend.prefers_original_grayscale();
-        let colored_tiles: Vec<(TileInfo, RgbImage)> =
-            if layout.tiles.len() < 2 || parallel_jobs == 1 {
-                let mut acc = Vec::with_capacity(layout.tiles.len());
-                for tile in &layout.tiles {
-                    if check_cancel(&cancel) {
-                        return Err(anyhow!("colorization cancelled before tile {}", tile.id));
-                    }
-                    let source_gray = if use_original {
-                        &preprocess.original_grayscale
-                    } else {
-                        &preprocess.clean_lineart
-                    };
-                    let output = backend
-                        .colorize(&ModelInput {
-                            lineart: crop_gray(source_gray, tile.bbox),
-                            hint_map: crop_rgb(&hints.hint_map, tile.bbox),
-                            hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
-                        })
-                        .map_err(|err| anyhow!(err))?;
-                    acc.push((tile.clone(), output));
-                    emit_progress(
-                        &progress,
-                        "inference_tile",
-                        acc.len(),
-                        tiles_total,
-                        Some(tile.id.clone()),
-                    );
+        let colored_tiles: Vec<(TileInfo, RgbImage)> = if layout.tiles.len() < 2
+            || parallel_jobs == 1
+        {
+            let mut acc = Vec::with_capacity(layout.tiles.len());
+            for tile in &layout.tiles {
+                if check_cancel(&cancel) {
+                    return Err(anyhow!("colorization cancelled before tile {}", tile.id));
                 }
-                acc
-            } else {
-                let pool = build_pool(parallel_jobs);
-                let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
-                    let tiles = &layout.tiles;
-                    let source_gray = if use_original {
-                        &preprocess.original_grayscale
-                    } else {
-                        &preprocess.clean_lineart
-                    };
-                    let hint_map = &hints.hint_map;
-                    let hint_mask = &hints.hint_mask;
-                    let backend = Arc::clone(&backend);
-                    let cancel = cancel.clone();
-                    tiles
-                        .par_iter()
-                        .map(|tile| {
-                            if check_cancel(&cancel) {
-                                return Err(anyhow!("cancelled during tile {}", tile.id));
-                            }
-                            backend
-                                .colorize(&ModelInput {
-                                    lineart: crop_gray(source_gray, tile.bbox),
-                                    hint_map: crop_rgb(hint_map, tile.bbox),
-                                    hint_mask: crop_gray(hint_mask, tile.bbox),
-                                })
-                                .map(|output| (tile.clone(), output))
-                                .map_err(|err| anyhow!(err))
-                        })
-                        .collect()
-                });
-                raw.into_iter().collect::<Result<Vec<_>>>()?
-            };
+                let source_gray = if use_original {
+                    &preprocess.original_grayscale
+                } else {
+                    &preprocess.clean_lineart
+                };
+                let output = backend
+                    .colorize(&ModelInput {
+                        lineart: crop_gray(source_gray, tile.bbox),
+                        model_guide: Some(crop_corresponding_gray(&model_guide, size, tile.bbox)),
+                        hint_map: crop_rgb(&hints.hint_map, tile.bbox),
+                        hint_mask: crop_gray(&hints.hint_mask, tile.bbox),
+                    })
+                    .map_err(|err| anyhow!(err))?;
+                acc.push((tile.clone(), output));
+                emit_progress(
+                    &progress,
+                    "inference_tile",
+                    acc.len(),
+                    tiles_total,
+                    Some(tile.id.clone()),
+                );
+            }
+            acc
+        } else {
+            let pool = build_pool(parallel_jobs);
+            let raw: Vec<Result<(TileInfo, RgbImage)>> = pool.install(|| {
+                let tiles = &layout.tiles;
+                let source_gray = if use_original {
+                    &preprocess.original_grayscale
+                } else {
+                    &preprocess.clean_lineart
+                };
+                let hint_map = &hints.hint_map;
+                let hint_mask = &hints.hint_mask;
+                let model_guide = &model_guide;
+                let backend = Arc::clone(&backend);
+                let cancel = cancel.clone();
+                tiles
+                    .par_iter()
+                    .map(|tile| {
+                        if check_cancel(&cancel) {
+                            return Err(anyhow!("cancelled during tile {}", tile.id));
+                        }
+                        backend
+                            .colorize(&ModelInput {
+                                lineart: crop_gray(source_gray, tile.bbox),
+                                model_guide: Some(crop_corresponding_gray(
+                                    model_guide,
+                                    size,
+                                    tile.bbox,
+                                )),
+                                hint_map: crop_rgb(hint_map, tile.bbox),
+                                hint_mask: crop_gray(hint_mask, tile.bbox),
+                            })
+                            .map(|output| (tile.clone(), output))
+                            .map_err(|err| anyhow!(err))
+                    })
+                    .collect()
+            });
+            raw.into_iter().collect::<Result<Vec<_>>>()?
+        };
         emit_progress(&progress, "inference_done", 4, 6, None);
 
         if check_cancel(&cancel) {
             return Err(anyhow!("colorization cancelled after inference"));
         }
 
-        let mut merged = merge_rgb_tiles(size, &colored_tiles)?;
+        let overlap_consistency = measure_tile_overlap_consistency(&colored_tiles);
+        let merged = merge_rgb_tiles(size, &colored_tiles)?;
         report.inference_ms = inference_start.elapsed().as_millis();
 
         // The model's own chroma signal: mean opponent magnitude of the
@@ -784,16 +835,19 @@ impl MangaHueEngine {
             }
         };
 
-        cross_tile_coherence(
-            &mut merged,
-            &preprocess.line_mask,
-            config.layout.tile_size,
-            config.layout.tile_overlap,
-        );
         let inference_report = StageReport::new("inference")
             .note(format!("backend={}", backend_name))
             .metric("parallel_jobs", parallel_jobs as f64)
-            .metric("tiles_completed", colored_tiles.len() as f64);
+            .metric("tiles_completed", colored_tiles.len() as f64)
+            .metric("overlap_pairs", overlap_consistency.overlap_pairs as f64)
+            .metric(
+                "overlap_mean_rgb_delta",
+                overlap_consistency.mean_rgb_delta as f64,
+            )
+            .metric(
+                "overlap_p95_rgb_delta",
+                overlap_consistency.p95_rgb_delta as f64,
+            );
         report.add_stage_report(inference_report);
 
         let confidence_map_path: Option<PathBuf> = None;
@@ -1057,6 +1111,15 @@ impl MangaHueEngine {
             report.warn(format!("non-blocking quality warning: {verdict}"));
         }
         report.director_verdict = Some(verdict);
+        if overlap_consistency.overlap_pairs > 0
+            && overlap_consistency.p95_rgb_delta > MAX_TILE_OVERLAP_P95_RGB_DELTA
+        {
+            record_blocking_verdict(&mut report, "needs_tile_overlap_consistency");
+            report.warn(format!(
+                "delivery withheld: tile overlap p95 RGB disagreement {:.1} exceeded {:.1}",
+                overlap_consistency.p95_rgb_delta, MAX_TILE_OVERLAP_P95_RGB_DELTA
+            ));
+        }
 
         if final_image.dimensions() != manga_image.image.dimensions() {
             let original_gray = manga_image.image.to_luma8();
@@ -1578,6 +1641,164 @@ fn select_backend(
     }
 }
 
+/// Build the grayscale that DDColor sees independently from the bounded
+/// processing canvas. It is capped for predictable memory, but is derived in
+/// one step from the source page. Only pixels evidenced as screentone are
+/// blended toward a small Gaussian low-pass; strong ink is never changed.
+fn build_model_guide(
+    source: &GrayImage,
+    working_tone_mask: &GrayImage,
+    working_line_mask: &GrayImage,
+    working_max_dimension: u32,
+) -> (GrayImage, u64) {
+    if source.width() == 0 || source.height() == 0 {
+        return (source.clone(), 0);
+    }
+    let guide_limit = working_max_dimension.saturating_mul(2).clamp(1024, 2048);
+    let longest = source.width().max(source.height());
+    let mut guide = if longest > guide_limit {
+        let scale = guide_limit as f64 / longest as f64;
+        let width = (source.width() as f64 * scale).round().max(1.0) as u32;
+        let height = (source.height() as f64 * scale).round().max(1.0) as u32;
+        image::imageops::resize(source, width, height, image::imageops::FilterType::Lanczos3)
+    } else {
+        source.clone()
+    };
+    if working_tone_mask.width() == 0
+        || working_tone_mask.height() == 0
+        || working_line_mask.dimensions() != working_tone_mask.dimensions()
+    {
+        return (guide, 0);
+    }
+
+    let tone = image::imageops::resize(
+        working_tone_mask,
+        guide.width(),
+        guide.height(),
+        image::imageops::FilterType::Triangle,
+    );
+    let lines = image::imageops::resize(
+        working_line_mask,
+        guide.width(),
+        guide.height(),
+        image::imageops::FilterType::Nearest,
+    );
+    let sigma = (guide.width().max(guide.height()) as f32 / 1024.0 * 0.8).clamp(0.8, 1.6);
+    let low_pass = image::imageops::blur(&guide, sigma);
+    let mut changed = 0u64;
+    for (x, y, pixel) in guide.enumerate_pixels_mut() {
+        let tone_strength = tone.get_pixel(x, y)[0] as f32 / 255.0;
+        let ink_strength = lines.get_pixel(x, y)[0] as f32 / 255.0;
+        if tone_strength <= 0.08 || ink_strength >= 0.64 {
+            continue;
+        }
+        let blend = (tone_strength * (1.0 - ink_strength) * 0.82).clamp(0.0, 0.82);
+        let original = pixel[0] as f32;
+        let smoothed = low_pass.get_pixel(x, y)[0] as f32;
+        let value = (original * (1.0 - blend) + smoothed * blend)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        if value != pixel[0] {
+            pixel[0] = value;
+            changed += 1;
+        }
+    }
+    (guide, changed)
+}
+
+/// Crop a source-derived guide using a bounding box expressed in working-page
+/// coordinates. Integer floor/ceil mapping guarantees that every working tile
+/// receives its complete corresponding source area without gaps.
+fn crop_corresponding_gray(
+    source: &GrayImage,
+    working_size: ImageSize,
+    working_bbox: BoundingBox,
+) -> GrayImage {
+    if source.width() == 0
+        || source.height() == 0
+        || working_size.width == 0
+        || working_size.height == 0
+    {
+        return source.clone();
+    }
+    let bbox = working_bbox.clamp_to(working_size);
+    let ceil_div = |value: u64, divisor: u64| value.div_ceil(divisor);
+    let x0 = (bbox.x as u64 * source.width() as u64 / working_size.width as u64) as u32;
+    let y0 = (bbox.y as u64 * source.height() as u64 / working_size.height as u64) as u32;
+    let x1 = ceil_div(
+        bbox.right() as u64 * source.width() as u64,
+        working_size.width as u64,
+    )
+    .min(source.width() as u64) as u32;
+    let y1 = ceil_div(
+        bbox.bottom() as u64 * source.height() as u64,
+        working_size.height as u64,
+    )
+    .min(source.height() as u64) as u32;
+    let source_bbox = BoundingBox::new(
+        x0.min(source.width().saturating_sub(1)),
+        y0.min(source.height().saturating_sub(1)),
+        x1.saturating_sub(x0).max(1),
+        y1.saturating_sub(y0).max(1),
+    );
+    crop_gray(source, source_bbox)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TileOverlapConsistency {
+    overlap_pairs: usize,
+    mean_rgb_delta: f32,
+    p95_rgb_delta: f32,
+}
+
+/// Measure disagreement between model predictions in real tile intersections.
+/// This is recorded before feathering, so production telemetry can distinguish
+/// model context instability from a compositor defect. Sampling every other
+/// pixel keeps the check cheap without hiding periodic or regional shifts.
+fn measure_tile_overlap_consistency(tiles: &[(TileInfo, RgbImage)]) -> TileOverlapConsistency {
+    let mut deltas = Vec::new();
+    let mut overlap_pairs = 0usize;
+    for left_index in 0..tiles.len() {
+        for right_index in (left_index + 1)..tiles.len() {
+            let (left_tile, left_image) = &tiles[left_index];
+            let (right_tile, right_image) = &tiles[right_index];
+            let x0 = left_tile.bbox.x.max(right_tile.bbox.x);
+            let y0 = left_tile.bbox.y.max(right_tile.bbox.y);
+            let x1 = left_tile.bbox.right().min(right_tile.bbox.right());
+            let y1 = left_tile.bbox.bottom().min(right_tile.bbox.bottom());
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            overlap_pairs += 1;
+            for y in (y0..y1).step_by(2) {
+                for x in (x0..x1).step_by(2) {
+                    let left = left_image.get_pixel(x - left_tile.bbox.x, y - left_tile.bbox.y);
+                    let right = right_image.get_pixel(x - right_tile.bbox.x, y - right_tile.bbox.y);
+                    let delta = (0..3)
+                        .map(|channel| (left[channel] as f32 - right[channel] as f32).abs())
+                        .sum::<f32>()
+                        / 3.0;
+                    deltas.push(delta);
+                }
+            }
+        }
+    }
+    if deltas.is_empty() {
+        return TileOverlapConsistency {
+            overlap_pairs,
+            ..TileOverlapConsistency::default()
+        };
+    }
+    let mean_rgb_delta = deltas.iter().sum::<f32>() / deltas.len() as f32;
+    deltas.sort_unstable_by(f32::total_cmp);
+    let p95_index = ((deltas.len() - 1) as f32 * 0.95).round() as usize;
+    TileOverlapConsistency {
+        overlap_pairs,
+        mean_rgb_delta,
+        p95_rgb_delta: deltas[p95_index],
+    }
+}
+
 fn update_project_history(project_path: &Path, page_id: &str) -> Result<()> {
     let mut project = ProjectMemory::load(project_path)?;
     project.mark_processed(page_id);
@@ -1970,6 +2191,10 @@ fn compute_idempotency_key(
     style: &StyleProfile,
 ) -> String {
     let mut hasher = Sha256::new();
+    // An immutable release can reuse the durable cache from its predecessor.
+    // Explicitly version behavior that is not represented by user config so a
+    // new compositor/model-guide algorithm cannot return an older artifact.
+    hasher.update(PIPELINE_CACHE_SCHEMA);
     hasher.update(request.input_path.to_string_lossy().as_bytes());
     hasher.update(b"\x00");
     hasher.update(preprocess.clean_lineart.width().to_le_bytes());
@@ -2115,6 +2340,102 @@ mod tests {
             colorization_evidence_passes(mean_sat, colored_fraction, colorfulness),
             "subtle tint rejected: sat {mean_sat}, frac {colored_fraction}, colorful {colorfulness}"
         );
+    }
+
+    #[test]
+    fn model_guide_suppresses_tones_without_touching_ink() {
+        let mut source = GrayImage::new(64, 96);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            pixel[0] = if (x + y).is_multiple_of(2) { 92 } else { 172 };
+        }
+        let tone = GrayImage::from_pixel(64, 96, Luma([255]));
+        let mut lines = GrayImage::from_pixel(64, 96, Luma([0]));
+        lines.put_pixel(10, 10, Luma([255]));
+        let ink_before = source.get_pixel(10, 10)[0];
+
+        let (guide, changed) = build_model_guide(&source, &tone, &lines, 1024);
+
+        assert_eq!(guide.dimensions(), source.dimensions());
+        assert!(changed > 2_000, "expected tone texture to be smoothed");
+        assert_eq!(guide.get_pixel(10, 10)[0], ink_before);
+    }
+
+    #[test]
+    fn corresponding_guide_crop_maps_working_coordinates_without_gaps() {
+        let source = GrayImage::from_pixel(200, 300, Luma([127]));
+        let working = ImageSize::new(100, 150);
+        let crop = crop_corresponding_gray(&source, working, BoundingBox::new(25, 30, 50, 60));
+        assert_eq!(crop.dimensions(), (100, 120));
+
+        let full = crop_corresponding_gray(
+            &source,
+            working,
+            BoundingBox::new(0, 0, working.width, working.height),
+        );
+        assert_eq!(full, source);
+    }
+
+    #[test]
+    fn tile_overlap_consistency_measures_only_real_intersections() {
+        let first = TileInfo {
+            id: "first".to_string(),
+            bbox: BoundingBox::new(0, 0, 8, 8),
+            overlap: 4,
+            panel_id: None,
+        };
+        let second = TileInfo {
+            id: "second".to_string(),
+            bbox: BoundingBox::new(4, 0, 8, 8),
+            overlap: 4,
+            panel_id: None,
+        };
+        let same = measure_tile_overlap_consistency(&[
+            (
+                first.clone(),
+                RgbImage::from_pixel(8, 8, Rgb([80, 90, 100])),
+            ),
+            (
+                second.clone(),
+                RgbImage::from_pixel(8, 8, Rgb([80, 90, 100])),
+            ),
+        ]);
+        assert_eq!(same.overlap_pairs, 1);
+        assert_eq!(same.mean_rgb_delta, 0.0);
+        assert_eq!(same.p95_rgb_delta, 0.0);
+
+        let shifted = measure_tile_overlap_consistency(&[
+            (first, RgbImage::from_pixel(8, 8, Rgb([0, 0, 0]))),
+            (second, RgbImage::from_pixel(8, 8, Rgb([90, 60, 30]))),
+        ]);
+        assert_eq!(shifted.overlap_pairs, 1);
+        assert_eq!(shifted.mean_rgb_delta, 60.0);
+        assert_eq!(shifted.p95_rgb_delta, 60.0);
+    }
+
+    #[test]
+    fn delivery_gate_rejects_unmeasured_or_unstable_tiled_inference() {
+        let make_report = |overlap_p95: Option<f64>| {
+            let mut report = ProcessingReport {
+                director_verdict: Some("production_ready_preview".to_string()),
+                ..ProcessingReport::default()
+            };
+            let mut inference = StageReport::new("inference")
+                .metric("tiles_completed", 2.0)
+                .metric("overlap_pairs", 1.0);
+            if let Some(delta) = overlap_p95 {
+                inference = inference.metric("overlap_p95_rgb_delta", delta);
+            }
+            report.add_stage_report(inference);
+            report
+                .add_stage_report(StageReport::new("colorization_coverage").metric("passed", 1.0));
+            report
+                .add_stage_report(StageReport::new("colorization_transform").metric("passed", 1.0));
+            report
+        };
+
+        assert!(!delivery_quality_approved(&make_report(None)));
+        assert!(!delivery_quality_approved(&make_report(Some(81.0))));
+        assert!(delivery_quality_approved(&make_report(Some(31.0))));
     }
 
     #[test]

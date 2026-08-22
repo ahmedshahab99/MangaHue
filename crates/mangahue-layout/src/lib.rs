@@ -121,7 +121,7 @@ pub fn merge_rgb_tiles(size: ImageSize, tiles: &[(TileInfo, RgbImage)]) -> Resul
                     continue;
                 }
                 let idx = (y as usize) * (size.width as usize) + x as usize;
-                let weight = tile_weight(tx, ty, image.width(), image.height(), tile.overlap);
+                let weight = tile_weight(tile, tx, ty, size);
                 let pixel = image.get_pixel(tx, ty);
                 r[idx] += pixel[0] as f32 * weight;
                 g[idx] += pixel[1] as f32 * weight;
@@ -326,18 +326,38 @@ fn positions(length: u32, tile_size: u32, overlap: u32) -> Vec<u32> {
     out
 }
 
-fn tile_weight(x: u32, y: u32, width: u32, height: u32, overlap: u32) -> f32 {
+fn tile_weight(tile: &TileInfo, x: u32, y: u32, page: ImageSize) -> f32 {
+    let overlap = tile.overlap;
     if overlap == 0 {
         return 1.0;
     }
-    let edge_x = x.min(width.saturating_sub(1).saturating_sub(x));
-    let edge_y = y.min(height.saturating_sub(1).saturating_sub(y));
-    let dist = edge_x.min(edge_y) as f32;
-    if dist >= overlap as f32 {
-        return 1.0;
+    let ramp = |distance: u32| {
+        if distance >= overlap {
+            1.0
+        } else {
+            let t = distance as f32 / overlap as f32;
+            (0.5 - 0.5 * (std::f32::consts::PI * t).cos()).clamp(0.0, 1.0)
+        }
+    };
+
+    // Feather only an edge that actually overlaps another tile. Page-exterior
+    // edges have no neighbor, so fading them to zero creates dark borders at
+    // working resolution and pale ghost strips after luminance reconstruction.
+    let mut weight_x = 1.0f32;
+    if tile.bbox.x > 0 {
+        weight_x = weight_x.min(ramp(x));
     }
-    let t = dist / overlap as f32;
-    (0.5 - 0.5 * (std::f32::consts::PI * t).cos()).clamp(0.0, 1.0)
+    if tile.bbox.right() < page.width {
+        weight_x = weight_x.min(ramp(tile.bbox.width.saturating_sub(1).saturating_sub(x)));
+    }
+    let mut weight_y = 1.0f32;
+    if tile.bbox.y > 0 {
+        weight_y = weight_y.min(ramp(y));
+    }
+    if tile.bbox.bottom() < page.height {
+        weight_y = weight_y.min(ramp(tile.bbox.height.saturating_sub(1).saturating_sub(y)));
+    }
+    weight_x * weight_y
 }
 
 #[cfg(test)]
@@ -369,6 +389,32 @@ mod tests {
             .collect();
         let merged = merge_rgb_tiles(size, &colored).unwrap();
         assert_eq!(merged.dimensions(), (900, 900));
+    }
+
+    #[test]
+    fn tiled_merge_never_fades_exterior_page_edges() {
+        let size = ImageSize::new(700, 1000);
+        let config = LayoutSection {
+            panel_detection: true,
+            tiling_enabled: true,
+            tile_size: 768,
+            tile_overlap: 128,
+            webtoon_mode: "auto".to_string(),
+            reading_direction: ReadingDirection::RightToLeft,
+        };
+        let tiles = split_tiles(size, &config);
+        assert_eq!(tiles.len(), 2);
+        let colored: Vec<_> = tiles
+            .into_iter()
+            .map(|tile| {
+                let image =
+                    RgbImage::from_pixel(tile.bbox.width, tile.bbox.height, Rgb([73, 141, 209]));
+                (tile, image)
+            })
+            .collect();
+
+        let merged = merge_rgb_tiles(size, &colored).unwrap();
+        assert!(merged.pixels().all(|pixel| pixel == &Rgb([73, 141, 209])));
     }
 
     #[test]

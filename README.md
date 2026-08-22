@@ -24,6 +24,8 @@ cargo run -p mangahue-cli -- inspect .\examples\input\page.png --output .\exampl
 
 Production uses exactly one pretrained artifact: `models/ddcolor-full-fp32.onnx` (DDColor Full, Apache-2.0), executed natively through ONNX Runtime. Its SHA-256 is pinned in code and in `configs/model-checksums/`; the bot refuses to start with a renamed or different model. The runtime and colorization pipeline are Rust-only.
 
+On the low-budget CPU profile, MangaHue builds a source-resolution model guide that suppresses evidenced screentones without changing the canonical page luminance. Pages larger than 768 pixels on either working axis are colored as overlapping crops through the same shared DDColor session, strictly one crop at a time. The compositor feathers only real internal overlaps, measures cross-crop disagreement, and blocks unstable, unchanged, grayscale, structurally damaged, or residual-grid output. A chapter is complete and exportable only when every admitted page passes.
+
 ## CLI
 
 ```powershell
